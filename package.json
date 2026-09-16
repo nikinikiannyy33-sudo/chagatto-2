@@ -6,7 +6,8 @@
     "start": "tsx index.ts"
   },
   "dependencies": {
-    "hono": "^4.9.0"
+    "hono": "^4.9.0",
+    "@hono/node-server": "^1.19.1"
   },
   "devDependencies": {
     "tsx": "^4.20.0",
