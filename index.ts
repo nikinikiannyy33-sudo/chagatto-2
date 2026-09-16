@@ -52,15 +52,11 @@ app.get("/test", (c) => {
   });
 });
 
-app.get("/fx-test", (c) => {
-  const prices = [
-    147.10, 147.18, 147.25, 147.22, 147.30,
-    147.35, 147.42, 147.38, 147.46, 147.52,
-    147.58, 147.61, 147.66, 147.72, 147.69,
-    147.76, 147.82, 147.88, 147.91, 147.96
-  ];
-
-  const currentPrice = prices[prices.length - 1];
+app.get("/fx-test", async (c) => {
+const response = await fetch("https://open.er-api.com/v6/latest/USD");
+const data = await response.json() as any;
+const currentPrice = Number(data.rates.JPY);
+const prices = Array(20).fill(currentPrice);
   const sma5 = sma(prices, 5);
   const sma10 = sma(prices, 10);
   const rsi14 = rsi(prices, 14);
