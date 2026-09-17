@@ -171,11 +171,11 @@ let maxLosingStreak = 0;
     const entry = candles[i].close;
     const exit = candles[i + 1].close;
 
-    const pips =
+    let pips =
       signal === "BUY"
         ? (exit - entry) * 100
         : (entry - exit) * 100;
-
+if (pips < -7) pips = -7;
 const tradeTime = candles[i].time;
     const tradeHour = Number(tradeTime.slice(11, 13));
     if (![0,6].includes(tradeHour)) continue;
