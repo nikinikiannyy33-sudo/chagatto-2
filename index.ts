@@ -104,6 +104,95 @@ app.get("/fx-test", async (c) => {
     time: new Date().toISOString(),
   });
 });
+app.get("/backtest", async (c) => {
+  const apiKey = process.env.TWELVE_DATA_API_KEY;
+
+  if (!apiKey) {
+    return c.json(
+      { error: "TWELVE_DATA_API_KEY is not set" },
+      500
+    );
+  }
+
+  const response = await fetch(
+    `https://api.twelvedata.com/time_series?symbol=USD/JPY&interval=1h&outputsize=500&apikey=${apiKey}`
+  );
+
+  const data = await response.json() as any;
+
+  if (!data.values || !Array.isArray(data.values)) {
+    return c.json({
+      error: "Twelve Data API error",
+      details: data
+    }, 500);
+  }
+  const candles = data.values
+    .slice()
+    .reverse()
+    .map((item: any) => ({
+      time: item.datetime,
+      close: Number(item.close),
+    }))
+    .filter((item: any) => Number.isFinite(item.close));
+
+  let trades = 0;
+  let wins = 0;
+  let losses = 0;
+  let totalPips = 0;
+  for (let i = 14; i < candles.length - 1; i++) {
+    const history = candles
+      .slice(0, i + 1)
+      .map((item: any) => item.close);
+
+    const sma5 = sma(history, 5);
+    const sma10 = sma(history, 10);
+    const rsi14 = rsi(history, 14);
+
+    if (sma5 === null || sma10 === null || rsi14 === null) {
+      continue;
+    }
+
+    let signal = "WAIT";
+
+    if (sma5 > sma10 && rsi14 < 70) {
+      signal = "BUY";
+    } else if (sma5 < sma10 && rsi14 > 30) {
+      signal = "SELL";
+    }
+
+    if (signal === "WAIT") continue;
+
+    const entry = candles[i].close;
+    const exit = candles[i + 1].close;
+
+    const pips =
+      signal === "BUY"
+        ? (exit - entry) * 100
+        : (entry - exit) * 100;
+
+    trades++;
+
+    if (pips > 0) {
+      wins++;
+    } else if (pips < 0) {
+      losses++;
+    }
+
+    totalPips += pips;
+  }
+    const winRate = trades > 0 ? (wins / trades) * 100 : 0;
+
+  return c.json({
+    system: "Chagatto-2 Backtest",
+    pair: "USDJPY",
+    interval: "1h",
+    trades,
+    wins,
+    losses,
+    winRate,
+    totalPips
+  });
+});
 
 const port = Number(process.env.PORT || 8080);
 
