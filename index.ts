@@ -174,8 +174,10 @@ let maxLosingStreak = 0;
         ? (exit - entry) * 100
         : (entry - exit) * 100;
 
+const tradeTime = candles[i].time;
+    const tradeHour = Number(tradeTime.slice(11, 13));
+    if (![0, 6, 12].includes(tradeHour)) continue;
     trades++;
-
     if (pips > 0) {
   wins++;
   grossProfit += pips;
