@@ -141,6 +141,8 @@ app.get("/backtest", async (c) => {
   let totalPips = 0;
   let grossProfit = 0;
 let grossLoss = 0;
+  let winningPips = 0;
+let losingPips = 0;
 let currentLosingStreak = 0;
 let maxLosingStreak = 0;
   for (let i = 14; i < candles.length - 1; i++) {
@@ -181,9 +183,11 @@ const tradeTime = candles[i].time;
     if (pips > 0) {
   wins++;
   grossProfit += pips;
+      winningPips += pips;
   currentLosingStreak = 0;
 } else if (pips < 0) {
   losses++;
+      losingPips += Math.abs(pips);
   grossLoss += Math.abs(pips);
   currentLosingStreak++;
   maxLosingStreak = Math.max(maxLosingStreak, currentLosingStreak);
@@ -193,7 +197,8 @@ const tradeTime = candles[i].time;
   }
     const winRate = trades > 0 ? (wins / trades) * 100 : 0;
   const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : 0;
-
+const avgWin = wins > 0 ? winningPips / wins : 0;
+const avgLoss = losses > 0 ? losingPips / losses : 0;
   return c.json({
     system: "Chagatto-2 Backtest",
     pair: "USDJPY",
@@ -204,6 +209,8 @@ const tradeTime = candles[i].time;
     winRate,
     totalPips,
 profitFactor,
+    avgWin,
+avgLoss,
 maxLosingStreak
   });
 });
