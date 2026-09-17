@@ -158,9 +158,9 @@ let maxLosingStreak = 0;
 
     let signal = "WAIT";
 
-    if (sma5 > sma10 && rsi14 < 70) {
+    if (sma5 > sma10 && rsi14 < 60) {
       signal = "BUY";
-    } else if (sma5 < sma10 && rsi14 > 30) {
+    } else if (sma5 < sma10 && rsi14 > 40) {
       signal = "SELL";
     }
 
