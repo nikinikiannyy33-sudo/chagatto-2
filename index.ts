@@ -132,8 +132,10 @@ app.get("/backtest", async (c) => {
     .map((item: any) => ({
       time: item.datetime,
       close: Number(item.close),
+      high: Number(item.high),
+      low: Number(item.low),
     }))
-    .filter((item: any) => Number.isFinite(item.close));
+    .filter((item: any) => Number.isFinite(item.close) && Number.isFinite(item.high) && Number.isFinite(item.low));
 
   let trades = 0;
   let wins = 0;
@@ -169,13 +171,18 @@ let maxLosingStreak = 0;
     if (signal === "WAIT") continue;
 
     const entry = candles[i].close;
-    const exit = candles[i + 1].close;
-
+    const nextCandle = candles[i + 1];
+if (!nextCandle) continue;
+    const exit = nextCandle.close;
+const stopLoss = 7;
     let pips =
       signal === "BUY"
         ? (exit - entry) * 100
         : (entry - exit) * 100;
-if (pips < -7) pips = -7;
+    const stopPrice = signal === "BUY" ? entry - stopLoss / 100
+      : entry + stopLoss / 100;
+    const stopHit = signal === "BUY" ? nextCandle.low <= stopPrice : nextCandle.high >= stopPrice;
+  if (stopHit) pips = -stopLoss;
 const tradeTime = candles[i].time;
     const tradeHour = Number(tradeTime.slice(11, 13));
     if (![0,6].includes(tradeHour)) continue;
