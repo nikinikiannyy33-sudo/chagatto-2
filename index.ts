@@ -139,6 +139,10 @@ app.get("/backtest", async (c) => {
   let wins = 0;
   let losses = 0;
   let totalPips = 0;
+  let grossProfit = 0;
+let grossLoss = 0;
+let currentLosingStreak = 0;
+let maxLosingStreak = 0;
   for (let i = 14; i < candles.length - 1; i++) {
     const history = candles
       .slice(0, i + 1)
@@ -173,14 +177,20 @@ app.get("/backtest", async (c) => {
     trades++;
 
     if (pips > 0) {
-      wins++;
-    } else if (pips < 0) {
-      losses++;
-    }
+  wins++;
+  grossProfit += pips;
+  currentLosingStreak = 0;
+} else if (pips < 0) {
+  losses++;
+  grossLoss += Math.abs(pips);
+  currentLosingStreak++;
+  maxLosingStreak = Math.max(maxLosingStreak, currentLosingStreak);
+}
 
     totalPips += pips;
   }
     const winRate = trades > 0 ? (wins / trades) * 100 : 0;
+  const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : 0;
 
   return c.json({
     system: "Chagatto-2 Backtest",
@@ -190,7 +200,9 @@ app.get("/backtest", async (c) => {
     wins,
     losses,
     winRate,
-    totalPips
+    totalPips,
+profitFactor,
+maxLosingStreak
   });
 });
 
