@@ -174,7 +174,7 @@ let maxLosingStreak = 0;
     const nextCandle = candles[i + 1];
 if (!nextCandle) continue;
     const exit = nextCandle.close;
-const stopLoss = 4.65;
+const stopLoss = 4.64;
     let pips =
       signal === "BUY"
         ? (exit - entry) * 100
