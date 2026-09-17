@@ -53,24 +53,32 @@ app.get("/test", (c) => {
 });
 
 app.get("/fx-test", async (c) => {
-  const end = new Date();
-const start = new Date();
-start.setDate(end.getDate() - 45);
+    const apiKey = process.env.TWELVE_DATA_API_KEY;
 
-const formatDate = (d: Date) => d.toISOString().slice(0, 10);
+  if (!apiKey) {
+    return c.json({ error: "TWELVE_DATA_API_KEY is not set" }, 500);
+  }
 
-const response = await fetch(
-  `https://api.frankfurter.app/${formatDate(start)}..${formatDate(end)}?from=USD&to=JPY`
-);
+  const response = await fetch(
+    `https://api.twelvedata.com/time_series?symbol=USD/JPY&interval=1h&outputsize=50&apikey=${apiKey}`
+  );
 
-const data = await response.json() as any;
+  const data = await response.json() as any;
 
-const prices = Object.keys(data.rates)
-  .sort()
-  .map((date) => Number(data.rates[date].JPY))
-  .filter((price) => Number.isFinite(price));
+  if (!data.values || !Array.isArray(data.values)) {
+    return c.json({
+      error: "Twelve Data API error",
+      details: data
+    }, 500);
+  }
 
-const currentPrice = prices[prices.length - 1];
+  const prices = data.values
+    .slice()
+    .reverse()
+    .map((item: any) => Number(item.close))
+    .filter((price: number) => Number.isFinite(price));
+
+  const currentPrice = prices[prices.length - 1];
   const sma5 = sma(prices, 5);
   const sma10 = sma(prices, 10);
   const rsi14 = rsi(prices, 14);
