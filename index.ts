@@ -176,7 +176,7 @@ let maxLosingStreak = 0;
 
 const tradeTime = candles[i].time;
     const tradeHour = Number(tradeTime.slice(11, 13));
-    if (![6].includes(tradeHour)) continue;
+    if (![12].includes(tradeHour)) continue;
     trades++;
     if (pips > 0) {
   wins++;
