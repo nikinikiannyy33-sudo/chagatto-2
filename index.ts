@@ -147,6 +147,7 @@ let grossLoss = 0;
 let losingPips = 0;
 let currentLosingStreak = 0;
 let maxLosingStreak = 0;
+  let equity = 0, peakEquity = 0, maxDrawdown = 0;
   for (let i = 14; i < candles.length - 1; i++) {
     const history = candles
       .slice(0, i + 1)
@@ -202,6 +203,9 @@ const tradeTime = candles[i].time;
 }
 
     totalPips += pips;
+    equity += pips;
+peakEquity = Math.max(peakEquity, equity);
+maxDrawdown = Math.max(maxDrawdown, peakEquity - equity);
   }
     const winRate = trades > 0 ? (wins / trades) * 100 : 0;
   const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : 0;
@@ -219,7 +223,8 @@ const avgLoss = losses > 0 ? losingPips / losses : 0;
 profitFactor,
     avgWin,
 avgLoss,
-maxLosingStreak
+maxLosingStreak,
+maxDrawdown
   });
 });
 
