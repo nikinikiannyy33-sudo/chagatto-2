@@ -211,20 +211,26 @@ maxDrawdown = Math.max(maxDrawdown, peakEquity - equity);
   const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : 0;
 const avgWin = wins > 0 ? winningPips / wins : 0;
 const avgLoss = losses > 0 ? losingPips / losses : 0;
+    stopLossResults.push({
+      stopLoss,
+      trades,
+      wins,
+      losses,
+      winRate,
+      totalPips,
+      profitFactor,
+      avgWin,
+      avgLoss,
+      maxLosingStreak,
+      maxDrawdown
+    });
+  }
+
   return c.json({
-    system: "Chagatto-2 Backtest",
+    system: "Chagatto-2 StopLoss Test",
     pair: "USDJPY",
     interval: "1h",
-    trades,
-    wins,
-    losses,
-    winRate,
-    totalPips,
-profitFactor,
-    avgWin,
-avgLoss,
-maxLosingStreak,
-maxDrawdown
+    results: stopLossResults
   });
 });
 
