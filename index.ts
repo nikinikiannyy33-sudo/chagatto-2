@@ -57,7 +57,7 @@ app.get("/fx-test", async (c) => {
 
   if (!apiKey) {
     return c.json({ error: "TWELVE_DATA_API_KEY is not set" }, 500);
-  }
+ }
 
   const response = await fetch(
     `https://api.twelvedata.com/time_series?symbol=USD/JPY&interval=1h&outputsize=50&apikey=${apiKey}`
