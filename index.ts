@@ -224,7 +224,6 @@ const avgLoss = losses > 0 ? losingPips / losses : 0;
       maxLosingStreak,
       maxDrawdown
     });
-  }
 
   return c.json({
     system: "Chagatto-2 StopLoss Test",
