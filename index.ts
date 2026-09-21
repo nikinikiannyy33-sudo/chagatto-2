@@ -213,7 +213,7 @@ maxDrawdown = Math.max(maxDrawdown, peakEquity - equity);
 const avgWin = wins > 0 ? winningPips / wins : 0;
 const avgLoss = losses > 0 ? losingPips / losses : 0;
     stopLossResults.push({
-      stopLoss,
+    stopLoss: 4.618,
       trades,
       wins,
       losses,
