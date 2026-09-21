@@ -148,6 +148,7 @@ let losingPips = 0;
 let currentLosingStreak = 0;
 let maxLosingStreak = 0;
   let equity = 0, peakEquity = 0, maxDrawdown = 0;
+  const stopLossResults: any[] = [];
   for (let i = 14; i < candles.length - 1; i++) {
     const history = candles
       .slice(0, i + 1)
