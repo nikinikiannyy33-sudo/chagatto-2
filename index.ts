@@ -253,7 +253,7 @@ app.get("/gmo-test", async (c) => {
     .digest("hex");
 
   const response = await fetch(
-    "https://api.coin.z.com/private/v1/account/assets",
+  "https://forex-api.coin.z.com/private/v1/account/assets",
     {
       method,
       headers: {
