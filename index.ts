@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
-
+import crypto from "node:crypto";
 const app = new Hono();
 
 function sma(values: number[], period: number) {
@@ -233,7 +233,44 @@ const avgLoss = losses > 0 ? losingPips / losses : 0;
     results: stopLossResults
   });
 });
+app.get("/gmo-test", async (c) => {
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
 
+  if (!apiKey || !apiSecret) {
+    return c.json({ error: "GMO API keys are not set" }, 500);
+  }
+
+  const timestamp = Date.now().toString();
+  const method = "GET";
+  const path = "/v1/account/assets";
+
+  const text = timestamp + method + path;
+
+  const sign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(text)
+    .digest("hex");
+
+  const response = await fetch(
+    "https://api.coin.z.com/private/v1/account/assets",
+    {
+      method,
+      headers: {
+        "API-KEY": apiKey,
+        "API-TIMESTAMP": timestamp,
+        "API-SIGN": sign,
+      },
+    }
+  );
+
+  const data = await response.json();
+
+  return c.json({
+    connected: response.ok,
+    data,
+  });
+});
 const port = Number(process.env.PORT || 8080);
 
 console.log(`Chagatto-2 started PORT=${port}`);
