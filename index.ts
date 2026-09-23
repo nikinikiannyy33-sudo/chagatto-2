@@ -703,14 +703,157 @@ if (orderSize < 100) {
 
   const data: any = await response.json();
 
+if (!response.ok || data.status !== 0) {
   return c.json({
-    orderSent: response.ok && data.status === 0,
+    orderSent: false,
     symbol: "USD_JPY",
     side,
-    size: "10000",
-    executionType: "MARKET",
+    size: String(orderSize),
     data,
-  });
+  }, 500);
+}
+
+const orderId = Number(data?.data);
+
+if (!Number.isFinite(orderId)) {
+  return c.json({
+    orderSent: true,
+    stopOrderSent: false,
+    error: "ORDER_ID_NOT_FOUND",
+    data,
+  }, 500);
+}
+
+// 成行注文の約定反映を少し待つ
+await new Promise((resolve) => setTimeout(resolve, 1000));
+
+const executionTimestamp = Date.now().toString();
+const executionMethod = "GET";
+const executionPath = "/v1/executions";
+
+const executionSign = crypto
+  .createHmac("sha256", apiSecret)
+  .update(
+    executionTimestamp +
+    executionMethod +
+    executionPath
+  )
+  .digest("hex");
+
+const executionResponse = await fetch(
+  `https://forex-api.coin.z.com/private/v1/executions?orderId=${orderId}`,
+  {
+    method: executionMethod,
+    headers: {
+      "API-KEY": apiKey,
+      "API-TIMESTAMP": executionTimestamp,
+      "API-SIGN": executionSign,
+    },
+  }
+);
+
+const executionData: any =
+  await executionResponse.json();
+
+const executions = Array.isArray(
+  executionData?.data?.list
+)
+  ? executionData.data.list
+  : [];
+
+const execution = executions.find(
+  (x: any) =>
+    Number(x.orderId) === orderId &&
+    x.symbol === "USD_JPY" &&
+    x.settleType === "OPEN"
+);
+
+if (!execution) {
+  return c.json({
+    orderSent: true,
+    stopOrderSent: false,
+    orderId,
+    error: "EXECUTION_NOT_FOUND",
+    executionData,
+  }, 202);
+}
+
+const positionId = Number(execution.positionId);
+const entryPrice = Number(execution.price);
+const executedSize = String(execution.size);
+
+// 約定価格を基準にSTOP価格を固定
+const rawStopPrice =
+  side === "BUY"
+    ? entryPrice - stopDistance
+    : entryPrice + stopDistance;
+
+// USD/JPYは小数第3位までに丸める
+const stopPrice = rawStopPrice.toFixed(3);
+
+// 決済方向は新規注文と逆
+const stopSide =
+  side === "BUY" ? "SELL" : "BUY";
+
+const stopTimestamp = Date.now().toString();
+const stopMethod = "POST";
+const stopPath = "/v1/closeOrder";
+
+const stopBody = JSON.stringify({
+  symbol: "USD_JPY",
+  side: stopSide,
+  executionType: "STOP",
+  stopPrice,
+  settlePosition: [
+    {
+      positionId,
+      size: executedSize,
+    },
+  ],
+});
+
+const stopText =
+  stopTimestamp +
+  stopMethod +
+  stopPath +
+  stopBody;
+
+const stopSign = crypto
+  .createHmac("sha256", apiSecret)
+  .update(stopText)
+  .digest("hex");
+
+const stopResponse = await fetch(
+  "https://forex-api.coin.z.com/private/v1/closeOrder",
+  {
+    method: stopMethod,
+    headers: {
+      "Content-Type": "application/json",
+      "API-KEY": apiKey,
+      "API-TIMESTAMP": stopTimestamp,
+      "API-SIGN": stopSign,
+    },
+    body: stopBody,
+  }
+);
+
+const stopData: any =
+  await stopResponse.json();
+
+return c.json({
+  orderSent: true,
+  stopOrderSent:
+    stopResponse.ok && stopData.status === 0,
+  symbol: "USD_JPY",
+  side,
+  orderId,
+  positionId,
+  entryPrice,
+  size: executedSize,
+  stopDistance,
+  stopPrice,
+  stopData,
+});
 });
 app.get("/gmo-positions", async (c) => {
   const apiKey = process.env.GMO_API_KEY;
