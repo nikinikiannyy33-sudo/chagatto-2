@@ -561,6 +561,62 @@ app.post("/gmo-order", async (c) => {
     data,
   });
 });
+app.get("/gmo-positions", async (c) => {
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
+
+  if (!apiKey || !apiSecret) {
+    return c.json({
+      error: "GMO API keys are not set",
+    }, 500);
+  }
+
+  const timestamp = Date.now().toString();
+  const method = "GET";
+  const path = "/v1/openPositions";
+
+  const text = timestamp + method + path;
+
+  const sign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(text)
+    .digest("hex");
+
+  const response = await fetch(
+    "https://forex-api.coin.z.com/private/v1/openPositions?symbol=USD_JPY&count=100",
+    {
+      method,
+      headers: {
+        "API-KEY": apiKey,
+        "API-TIMESTAMP": timestamp,
+        "API-SIGN": sign,
+      },
+    }
+  );
+
+  const data: any = await response.json();
+
+  if (!response.ok || data.status !== 0) {
+    return c.json({
+      connected: false,
+      error: "Failed to get open positions",
+      data,
+    }, 500);
+  }
+
+  const positions = Array.isArray(data.data)
+    ? data.data
+    : [];
+
+  return c.json({
+    system: "Chagatto-2",
+    source: "GMO Coin FX",
+    symbol: "USD_JPY",
+    positionCount: positions.length,
+    hasPosition: positions.length > 0,
+    positions,
+  });
+});
 const port = Number(process.env.PORT || 8080);
 
 console.log(`Chagatto-2 started PORT=${port}`);
