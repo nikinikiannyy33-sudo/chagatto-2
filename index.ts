@@ -849,6 +849,27 @@ app.post("/gmo-close", async (c) => {
     data,
   });
 });
+app.get("/gmo-stop-check", async (c) => {
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
+  if (!apiKey || !apiSecret) {
+  return c.json({ error: "GMO API keys are not set" }, 500);
+}
+    const tickerResponse = await fetch(
+  "https://forex-api.coin.z.com/public/v1/ticker?symbol=USD_JPY"
+);
+  const tickerData: any = await tickerResponse.json();
+  const bid = Number(tickerData?.data?.[0]?.bid);
+  if (!Number.isFinite(bid)) {
+  return c.json({ error: "Failed to get USD_JPY bid" }, 500);
+}
+  return c.json({
+  system: "Chagatto-2",
+  symbol: "USD_JPY",
+  bid,
+  stopCheck: "READY",
+});
+});
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
