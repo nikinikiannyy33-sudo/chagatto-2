@@ -307,53 +307,74 @@ app.get("/gmo-price", async (c) => {
 });
 app.get("/gmo-klines", async (c) => {
   const now = new Date();
+  const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
 
-  const jst = new Date(
-    now.getTime() + 9 * 60 * 60 * 1000
-  );
-
-  // GMO FXは日本時間6:00で日付が切り替わる
+  // GMO FXは日本時間6:00で取引日が切り替わる
   if (jst.getUTCHours() < 6) {
     jst.setUTCDate(jst.getUTCDate() - 1);
   }
 
-  const date =
-    jst.getUTCFullYear().toString() +
-    String(jst.getUTCMonth() + 1).padStart(2, "0") +
-    String(jst.getUTCDate()).padStart(2, "0");
+  const formatDate = (d: Date) =>
+    d.getUTCFullYear().toString() +
+    String(d.getUTCMonth() + 1).padStart(2, "0") +
+    String(d.getUTCDate()).padStart(2, "0");
 
-  const url =
-    "https://forex-api.coin.z.com/public/v1/klines" +
-    "?symbol=USD_JPY" +
-    "&priceType=BID" +
-    "&interval=1hour" +
-    "&date=" + date;
+  const currentDate = formatDate(jst);
 
-  const response = await fetch(url);
-  const data: any = await response.json();
+  const previous = new Date(jst);
+  previous.setUTCDate(previous.getUTCDate() - 1);
 
-  if (data.status !== 0 || !Array.isArray(data.data)) {
-    return c.json({
-      error: "Failed to get GMO FX klines",
-      data,
-    }, 500);
+  // 土日を飛ばす
+  while (
+    previous.getUTCDay() === 0 ||
+    previous.getUTCDay() === 6
+  ) {
+    previous.setUTCDate(previous.getUTCDate() - 1);
   }
 
-  const candles = data.data.map((x: any) => ({
-    time: Number(x.openTime),
-    open: Number(x.open),
-    high: Number(x.high),
-    low: Number(x.low),
-    close: Number(x.close),
-  }));
+  const previousDate = formatDate(previous);
+
+  const getKlines = async (date: string) => {
+    const url =
+      "https://forex-api.coin.z.com/public/v1/klines" +
+      "?symbol=USD_JPY" +
+      "&priceType=BID" +
+      "&interval=1hour" +
+      "&date=" + date;
+
+    const response = await fetch(url);
+    const data: any = await response.json();
+
+    if (data.status !== 0 || !Array.isArray(data.data)) {
+      return [];
+    }
+
+    return data.data.map((x: any) => ({
+      time: Number(x.openTime),
+      open: Number(x.open),
+      high: Number(x.high),
+      low: Number(x.low),
+      close: Number(x.close),
+    }));
+  };
+
+  const previousCandles = await getKlines(previousDate);
+  const currentCandles = await getKlines(currentDate);
+
+  const candles = [
+    ...previousCandles,
+    ...currentCandles,
+  ].sort((a, b) => a.time - b.time);
 
   return c.json({
     system: "Chagatto-2",
     source: "GMO Coin FX",
     symbol: "USD_JPY",
     interval: "1hour",
-    date,
-    candles: candles.slice(-20),
+    previousDate,
+    currentDate,
+    candleCount: candles.length,
+    candles: candles.slice(-30),
   });
 });
 const port = Number(process.env.PORT || 8080);
