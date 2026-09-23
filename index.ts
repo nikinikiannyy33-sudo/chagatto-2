@@ -305,6 +305,57 @@ app.get("/gmo-price", async (c) => {
     timestamp: usdJpy.timestamp,
   });
 });
+app.get("/gmo-klines", async (c) => {
+  const now = new Date();
+
+  const jst = new Date(
+    now.getTime() + 9 * 60 * 60 * 1000
+  );
+
+  // GMO FXは日本時間6:00で日付が切り替わる
+  if (jst.getUTCHours() < 6) {
+    jst.setUTCDate(jst.getUTCDate() - 1);
+  }
+
+  const date =
+    jst.getUTCFullYear().toString() +
+    String(jst.getUTCMonth() + 1).padStart(2, "0") +
+    String(jst.getUTCDate()).padStart(2, "0");
+
+  const url =
+    "https://forex-api.coin.z.com/public/v1/klines" +
+    "?symbol=USD_JPY" +
+    "&priceType=BID" +
+    "&interval=1hour" +
+    "&date=" + date;
+
+  const response = await fetch(url);
+  const data: any = await response.json();
+
+  if (data.status !== 0 || !Array.isArray(data.data)) {
+    return c.json({
+      error: "Failed to get GMO FX klines",
+      data,
+    }, 500);
+  }
+
+  const candles = data.data.map((x: any) => ({
+    time: Number(x.openTime),
+    open: Number(x.open),
+    high: Number(x.high),
+    low: Number(x.low),
+    close: Number(x.close),
+  }));
+
+  return c.json({
+    system: "Chagatto-2",
+    source: "GMO Coin FX",
+    symbol: "USD_JPY",
+    interval: "1hour",
+    date,
+    candles: candles.slice(-20),
+  });
+});
 const port = Number(process.env.PORT || 8080);
 
 console.log(`Chagatto-2 started PORT=${port}`);
