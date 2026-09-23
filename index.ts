@@ -377,6 +377,103 @@ app.get("/gmo-klines", async (c) => {
     candles: candles.slice(-30),
   });
 });
+app.get("/gmo-signal", async (c) => {
+  const now = new Date();
+  const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+
+  if (jst.getUTCHours() < 6) {
+    jst.setUTCDate(jst.getUTCDate() - 1);
+  }
+
+  const formatDate = (d: Date) =>
+    d.getUTCFullYear().toString() +
+    String(d.getUTCMonth() + 1).padStart(2, "0") +
+    String(d.getUTCDate()).padStart(2, "0");
+
+  const currentDate = formatDate(jst);
+
+  const previous = new Date(jst);
+  previous.setUTCDate(previous.getUTCDate() - 1);
+
+  while (
+    previous.getUTCDay() === 0 ||
+    previous.getUTCDay() === 6
+  ) {
+    previous.setUTCDate(previous.getUTCDate() - 1);
+  }
+
+  const previousDate = formatDate(previous);
+
+  const getKlines = async (date: string) => {
+    const url =
+      "https://forex-api.coin.z.com/public/v1/klines" +
+      "?symbol=USD_JPY" +
+      "&priceType=BID" +
+      "&interval=1hour" +
+      "&date=" + date;
+
+    const response = await fetch(url);
+    const data: any = await response.json();
+
+    if (data.status !== 0 || !Array.isArray(data.data)) {
+      return [];
+    }
+
+    return data.data.map((x: any) => ({
+      time: Number(x.openTime),
+      close: Number(x.close),
+    }));
+  };
+
+  const previousCandles = await getKlines(previousDate);
+  const currentCandles = await getKlines(currentDate);
+
+  const candles = [
+    ...previousCandles,
+    ...currentCandles,
+  ].sort((a, b) => a.time - b.time);
+
+  const closes = candles.map((x) => x.close);
+
+  if (closes.length < 15) {
+    return c.json({
+      error: "Not enough candles",
+      candleCount: closes.length,
+    }, 500);
+  }
+
+  const sma5 = sma(closes, 5);
+  const sma10 = sma(closes, 10);
+  const rsi14 = rsi(closes, 14);
+
+  let signal = "WAIT";
+
+  if (
+    sma5 !== null &&
+    sma10 !== null &&
+    rsi14 !== null
+  ) {
+    if (sma5 > sma10 && rsi14 < 70) {
+      signal = "BUY";
+    } else if (sma5 < sma10 && rsi14 > 30) {
+      signal = "SELL";
+    }
+  }
+
+  return c.json({
+    system: "Chagatto-2",
+    source: "GMO Coin FX",
+    symbol: "USD_JPY",
+    interval: "1hour",
+    candleCount: closes.length,
+    price: closes[closes.length - 1],
+    sma5,
+    sma10,
+    rsi14,
+    signal,
+    time: new Date().toISOString(),
+  });
+});
 const port = Number(process.env.PORT || 8080);
 
 console.log(`Chagatto-2 started PORT=${port}`);
