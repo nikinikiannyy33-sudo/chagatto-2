@@ -670,7 +670,6 @@ app.get("/gmo-positions", async (c) => {
     positions,
   });
 });
-const port = Number(process.env.PORT || 8080);
 app.post("/gmo-close", async (c) => {
   // 安全装置1：本番取引OFFなら決済しない
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
