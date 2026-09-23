@@ -474,6 +474,93 @@ app.get("/gmo-signal", async (c) => {
     time: new Date().toISOString(),
   });
 });
+app.post("/gmo-order", async (c) => {
+  // 安全装置1：本番取引が有効になっているか
+  if (process.env.LIVE_TRADING_ENABLED !== "true") {
+    return c.json({
+      orderSent: false,
+      error: "LIVE_TRADING_ENABLED is false",
+    }, 403);
+  }
+
+  // 安全装置2：管理者トークン
+  const adminToken = process.env.ADMIN_TOKEN;
+  const receivedToken = c.req.header("X-ADMIN-TOKEN");
+
+  if (!adminToken || receivedToken !== adminToken) {
+    return c.json({
+      orderSent: false,
+      error: "Unauthorized",
+    }, 401);
+  }
+
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
+
+  if (!apiKey || !apiSecret) {
+    return c.json({
+      orderSent: false,
+      error: "GMO API keys are not set",
+    }, 500);
+  }
+
+  const body = await c.req.json();
+  const side = body.side;
+
+  if (side !== "BUY" && side !== "SELL") {
+    return c.json({
+      orderSent: false,
+      error: "side must be BUY or SELL",
+    }, 400);
+  }
+
+  const timestamp = Date.now().toString();
+  const method = "POST";
+  const path = "/v1/order";
+
+  const orderBody = JSON.stringify({
+    symbol: "USD_JPY",
+    side,
+    size: "10000",
+    executionType: "MARKET",
+  });
+
+  const text =
+    timestamp +
+    method +
+    path +
+    orderBody;
+
+  const sign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(text)
+    .digest("hex");
+
+  const response = await fetch(
+    "https://forex-api.coin.z.com/private/v1/order",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "API-KEY": apiKey,
+        "API-TIMESTAMP": timestamp,
+        "API-SIGN": sign,
+      },
+      body: orderBody,
+    }
+  );
+
+  const data: any = await response.json();
+
+  return c.json({
+    orderSent: response.ok && data.status === 0,
+    symbol: "USD_JPY",
+    side,
+    size: "10000",
+    executionType: "MARKET",
+    data,
+  });
+});
 const port = Number(process.env.PORT || 8080);
 
 console.log(`Chagatto-2 started PORT=${port}`);
