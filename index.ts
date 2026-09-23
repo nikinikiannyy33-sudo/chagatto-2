@@ -863,11 +863,84 @@ app.get("/gmo-stop-check", async (c) => {
   if (!Number.isFinite(bid)) {
   return c.json({ error: "Failed to get USD_JPY bid" }, 500);
 }
+  // 現在の建玉を取得
+const timestamp = Date.now().toString();
+const method = "GET";
+const path = "/v1/openPositions";
+
+const sign = crypto
+  .createHmac("sha256", apiSecret)
+  .update(timestamp + method + path)
+  .digest("hex");
+
+const positionsResponse = await fetch(
+  "https://forex-api.coin.z.com/private/v1/openPositions?symbol=USD_JPY&count=100",
+  {
+    method,
+    headers: {
+      "API-KEY": apiKey,
+      "API-TIMESTAMP": timestamp,
+      "API-SIGN": sign,
+    },
+  }
+);
+
+const positionsData: any = await positionsResponse.json();
+
+if (!positionsResponse.ok || positionsData.status !== 0) {
   return c.json({
+    error: "Failed to get positions",
+    data: positionsData,
+  }, 500);
+}
+
+const positions = Array.isArray(positionsData?.data)
+  ? positionsData.data
+  : Array.isArray(positionsData?.data?.list)
+    ? positionsData.data.list
+    : [];
+
+const stopDistance = 0.20;
+
+const checks = positions.map((p: any) => {
+  const entryPrice = Number(p.price);
+  const side = p.side;
+
+  const currentPrice =
+    side === "BUY"
+      ? bid
+      : Number(tickerData?.data?.[0]?.ask);
+
+  const stopPrice =
+    side === "BUY"
+      ? entryPrice - stopDistance
+      : entryPrice + stopDistance;
+
+  const stopTriggered =
+    side === "BUY"
+      ? currentPrice <= stopPrice
+      : currentPrice >= stopPrice;
+
+  return {
+    positionId: p.positionId,
+    side,
+    size: p.size,
+    entryPrice,
+    currentPrice,
+    stopPrice,
+    stopDistance,
+    stopTriggered,
+  };
+});
+
+return c.json({
   system: "Chagatto-2",
   symbol: "USD_JPY",
   bid,
-  stopCheck: "READY",
+  ask: Number(tickerData?.data?.[0]?.ask),
+  positionCount: positions.length,
+  checks,
+  action: "CHECK_ONLY",
 });
 });
 const port = Number(process.env.PORT || 8080);
