@@ -671,7 +671,119 @@ app.get("/gmo-positions", async (c) => {
   });
 });
 const port = Number(process.env.PORT || 8080);
+app.post("/gmo-close", async (c) => {
+  // 安全装置1：本番取引OFFなら決済しない
+  if (process.env.LIVE_TRADING_ENABLED !== "true") {
+    return c.json({
+      closeSent: false,
+      error: "LIVE_TRADING_ENABLED is false",
+    }, 403);
+  }
 
+  // 安全装置2：管理者トークン
+  const adminToken = process.env.ADMIN_TOKEN;
+  const receivedToken = c.req.header("X-ADMIN-TOKEN");
+
+  if (!adminToken || receivedToken !== adminToken) {
+    return c.json({
+      closeSent: false,
+      error: "Unauthorized",
+    }, 401);
+  }
+
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
+
+  if (!apiKey || !apiSecret) {
+    return c.json({
+      closeSent: false,
+      error: "GMO API keys are not set",
+    }, 500);
+  }
+
+  const body = await c.req.json();
+
+  const positionId = Number(body.positionId);
+  const positionSide = body.positionSide;
+  const size = String(body.size || "10000");
+
+  if (!Number.isFinite(positionId)) {
+    return c.json({
+      closeSent: false,
+      error: "Invalid positionId",
+    }, 400);
+  }
+
+  if (
+    positionSide !== "BUY" &&
+    positionSide !== "SELL"
+  ) {
+    return c.json({
+      closeSent: false,
+      error: "positionSide must be BUY or SELL",
+    }, 400);
+  }
+
+  // BUY建玉はSELLで決済、SELL建玉はBUYで決済
+  const closeSide =
+    positionSide === "BUY" ? "SELL" : "BUY";
+
+  const timestamp = Date.now().toString();
+  const method = "POST";
+  const path = "/v1/closeOrder";
+
+  const closeBody = JSON.stringify({
+    symbol: "USD_JPY",
+    side: closeSide,
+    executionType: "MARKET",
+    settlePosition: [
+      {
+        positionId,
+        size,
+      },
+    ],
+  });
+
+  const text =
+    timestamp +
+    method +
+    path +
+    closeBody;
+
+  const sign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(text)
+    .digest("hex");
+
+  const response = await fetch(
+    "https://forex-api.coin.z.com/private/v1/closeOrder",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "API-KEY": apiKey,
+        "API-TIMESTAMP": timestamp,
+        "API-SIGN": sign,
+      },
+      body: closeBody,
+    }
+  );
+
+  const data: any = await response.json();
+
+  return c.json({
+    closeSent:
+      response.ok && data.status === 0,
+    symbol: "USD_JPY",
+    positionId,
+    positionSide,
+    closeSide,
+    size,
+    executionType: "MARKET",
+    data,
+  });
+});
+const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
 serve({
