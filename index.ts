@@ -633,6 +633,37 @@ app.post("/gmo-order", async (c) => {
       positionCount: openPositions.length,
     }, 409);
   }
+  // 5万円・1回の最大リスク2%
+const accountBalance = 50000;
+const riskRate = 0.02;
+const maxRiskYen = accountBalance * riskRate;
+
+// 現在のATR×1.5を取得するためシグナルAPIを呼ぶ
+const signalResponse = await fetch(
+  new URL("/gmo-signal", c.req.url).toString()
+);
+
+const signalData: any = await signalResponse.json();
+
+const stopDistance = Number(signalData.stopDistance);
+
+if (!Number.isFinite(stopDistance) || stopDistance <= 0) {
+  return c.json({
+    orderSent: false,
+    error: "Invalid stopDistance",
+  }, 500);
+}
+
+// 損失上限から注文数量を計算
+const rawSize = maxRiskYen / stopDistance;
+const orderSize = Math.floor(rawSize / 100) * 100;
+
+if (orderSize < 100) {
+  return c.json({
+    orderSent: false,
+    error: "Calculated order size is too small",
+  }, 400);
+}
 
   const timestamp = Date.now().toString();
   const method = "POST";
@@ -641,7 +672,7 @@ app.post("/gmo-order", async (c) => {
   const orderBody = JSON.stringify({
     symbol: "USD_JPY",
     side,
-    size: "10000",
+    size: String(orderSize),
     executionType: "MARKET",
   });
 
