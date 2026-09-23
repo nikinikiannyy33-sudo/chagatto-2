@@ -513,6 +513,59 @@ app.post("/gmo-order", async (c) => {
       error: "side must be BUY or SELL",
     }, 400);
   }
+    // 安全装置3：すでに建玉がある場合は新規注文しない
+  const positionTimestamp = Date.now().toString();
+  const positionMethod = "GET";
+  const positionPath = "/v1/openPositions";
+
+  const positionText =
+    positionTimestamp +
+    positionMethod +
+    positionPath;
+
+  const positionSign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(positionText)
+    .digest("hex");
+
+  const positionResponse = await fetch(
+    "https://forex-api.coin.z.com/private/v1/openPositions?symbol=USD_JPY&count=100",
+    {
+      method: positionMethod,
+      headers: {
+        "API-KEY": apiKey,
+        "API-TIMESTAMP": positionTimestamp,
+        "API-SIGN": positionSign,
+      },
+    }
+  );
+
+  const positionData: any =
+    await positionResponse.json();
+
+  if (
+    !positionResponse.ok ||
+    positionData.status !== 0
+  ) {
+    return c.json({
+      orderSent: false,
+      error: "Failed to check open positions",
+      data: positionData,
+    }, 500);
+  }
+
+  const openPositions =
+    Array.isArray(positionData.data)
+      ? positionData.data
+      : [];
+
+  if (openPositions.length > 0) {
+    return c.json({
+      orderSent: false,
+      reason: "POSITION_ALREADY_EXISTS",
+      positionCount: openPositions.length,
+    }, 409);
+  }
 
   const timestamp = Date.now().toString();
   const method = "POST";
