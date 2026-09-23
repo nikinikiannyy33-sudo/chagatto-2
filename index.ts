@@ -453,10 +453,12 @@ app.get("/gmo-signal", async (c) => {
       return [];
     }
 
-    return data.data.map((x: any) => ({
-      time: Number(x.openTime),
-      close: Number(x.close),
-    }));
+ return data.data.map((x: any) => ({
+  time: Number(x.openTime),
+  high: Number(x.high),
+  low: Number(x.low),
+  close: Number(x.close),
+}));
   };
 
   const previousCandles = await getKlines(previousDate);
@@ -479,6 +481,7 @@ app.get("/gmo-signal", async (c) => {
   const sma5 = sma(closes, 5);
   const sma10 = sma(closes, 10);
   const rsi14 = rsi(closes, 14);
+  const atr14 = atr(candles, 14);
 
   let signal = "WAIT";
 
@@ -493,6 +496,26 @@ app.get("/gmo-signal", async (c) => {
       signal = "SELL";
     }
   }
+  const accountBalance = 50000;
+const riskRate = 0.02;
+const maxRiskYen = accountBalance * riskRate;
+
+const stopDistance =
+  atr14 !== null ? atr14 * 1.5 : null;
+
+let orderSize = 0;
+
+if (stopDistance !== null && stopDistance > 0) {
+  const rawSize = maxRiskYen / stopDistance;
+
+  // 100通貨単位に切り下げ
+  orderSize = Math.floor(rawSize / 100) * 100;
+
+  // 最低100通貨
+  if (orderSize < 100) {
+    orderSize = 100;
+  }
+}
 
   return c.json({
     system: "Chagatto-2",
@@ -504,6 +527,10 @@ app.get("/gmo-signal", async (c) => {
     sma5,
     sma10,
     rsi14,
+    atr14,
+stopDistance,
+maxRiskYen,
+orderSize,
     signal,
     time: new Date().toISOString(),
   });
