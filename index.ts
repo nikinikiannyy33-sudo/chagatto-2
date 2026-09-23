@@ -468,8 +468,14 @@ app.get("/gmo-signal", async (c) => {
     ...previousCandles,
     ...currentCandles,
   ].sort((a, b) => a.time - b.time);
+    // 確定した1時間足だけを使用する
+  const nowMs = Date.now();
 
-  const closes = candles.map((x) => x.close);
+  const completedCandles = candles.filter(
+    (x) => x.time + 60 * 60 * 1000 <= nowMs
+  );
+
+  const closes = completedCandles.map((x) => x.close);
 
   if (closes.length < 15) {
     return c.json({
@@ -481,7 +487,7 @@ app.get("/gmo-signal", async (c) => {
   const sma5 = sma(closes, 5);
   const sma10 = sma(closes, 10);
   const rsi14 = rsi(closes, 14);
-  const atr14 = atr(candles, 14);
+  const atr14 = atr(completedCandles, 14);
 
   let signal = "WAIT";
 
