@@ -271,6 +271,40 @@ app.get("/gmo-test", async (c) => {
     data,
   });
 });
+app.get("/gmo-price", async (c) => {
+  const response = await fetch(
+    "https://forex-api.coin.z.com/public/v1/ticker"
+  );
+
+  const data: any = await response.json();
+
+  if (data.status !== 0 || !Array.isArray(data.data)) {
+    return c.json({
+      error: "Failed to get GMO FX price",
+      data,
+    }, 500);
+  }
+
+  const usdJpy = data.data.find(
+    (item: any) => item.symbol === "USD_JPY"
+  );
+
+  if (!usdJpy) {
+    return c.json({
+      error: "USD_JPY not found",
+    }, 404);
+  }
+
+  return c.json({
+    system: "Chagatto-2",
+    source: "GMO Coin FX",
+    symbol: usdJpy.symbol,
+    bid: Number(usdJpy.bid),
+    ask: Number(usdJpy.ask),
+    status: usdJpy.status,
+    timestamp: usdJpy.timestamp,
+  });
+});
 const port = Number(process.env.PORT || 8080);
 
 console.log(`Chagatto-2 started PORT=${port}`);
