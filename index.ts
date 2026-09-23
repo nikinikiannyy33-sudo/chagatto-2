@@ -28,7 +28,41 @@ function rsi(values: number[], period = 14) {
   const rs = gains / losses;
   return 100 - 100 / (1 + rs);
 }
+function atr(
+  candles: {
+    high: number;
+    low: number;
+    close: number;
+  }[],
+  period = 14
+) {
+  if (candles.length <= period) return null;
 
+  const trueRanges: number[] = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const high = candles[i].high;
+    const low = candles[i].low;
+    const previousClose = candles[i - 1].close;
+
+    const tr = Math.max(
+      high - low,
+      Math.abs(high - previousClose),
+      Math.abs(low - previousClose)
+    );
+
+    trueRanges.push(tr);
+  }
+
+  if (trueRanges.length < period) return null;
+
+  const recent = trueRanges.slice(-period);
+
+  return (
+    recent.reduce((sum, value) => sum + value, 0) /
+    period
+  );
+}
 app.get("/", (c) => {
   return c.json({
     system: "Chagatto-2",
