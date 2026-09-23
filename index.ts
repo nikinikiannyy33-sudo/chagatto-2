@@ -645,6 +645,37 @@ const signalResponse = await fetch(
 
 const signalData: any = await signalResponse.json();
 
+  // シグナル取得が正常か確認
+if (!signalResponse.ok) {
+  return c.json({
+    orderSent: false,
+    error: "SIGNAL_API_ERROR",
+  }, 500);
+}
+
+// BUY / SELL シグナル以外では注文しない
+const currentSignal = String(signalData.signal);
+
+if (
+  currentSignal !== "BUY" &&
+  currentSignal !== "SELL"
+) {
+  return c.json({
+    orderSent: false,
+    error: "NO_TRADE_SIGNAL",
+    signal: currentSignal,
+  }, 409);
+}
+
+// 外部から指定された注文方向とシグナルが違えば拒否
+if (side !== currentSignal) {
+  return c.json({
+    orderSent: false,
+    error: "SIGNAL_SIDE_MISMATCH",
+    requestedSide: side,
+    signal: currentSignal,
+  }, 409);
+}
 const stopDistance = Number(signalData.stopDistance);
 
 if (!Number.isFinite(stopDistance) || stopDistance <= 0) {
@@ -656,7 +687,17 @@ if (!Number.isFinite(stopDistance) || stopDistance <= 0) {
 
 // 損失上限から注文数量を計算
 const rawSize = maxRiskYen / stopDistance;
-const orderSize = Math.floor(rawSize / 100) * 100;
+
+const calculatedOrderSize =
+  Math.floor(rawSize / 100) * 100;
+
+// 注文数量の安全上限
+const maxOrderSize = 10000;
+
+const orderSize = Math.min(
+  calculatedOrderSize,
+  maxOrderSize
+);
 
 if (orderSize < 100) {
   return c.json({
