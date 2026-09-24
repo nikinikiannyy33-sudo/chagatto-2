@@ -742,22 +742,34 @@ if (!Number.isFinite(stopDistance) || stopDistance <= 0) {
 // 損失上限から注文数量を計算
 const rawSize = maxRiskYen / stopDistance;
 
-const calculatedOrderSize =
-  Math.floor(rawSize / 100) * 100;
+// GMO FX USD/JPY の取引ルール
+const minOrderSize = 10000;
+const brokerMaxOrderSize = 500000;
+const sizeStep = 1;
 
-// 注文数量の安全上限
-const maxOrderSize = 10000;
+// リスクから注文数量を計算
+const calculatedOrderSize =
+  Math.floor(rawSize / sizeStep) * sizeStep;
+
+// チャガット2号独自の安全上限
+const internalMaxOrderSize = 10000;
 
 const orderSize = Math.min(
   calculatedOrderSize,
-  maxOrderSize
+  internalMaxOrderSize,
+  brokerMaxOrderSize
 );
 
-if (orderSize < 100) {
+// 最小注文数量に届かなければ注文しない
+if (orderSize < minOrderSize) {
   return c.json({
     orderSent: false,
-    error: "Calculated order size is too small",
-  }, 400);
+    error: "ORDER_SIZE_BELOW_MINIMUM",
+    calculatedOrderSize,
+    minOrderSize,
+    maxRiskYen,
+    stopDistance,
+  }, 409);
 }
 
   const timestamp = Date.now().toString();
