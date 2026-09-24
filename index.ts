@@ -541,6 +541,7 @@ orderSize,
     time: new Date().toISOString(),
   });
 });
+let gmoOrderInProgress = false;
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
@@ -560,6 +561,16 @@ app.post("/gmo-order", async (c) => {
       error: "Unauthorized",
     }, 401);
   }
+  if (gmoOrderInProgress) {
+  return c.json({
+    orderSent: false,
+    error: "ORDER_ALREADY_IN_PROGRESS",
+  }, 409);
+}
+
+gmoOrderInProgress = true;
+
+try {
 
   const apiKey = process.env.GMO_API_KEY;
   const apiSecret = process.env.GMO_API_SECRET;
@@ -925,6 +936,9 @@ return c.json({
   stopPrice,
   stopData,
 });
+} finally {
+  gmoOrderInProgress = false;
+}
 });
 app.get("/gmo-positions", async (c) => {
   const apiKey = process.env.GMO_API_KEY;
