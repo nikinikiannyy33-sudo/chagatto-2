@@ -644,10 +644,53 @@ try {
       positionCount: openPositions.length,
     }, 409);
   }
-  // 5万円・1回の最大リスク2%
-const accountBalance = 50000;
+// GMO FX口座の実際の取引余力を取得
+const assetTimestamp = Date.now().toString();
+const assetMethod = "GET";
+const assetPath = "/v1/account/assets";
+
+const assetSign = crypto
+  .createHmac("sha256", apiSecret)
+  .update(assetTimestamp + assetMethod + assetPath)
+  .digest("hex");
+
+const assetResponse = await fetch(
+  "https://forex-api.coin.z.com/private/v1/account/assets",
+  {
+    method: assetMethod,
+    headers: {
+      "API-KEY": apiKey,
+      "API-TIMESTAMP": assetTimestamp,
+      "API-SIGN": assetSign,
+    },
+  }
+);
+
+const assetData: any = await assetResponse.json();
+
+const accountAsset = Array.isArray(assetData?.data)
+  ? assetData.data[0]
+  : assetData?.data;
+
+const availableAmount = Number(
+  accountAsset?.availableAmount
+);
+
+if (
+  !assetResponse.ok ||
+  assetData?.status !== 0 ||
+  !Number.isFinite(availableAmount) ||
+  availableAmount <= 0
+) {
+  return c.json({
+    orderSent: false,
+    error: "NO_AVAILABLE_FUNDS",
+  }, 409);
+}
+
+// 1回の最大リスク＝取引余力の2%
 const riskRate = 0.02;
-const maxRiskYen = accountBalance * riskRate;
+const maxRiskYen = availableAmount * riskRate;
 
 // 現在のATR×1.5を取得するためシグナルAPIを呼ぶ
 const signalResponse = await fetch(
