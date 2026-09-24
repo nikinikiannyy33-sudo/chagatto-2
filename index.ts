@@ -764,65 +764,95 @@ if (!Number.isFinite(orderId)) {
     data,
   }, 500);
 }
-
 // 成行注文の約定反映を少し待つ
-await new Promise((resolve) => setTimeout(resolve, 1000));
+  // 成行注文の約定情報を最大5回確認
+let execution: any = null;
+let executionData: any = null;
 
-const executionTimestamp = Date.now().toString();
-const executionMethod = "GET";
-const executionPath = "/v1/executions";
+for (let attempt = 1; attempt <= 5; attempt++) {
+  await new Promise((resolve) =>
+    setTimeout(resolve, 1000)
+  );
 
-const executionSign = crypto
-  .createHmac("sha256", apiSecret)
-  .update(
-    executionTimestamp +
-    executionMethod +
-    executionPath
-  )
-  .digest("hex");
+  const executionTimestamp =
+    Date.now().toString();
 
-const executionResponse = await fetch(
-  `https://forex-api.coin.z.com/private/v1/executions?orderId=${orderId}`,
-  {
-    method: executionMethod,
-    headers: {
-      "API-KEY": apiKey,
-      "API-TIMESTAMP": executionTimestamp,
-      "API-SIGN": executionSign,
-    },
+  const executionMethod = "GET";
+  const executionPath = "/v1/executions";
+
+  const executionSign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(
+      executionTimestamp +
+      executionMethod +
+      executionPath
+    )
+    .digest("hex");
+
+  const executionResponse = await fetch(
+    `https://forex-api.coin.z.com/private/v1/executions?orderId=${orderId}`,
+    {
+      method: executionMethod,
+      headers: {
+        "API-KEY": apiKey,
+        "API-TIMESTAMP": executionTimestamp,
+        "API-SIGN": executionSign,
+      },
+    }
+  );
+
+  executionData =
+    await executionResponse.json();
+
+  const executions =
+    Array.isArray(executionData?.data?.list)
+      ? executionData.data.list
+      : [];
+
+  execution = executions.find(
+    (x: any) =>
+      Number(x.orderId) === orderId &&
+      x.symbol === "USD_JPY" &&
+      x.settleType === "OPEN"
+  );
+
+  if (execution) {
+    break;
   }
-);
-
-const executionData: any =
-  await executionResponse.json();
-
-const executions = Array.isArray(
-  executionData?.data?.list
-)
-  ? executionData.data.list
-  : [];
-
-const execution = executions.find(
-  (x: any) =>
-    Number(x.orderId) === orderId &&
-    x.symbol === "USD_JPY" &&
-    x.settleType === "OPEN"
-);
+}
 
 if (!execution) {
   return c.json({
     orderSent: true,
     stopOrderSent: false,
     orderId,
-    error: "EXECUTION_NOT_FOUND",
+    error: "EXECUTION_NOT_FOUND_AFTER_RETRY",
     executionData,
   }, 202);
 }
 
+
 const positionId = Number(execution.positionId);
 const entryPrice = Number(execution.price);
 const executedSize = String(execution.size);
+const executedSizeNumber =
+  Number(executedSize);
 
+if (
+  !Number.isFinite(positionId) ||
+  positionId <= 0 ||
+  !Number.isFinite(entryPrice) ||
+  entryPrice <= 0 ||
+  !Number.isFinite(executedSizeNumber) ||
+  executedSizeNumber <= 0
+) {
+  return c.json({
+    orderSent: true,
+    stopOrderSent: false,
+    orderId,
+    error: "INVALID_EXECUTION_DATA",
+  }, 500);
+}
 // 約定価格を基準にSTOP価格を固定
 const rawStopPrice =
   side === "BUY"
