@@ -855,6 +855,7 @@ for (let attempt = 1; attempt <= 5; attempt++) {
     )
     .digest("hex");
 
+  try {
   const executionResponse = await fetch(
     `https://forex-api.coin.z.com/private/v1/executions?orderId=${orderId}`,
     {
@@ -884,6 +885,13 @@ for (let attempt = 1; attempt <= 5; attempt++) {
 
   if (execution) {
     break;
+    } catch (error) {
+  executionData = {
+    error: "EXECUTION_API_RETRY",
+    attempt,
+  };
+  continue;
+}
   }
 }
 
