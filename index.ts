@@ -1080,6 +1080,7 @@ for (let attempt = 1; attempt <= 5; attempt++) {
 
   if (execution) {
     break;
+    }
     } catch (error) {
   executionData = {
     error: "EXECUTION_API_RETRY",
