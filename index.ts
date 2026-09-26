@@ -267,6 +267,201 @@ const avgLoss = losses > 0 ? losingPips / losses : 0;
     results: stopLossResults
   });
 });
+app.get("/auto-backtest", async (c) => {
+  const apiKey = process.env.TWELVE_DATA_API_KEY;
+
+  if (!apiKey) {
+    return c.json(
+      { error: "TWELVE_DATA_API_KEY is not set" },
+      500
+    );
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.twelvedata.com/time_series?symbol=USD/JPY&interval=1h&outputsize=500&apikey=${apiKey}`
+    );
+
+    const data = await response.json() as any;
+
+    if (!data.values || !Array.isArray(data.values)) {
+      return c.json({
+        error: "Twelve Data API error",
+        details: data,
+      }, 500);
+    }
+
+    const candles = data.values
+      .slice()
+      .reverse()
+      .map((item: any) => ({
+        time: item.datetime,
+        close: Number(item.close),
+        high: Number(item.high),
+        low: Number(item.low),
+      }))
+      .filter(
+        (item: any) =>
+          Number.isFinite(item.close) &&
+          Number.isFinite(item.high) &&
+          Number.isFinite(item.low)
+      );
+
+    // 現在の4.618を中心に自動比較
+    const stopLossCandidates = [
+      3.0,
+      3.5,
+      4.0,
+      4.5,
+      4.618,
+      5.0,
+      5.5,
+      6.0,
+    ];
+
+    const results: any[] = [];
+
+    for (const stopLoss of stopLossCandidates) {
+      let trades = 0;
+      let wins = 0;
+      let losses = 0;
+      let totalPips = 0;
+      let grossProfit = 0;
+      let grossLoss = 0;
+      let equity = 0;
+      let peakEquity = 0;
+      let maxDrawdown = 0;
+
+      for (let i = 14; i < candles.length - 1; i++) {
+        const history = candles
+          .slice(0, i + 1)
+          .map((item: any) => item.close);
+
+        const sma5 = sma(history, 5);
+        const sma10 = sma(history, 10);
+        const rsi14 = rsi(history, 14);
+
+        if (
+          sma5 === null ||
+          sma10 === null ||
+          rsi14 === null
+        ) {
+          continue;
+        }
+
+        let signal = "WAIT";
+
+        // 現在のチャガット1号の条件を変更しない
+        if (sma5 > sma10 && rsi14 < 60) {
+          signal = "BUY";
+        } else if (sma5 < sma10 && rsi14 > 40) {
+          signal = "SELL";
+        }
+
+        if (signal === "WAIT") continue;
+
+        const tradeTime = candles[i].time;
+        const tradeHour =
+          Number(tradeTime.slice(11, 13));
+
+        // 現在の時間フィルターを変更しない
+        if (![0, 6].includes(tradeHour)) {
+          continue;
+        }
+
+        const entry = candles[i].close;
+        const nextCandle = candles[i + 1];
+
+        if (!nextCandle) continue;
+
+        const exit = nextCandle.close;
+
+        let pips =
+          signal === "BUY"
+            ? (exit - entry) * 100
+            : (entry - exit) * 100;
+
+        const stopPrice =
+          signal === "BUY"
+            ? entry - stopLoss / 100
+            : entry + stopLoss / 100;
+
+        const stopHit =
+          signal === "BUY"
+            ? nextCandle.low <= stopPrice
+            : nextCandle.high >= stopPrice;
+
+        if (stopHit) {
+          pips = -stopLoss;
+        }
+
+        trades++;
+        totalPips += pips;
+
+        if (pips > 0) {
+          wins++;
+          grossProfit += pips;
+        } else if (pips < 0) {
+          losses++;
+          grossLoss += Math.abs(pips);
+        }
+
+        equity += pips;
+        peakEquity = Math.max(
+          peakEquity,
+          equity
+        );
+
+        maxDrawdown = Math.max(
+          maxDrawdown,
+          peakEquity - equity
+        );
+      }
+
+      const winRate =
+        trades > 0
+          ? (wins / trades) * 100
+          : 0;
+
+      const profitFactor =
+        grossLoss > 0
+          ? grossProfit / grossLoss
+          : grossProfit > 0
+            ? Infinity
+            : 0;
+
+      results.push({
+        stopLoss,
+        trades,
+        wins,
+        losses,
+        winRate,
+        totalPips,
+        profitFactor,
+        maxDrawdown,
+      });
+    }
+
+    return c.json({
+      system: "Chagatto-1 Auto Backtest",
+      pair: "USDJPY",
+      interval: "1h",
+      baselineStopLoss: 4.618,
+      testedStopLosses: stopLossCandidates,
+      results,
+      note:
+        "Comparison only. Parameters are not automatically changed.",
+    });
+  } catch (error) {
+    return c.json({
+      error: "AUTO_BACKTEST_FAILED",
+      message:
+        error instanceof Error
+          ? error.message
+          : String(error),
+    }, 500);
+  }
+});
 app.get("/gmo-test", async (c) => {
   const apiKey = process.env.GMO_API_KEY;
   const apiSecret = process.env.GMO_API_SECRET;
