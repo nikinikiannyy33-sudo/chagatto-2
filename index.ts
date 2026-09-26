@@ -672,13 +672,34 @@ app.get("/auto-optimize", async (c) => {
       }
     }
 
-    // 比較しやすいようtotalPips順に並べる
-    const rankedResults = results
-      .slice()
-      .sort(
-        (a, b) =>
-          b.totalPips - a.totalPips
-      );
+    // 成績だけでなく安定性も含めて自動評価する
+const rankedResults = results
+  .map((result: any) => {
+    const score =
+      result.totalPips +
+      result.profitFactor * 10 -
+      result.maxDrawdown * 0.5;
+
+    return {
+      ...result,
+      score,
+    };
+  })
+  .filter(
+    (result: any) =>
+      result.trades >= 15 &&
+      result.totalPips > 0 &&
+      result.profitFactor > 1
+  )
+  .sort(
+    (a: any, b: any) =>
+      b.score - a.score
+  );
+
+const bestCandidate =
+  rankedResults.length > 0
+    ? rankedResults[0]
+    : null;
 
     return c.json({
       system: "Chagatto-1 Auto Optimizer",
@@ -694,6 +715,7 @@ app.get("/auto-optimize", async (c) => {
       },
 
       combinationsTested: results.length,
+      bestCandidate,
 
       // 上位20件だけ表示
       topResults: rankedResults.slice(0, 20),
