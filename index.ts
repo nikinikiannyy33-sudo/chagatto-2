@@ -1089,7 +1089,6 @@ for (let attempt = 1; attempt <= 5; attempt++) {
   continue;
 }
   }
-}
 
 if (!execution) {
   return c.json({
