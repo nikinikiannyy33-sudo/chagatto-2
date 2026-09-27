@@ -1492,27 +1492,48 @@ const stopSign = crypto
   .update(stopText)
   .digest("hex");
 
-const stopResponse = await fetch(
-  "https://forex-api.coin.z.com/private/v1/closeOrder",
-  {
-    method: stopMethod,
-    headers: {
-      "Content-Type": "application/json",
-      "API-KEY": apiKey,
-      "API-TIMESTAMP": stopTimestamp,
-      "API-SIGN": stopSign,
-    },
-    body: stopBody,
-  }
-);
+let stopResponse: Response | null = null;
+let stopData: any = null;
+let stopRequestError: string | null = null;
 
-const stopData: any =
-  await stopResponse.json();
+try {
+  stopResponse = await fetch(
+    "https://forex-api.coin.z.com/private/v1/closeOrder",
+    {
+      method: stopMethod,
+      headers: {
+        "Content-Type": "application/json",
+        "API-KEY": apiKey,
+        "API-TIMESTAMP": stopTimestamp,
+        "API-SIGN": stopSign,
+      },
+      body: stopBody,
+    }
+  );
+
+  const stopTextResponse =
+    await stopResponse.text();
+
+  try {
+    stopData = JSON.parse(stopTextResponse);
+  } catch {
+    stopData = {
+      rawResponse: stopTextResponse,
+    };
+  }
+} catch (error) {
+  stopRequestError =
+    error instanceof Error
+      ? error.message
+      : String(error);
+}
 
 return c.json({
   orderSent: true,
   stopOrderSent:
-    stopResponse.ok && stopData.status === 0,
+  stopResponse !== null &&
+  stopResponse.ok &&
+  stopData?.status === 0,
   symbol: "USD_JPY",
   side,
   orderId,
@@ -1520,8 +1541,9 @@ return c.json({
   executedSize: totalExecutedSize,
   positions: settlePosition,
   stopDistance,
-  stopPrice,
-  stopData,
+stopPrice,
+stopData,
+stopRequestError,
 });
 } finally {
   gmoOrderInProgress = false;
