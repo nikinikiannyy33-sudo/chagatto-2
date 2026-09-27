@@ -1301,7 +1301,7 @@ if (!Number.isFinite(orderId)) {
 }
 // 成行注文の約定反映を少し待つ
   // 成行注文の約定情報を最大5回確認
-let execution: any = null;
+let executions: any[] = [];
 let executionData: any = null;
 
 for (let attempt = 1; attempt <= 5; attempt++) {
@@ -1340,21 +1340,25 @@ for (let attempt = 1; attempt <= 5; attempt++) {
   executionData =
     await executionResponse.json();
 
-  const executions =
-    Array.isArray(executionData?.data?.list)
-      ? executionData.data.list
-      : [];
+  executions = Array.isArray(executionData?.data?.list)
+  ? executionData.data.list.filter(
+      (x: any) =>
+        Number(x.orderId) === orderId &&
+        x.symbol === "USD_JPY" &&
+        x.settleType === "OPEN"
+    )
+  : [];
 
-  execution = executions.find(
-    (x: any) =>
-      Number(x.orderId) === orderId &&
-      x.symbol === "USD_JPY" &&
-      x.settleType === "OPEN"
-  );
+const totalExecutedSize = executions.reduce(
+  (sum: number, x: any) =>
+    sum + Number(x.size || 0),
+  0
+);
 
-  if (execution) {
-    break;
-    }
+// 注文数量すべての約定を確認してから次へ進む
+if (totalExecutedSize >= orderSize) {
+  break;
+}
     } catch (error) {
   executionData = {
     error: "EXECUTION_API_RETRY",
@@ -1364,7 +1368,7 @@ for (let attempt = 1; attempt <= 5; attempt++) {
 }
   }
 
-if (!execution) {
+if (executions.length === 0) {
   return c.json({
     orderSent: true,
     stopOrderSent: false,
@@ -1374,20 +1378,76 @@ if (!execution) {
   }, 202);
 }
 
-
-const positionId = Number(execution.positionId);
-const entryPrice = Number(execution.price);
-const executedSize = String(execution.size);
-const executedSizeNumber =
-  Number(executedSize);
+// 約定数量の合計
+const totalExecutedSize = executions.reduce(
+  (sum: number, x: any) =>
+    sum + Number(x.size || 0),
+  0
+);
 
 if (
-  !Number.isFinite(positionId) ||
-  positionId <= 0 ||
+  !Number.isFinite(totalExecutedSize) ||
+  totalExecutedSize < orderSize
+) {
+  return c.json({
+    orderSent: true,
+    stopOrderSent: false,
+    orderId,
+    error: "PARTIAL_EXECUTION_AFTER_RETRY",
+    executedSize: totalExecutedSize,
+    orderSize,
+  }, 202);
+}
+
+// 全約定の加重平均価格
+const weightedPriceTotal = executions.reduce(
+  (sum: number, x: any) =>
+    sum + Number(x.price) * Number(x.size),
+  0
+);
+
+const entryPrice =
+  weightedPriceTotal / totalExecutedSize;
+
+// 同じpositionIdの約定をまとめる
+const positionMap = new Map<number, number>();
+
+for (const x of executions) {
+  const positionId = Number(x.positionId);
+  const size = Number(x.size);
+
+  if (
+    !Number.isFinite(positionId) ||
+    positionId <= 0 ||
+    !Number.isFinite(size) ||
+    size <= 0
+  ) {
+    return c.json({
+      orderSent: true,
+      stopOrderSent: false,
+      orderId,
+      error: "INVALID_EXECUTION_DATA",
+    }, 500);
+  }
+
+  positionMap.set(
+    positionId,
+    (positionMap.get(positionId) || 0) + size
+  );
+}
+
+const settlePosition = Array.from(
+  positionMap.entries()
+).map(([positionId, size]) => ({
+  positionId,
+  size: String(size),
+}));
+
+if (
   !Number.isFinite(entryPrice) ||
   entryPrice <= 0 ||
-  !Number.isFinite(executedSizeNumber) ||
-  executedSizeNumber <= 0
+  settlePosition.length === 0 ||
+  settlePosition.length > 10
 ) {
   return c.json({
     orderSent: true,
@@ -1418,12 +1478,7 @@ const stopBody = JSON.stringify({
   side: stopSide,
   executionType: "STOP",
   stopPrice,
-  settlePosition: [
-    {
-      positionId,
-      size: executedSize,
-    },
-  ],
+  settlePosition,
 });
 
 const stopText =
@@ -1461,9 +1516,9 @@ return c.json({
   symbol: "USD_JPY",
   side,
   orderId,
-  positionId,
   entryPrice,
-  size: executedSize,
+  executedSize: totalExecutedSize,
+  positions: settlePosition,
   stopDistance,
   stopPrice,
   stopData,
