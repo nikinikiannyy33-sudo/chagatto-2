@@ -953,21 +953,21 @@ app.get("/gmo-signal", async (c) => {
     }, 500);
   }
 
-  const sma5 = sma(closes, 5);
-  const sma10 = sma(closes, 10);
+  const sma7 = sma(closes, 7);
+  const sma8 = sma(closes, 8);
   const rsi14 = rsi(closes, 14);
   const atr14 = atr(completedCandles, 14);
 
   let signal = "WAIT";
 
   if (
-    sma5 !== null &&
-    sma10 !== null &&
+    sma7 !== null &&
+    sma8 !== null &&
     rsi14 !== null
   ) {
-    if (sma5 > sma10 && rsi14 < 70) {
+    if (sma7 > sma8 && rsi14 < 60) {
       signal = "BUY";
-    } else if (sma5 < sma10 && rsi14 > 30) {
+    } else if (sma7 < sma8 && rsi14 > 45) {
       signal = "SELL";
     }
   }
@@ -1289,9 +1289,18 @@ if (!response.ok || data.status !== 0) {
   }, 500);
 }
 
-const orderId = Number(data?.data);
+const orderResult = Array.isArray(data?.data)
+  ? data.data[0]
+  : data?.data;
 
-if (!Number.isFinite(orderId)) {
+const orderId = Number(
+  orderResult?.orderId ?? orderResult
+);
+const rootOrderId = Number(
+  orderResult?.rootOrderId ?? orderId
+);
+
+if (!Number.isFinite(orderId) || !Number.isFinite(rootOrderId)) {
   return c.json({
     orderSent: true,
     stopOrderSent: false,
@@ -1369,11 +1378,75 @@ if (totalExecutedSize >= orderSize) {
   }
 
 if (executions.length === 0) {
+  // executions APIだけで約定を確認できない場合、建玉を再照合する。
+  // 新規注文前に建玉ゼロを確認済みなので、ここで現れた同方向の建玉を
+  // 今回注文の約定結果として復旧し、STOP保護へ進める。
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
+  const reconcileTimestamp = Date.now().toString();
+  const reconcileMethod = "GET";
+  const reconcilePath = "/v1/openPositions";
+  const reconcileSign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(reconcileTimestamp + reconcileMethod + reconcilePath)
+    .digest("hex");
+
+  try {
+    const reconcileResponse = await fetch(
+      "https://forex-api.coin.z.com/private/v1/openPositions?symbol=USD_JPY&count=100",
+      {
+        method: reconcileMethod,
+        headers: {
+          "API-KEY": apiKey,
+          "API-TIMESTAMP": reconcileTimestamp,
+          "API-SIGN": reconcileSign,
+        },
+      }
+    );
+
+    const reconcileData: any = await reconcileResponse.json();
+    const reconciledPositions = Array.isArray(reconcileData?.data?.list)
+      ? reconcileData.data.list
+      : Array.isArray(reconcileData?.data)
+        ? reconcileData.data
+        : [];
+
+    if (reconcileResponse.ok && reconcileData?.status === 0) {
+      executions = reconciledPositions
+        .filter(
+          (p: any) =>
+            p.symbol === "USD_JPY" &&
+            p.side === side &&
+            Number(p.positionId) > 0 &&
+            Number(p.size) > 0 &&
+            Number(p.price) > 0
+        )
+        .map((p: any) => ({
+          orderId,
+          symbol: "USD_JPY",
+          settleType: "OPEN",
+          positionId: p.positionId,
+          size: p.size,
+          price: p.price,
+          reconciledFromOpenPositions: true,
+        }));
+    }
+  } catch (error) {
+    executionData = {
+      ...executionData,
+      reconciliationError:
+        error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+if (executions.length === 0) {
+  // 約定なしと断定はしない。注文状態が不明なため本番運用では要監視。
   return c.json({
     orderSent: true,
     stopOrderSent: false,
     orderId,
-    error: "EXECUTION_NOT_FOUND_AFTER_RETRY",
+    error: "EXECUTION_STATE_UNKNOWN_AFTER_RECONCILIATION",
     executionData,
   }, 202);
 }
@@ -1385,18 +1458,128 @@ const totalExecutedSize = executions.reduce(
   0
 );
 
-if (
-  !Number.isFinite(totalExecutedSize) ||
-  totalExecutedSize < orderSize
-) {
+if (!Number.isFinite(totalExecutedSize) || totalExecutedSize <= 0) {
   return c.json({
     orderSent: true,
     stopOrderSent: false,
     orderId,
-    error: "PARTIAL_EXECUTION_AFTER_RETRY",
+    error: "INVALID_EXECUTED_SIZE",
     executedSize: totalExecutedSize,
-    orderSize,
-  }, 202);
+  }, 500);
+}
+
+// 部分約定時は注文状態も確認する。約定済み分は必ずSTOP保護へ進める。
+let entryOrderStatus: string | null = null;
+let entryOrderData: any = null;
+
+if (totalExecutedSize < orderSize) {
+  const orderStatusTimestamp = Date.now().toString();
+  const orderStatusMethod = "GET";
+  const orderStatusPath = "/v1/orders";
+  const orderStatusSign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(orderStatusTimestamp + orderStatusMethod + orderStatusPath)
+    .digest("hex");
+
+  try {
+    const orderStatusResponse = await fetch(
+      `https://forex-api.coin.z.com/private/v1/orders?orderId=${orderId}`,
+      {
+        method: orderStatusMethod,
+        headers: {
+          "API-KEY": apiKey,
+          "API-TIMESTAMP": orderStatusTimestamp,
+          "API-SIGN": orderStatusSign,
+        },
+      }
+    );
+    entryOrderData = await orderStatusResponse.json();
+    const orderList = Array.isArray(entryOrderData?.data?.list)
+      ? entryOrderData.data.list
+      : Array.isArray(entryOrderData?.data)
+        ? entryOrderData.data
+        : [];
+    const matchedEntryOrder = orderList.find(
+      (x: any) => Number(x.orderId) === orderId
+    );
+    entryOrderStatus = matchedEntryOrder?.status ?? null;
+  } catch (error) {
+    entryOrderData = {
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+const partialExecution = totalExecutedSize < orderSize;
+
+// 部分約定で残注文が生きている場合、後から追加約定してSTOP対象外に
+// なることを防ぐため、残注文を先に取消す。
+let remainderCancelAttempted = false;
+let remainderCancelSucceeded = false;
+let remainderCancelData: any = null;
+
+if (
+  partialExecution &&
+  ["WAITING", "ORDERED", "MODIFYING"].includes(String(entryOrderStatus))
+) {
+  remainderCancelAttempted = true;
+  const cancelTimestamp = Date.now().toString();
+  const cancelMethod = "POST";
+  const cancelPath = "/v1/cancelOrders";
+  const cancelBody = JSON.stringify({
+    rootOrderIds: [rootOrderId],
+  });
+  const cancelSign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(cancelTimestamp + cancelMethod + cancelPath + cancelBody)
+    .digest("hex");
+
+  try {
+    const cancelResponse = await fetch(
+      "https://forex-api.coin.z.com/private/v1/cancelOrders",
+      {
+        method: cancelMethod,
+        headers: {
+          "Content-Type": "application/json",
+          "API-KEY": apiKey,
+          "API-TIMESTAMP": cancelTimestamp,
+          "API-SIGN": cancelSign,
+        },
+        body: cancelBody,
+      }
+    );
+    const cancelText = await cancelResponse.text();
+    try {
+      remainderCancelData = JSON.parse(cancelText);
+    } catch {
+      remainderCancelData = { rawResponse: cancelText };
+    }
+    remainderCancelSucceeded =
+      cancelResponse.ok && remainderCancelData?.status === 0;
+  } catch (error) {
+    remainderCancelData = {
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  // 残注文の取消可否が不明なままSTOPを置くと、その後の追加約定分が
+  // 無保護になる可能性があるため、ここでは自動運転を継続しない。
+  if (!remainderCancelSucceeded) {
+    return c.json({
+      orderSent: true,
+      stopOrderSent: false,
+      orderId,
+      rootOrderId,
+      error: "PARTIAL_FILL_REMAINDER_CANCEL_FAILED",
+      executedSize: totalExecutedSize,
+      requestedSize: orderSize,
+      entryOrderStatus,
+      remainderCancelData,
+    }, 202);
+  }
+
+  // GMO Private APIのPOST上限（1秒1回）を守ってからSTOP注文へ進む。
+  await new Promise((resolve) => setTimeout(resolve, 1100));
 }
 
 // 全約定の加重平均価格
@@ -1472,10 +1655,13 @@ const stopSide =
 const stopTimestamp = Date.now().toString();
 const stopMethod = "POST";
 const stopPath = "/v1/closeOrder";
+const stopClientOrderId =
+  `CS${orderId}${Date.now()}`.slice(0, 36);
 
 const stopBody = JSON.stringify({
   symbol: "USD_JPY",
   side: stopSide,
+  clientOrderId: stopClientOrderId,
   executionType: "STOP",
   stopPrice,
   settlePosition,
@@ -1528,27 +1714,280 @@ try {
       : String(error);
 }
 
+// STOP応答が不明・失敗の場合、GMO側の有効注文を照合する
+let stopConfirmedByActiveOrders = false;
+let matchedStopOrder: any = null;
+let activeOrdersCheckSucceeded = false;
+
+if (
+  stopResponse === null ||
+  !stopResponse.ok ||
+  stopData?.status !== 0
+) {
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
+  const activeTimestamp = Date.now().toString();
+  const activeMethod = "GET";
+  const activePath = "/v1/activeOrders";
+  const activeSign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(activeTimestamp + activeMethod + activePath)
+    .digest("hex");
+
+  try {
+    const activeResponse = await fetch(
+      "https://forex-api.coin.z.com/private/v1/activeOrders?symbol=USD_JPY&count=100",
+      {
+        method: activeMethod,
+        headers: {
+          "API-KEY": apiKey,
+          "API-TIMESTAMP": activeTimestamp,
+          "API-SIGN": activeSign,
+        },
+      }
+    );
+    const activeData: any = await activeResponse.json();
+    activeOrdersCheckSucceeded =
+      activeResponse.ok && activeData?.status === 0;
+
+    const activeOrders = Array.isArray(activeData?.data?.list)
+      ? activeData.data.list
+      : Array.isArray(activeData?.data)
+        ? activeData.data
+        : [];
+
+    matchedStopOrder =
+      activeOrders.find(
+        (x: any) =>
+          x.clientOrderId === stopClientOrderId &&
+          x.symbol === "USD_JPY" &&
+          x.executionType === "STOP" &&
+          x.settleType === "CLOSE"
+      ) ?? null;
+
+    stopConfirmedByActiveOrders = matchedStopOrder !== null;
+  } catch (error) {
+    console.error("STOP activeOrders check failed:", error);
+  }
+}
+
+const stopConfirmed =
+  (
+    stopResponse !== null &&
+    stopResponse.ok &&
+    stopData?.status === 0
+  ) || stopConfirmedByActiveOrders;
+
+// STOPがGMO側に存在しないことを確認できた場合だけ、
+// 建玉を成行決済して無防備なポジションを残さない。
+// 照合自体に失敗した場合は二重決済を避けるため自動決済しない。
+let emergencyCloseAttempted = false;
+let emergencyCloseSucceeded = false;
+let emergencyCloseData: any = null;
+let emergencyCloseError: string | null = null;
+
+if (!stopConfirmed && activeOrdersCheckSucceeded) {
+  emergencyCloseAttempted = true;
+
+  const emergencyTimestamp = Date.now().toString();
+  const emergencyMethod = "POST";
+  const emergencyPath = "/v1/closeOrder";
+  const emergencyClientOrderId =
+    `CE${orderId}${Date.now()}`.slice(0, 36);
+
+  const emergencyBody = JSON.stringify({
+    symbol: "USD_JPY",
+    side: stopSide,
+    clientOrderId: emergencyClientOrderId,
+    executionType: "MARKET",
+    settlePosition,
+  });
+
+  const emergencySign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(
+      emergencyTimestamp +
+      emergencyMethod +
+      emergencyPath +
+      emergencyBody
+    )
+    .digest("hex");
+
+  try {
+    const emergencyResponse = await fetch(
+      "https://forex-api.coin.z.com/private/v1/closeOrder",
+      {
+        method: emergencyMethod,
+        headers: {
+          "Content-Type": "application/json",
+          "API-KEY": apiKey,
+          "API-TIMESTAMP": emergencyTimestamp,
+          "API-SIGN": emergencySign,
+        },
+        body: emergencyBody,
+      }
+    );
+
+    const emergencyText = await emergencyResponse.text();
+    try {
+      emergencyCloseData = JSON.parse(emergencyText);
+    } catch {
+      emergencyCloseData = { rawResponse: emergencyText };
+    }
+
+    emergencyCloseSucceeded =
+      emergencyResponse.ok &&
+      emergencyCloseData?.status === 0;
+  } catch (error) {
+    emergencyCloseError =
+      error instanceof Error
+        ? error.message
+        : String(error);
+  }
+}
+
+const protectionState = stopConfirmed
+  ? "STOP_CONFIRMED"
+  : emergencyCloseSucceeded
+    ? "EMERGENCY_CLOSE_SENT"
+    : activeOrdersCheckSucceeded
+      ? "PROTECTION_FAILED"
+      : "PROTECTION_UNKNOWN";
+
 return c.json({
   orderSent: true,
-  stopOrderSent:
-  stopResponse !== null &&
-  stopResponse.ok &&
-  stopData?.status === 0,
+  stopOrderSent: stopConfirmed,
   symbol: "USD_JPY",
   side,
   orderId,
+  rootOrderId,
   entryPrice,
   executedSize: totalExecutedSize,
+  requestedSize: orderSize,
+  partialExecution,
+  entryOrderStatus,
+  remainderCancelAttempted,
+  remainderCancelSucceeded,
+  remainderCancelData,
+  entryOrderData,
   positions: settlePosition,
   stopDistance,
 stopPrice,
+stopClientOrderId,
 stopData,
 stopRequestError,
+stopConfirmedByActiveOrders,
+matchedStopOrder,
+activeOrdersCheckSucceeded,
+protectionState,
+emergencyCloseAttempted,
+emergencyCloseSucceeded,
+emergencyCloseData,
+emergencyCloseError,
 });
 } finally {
   gmoOrderInProgress = false;
 }
 });
+
+// 自動実行用エンドポイント。
+// 外部スケジューラから 08:00 / 15:00 / 21:00 (JST) に呼び出す。
+// LIVE_TRADING_ENABLED=false の間は実注文されない。
+app.post("/gmo-auto-run", async (c) => {
+  const adminToken = process.env.ADMIN_TOKEN;
+  const receivedToken = c.req.header("X-ADMIN-TOKEN");
+
+  if (!adminToken || receivedToken !== adminToken) {
+    return c.json({
+      autoRun: false,
+      error: "Unauthorized",
+    }, 401);
+  }
+
+  // シグナルをサーバー内部で取得
+  let signalResponse: Response;
+  let signalData: any;
+
+  try {
+    signalResponse = await fetch(
+      new URL("/gmo-signal", c.req.url).toString()
+    );
+    signalData = await signalResponse.json();
+  } catch (error) {
+    return c.json({
+      autoRun: false,
+      error: "SIGNAL_FETCH_FAILED",
+      message:
+        error instanceof Error ? error.message : String(error),
+    }, 500);
+  }
+
+  if (!signalResponse.ok) {
+    return c.json({
+      autoRun: false,
+      error: "SIGNAL_API_ERROR",
+      signalData,
+    }, 500);
+  }
+
+  const signal = String(signalData?.signal ?? "WAIT");
+
+  // WAITなら注文処理を呼ばない
+  if (signal !== "BUY" && signal !== "SELL") {
+    return c.json({
+      autoRun: true,
+      action: "NO_ORDER",
+      signal,
+      signalData,
+    });
+  }
+
+  // 実注文処理は既存 /gmo-order に一本化する。
+  // これにより資金確認・建玉確認・部分約定・STOP保護を重複実装しない。
+  let orderResponse: Response;
+  let orderData: any;
+
+  try {
+    orderResponse = await fetch(
+      new URL("/gmo-order", c.req.url).toString(),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-ADMIN-TOKEN": adminToken,
+        },
+        body: JSON.stringify({ side: signal }),
+      }
+    );
+
+    const orderText = await orderResponse.text();
+
+    try {
+      orderData = JSON.parse(orderText);
+    } catch {
+      orderData = { rawResponse: orderText };
+    }
+  } catch (error) {
+    return c.json({
+      autoRun: false,
+      action: "ORDER_REQUEST_FAILED",
+      signal,
+      message:
+        error instanceof Error ? error.message : String(error),
+    }, 500);
+  }
+
+  return c.json({
+    autoRun: true,
+    action: orderResponse.ok
+      ? "ORDER_FLOW_COMPLETED"
+      : "ORDER_FLOW_REJECTED",
+    signal,
+    orderHttpStatus: orderResponse.status,
+    orderData,
+  }, orderResponse.ok ? 200 : 409);
+});
+
 app.get("/gmo-positions", async (c) => {
   const apiKey = process.env.GMO_API_KEY;
   const apiSecret = process.env.GMO_API_SECRET;
@@ -1639,7 +2078,15 @@ app.post("/gmo-close", async (c) => {
 
   const positionId = Number(body.positionId);
   const positionSide = body.positionSide;
-  const size = String(body.size || "10000");
+  const sizeValue = Number(body.size);
+  const size = String(body.size ?? "");
+
+  if (!Number.isFinite(sizeValue) || sizeValue <= 0) {
+    return c.json({
+      closeSent: false,
+      error: "Valid size is required",
+    }, 400);
+  }
 
   if (!Number.isFinite(positionId)) {
     return c.json({
