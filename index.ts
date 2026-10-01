@@ -1979,6 +1979,30 @@ app.post("/gmo-order", async (c) => {
       error: "Unauthorized",
     }, 401);
   }
+
+  // 安全装置3：注文APIを直接呼ばれても、当日確定損益が
+  // 日次損失上限以下なら新規注文を必ず拒否する。
+  // 損益を確認できない場合も安全側に倒して注文しない。
+  let orderDailyPnl: Awaited<ReturnType<typeof getTodayRealizedPnlJst>>;
+  try {
+    orderDailyPnl = await getTodayRealizedPnlJst();
+  } catch (error) {
+    return c.json({
+      orderSent: false,
+      error: "DAILY_PNL_CHECK_FAILED",
+      message: error instanceof Error ? error.message : String(error),
+    }, 503);
+  }
+
+  if (orderDailyPnl.pnl <= DAILY_LOSS_LIMIT_YEN) {
+    return c.json({
+      orderSent: false,
+      error: "DAILY_LOSS_LIMIT_REACHED",
+      daily: orderDailyPnl,
+      dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
+    }, 409);
+  }
+
   if (gmoSafetyHalt) {
     return c.json({
       orderSent: false,
@@ -2017,7 +2041,7 @@ try {
       error: "side must be BUY or SELL",
     }, 400);
   }
-    // 安全装置3：すでに建玉がある場合は新規注文しない
+    // 安全装置4：すでに建玉がある場合は新規注文しない
   const positionTimestamp = Date.now().toString();
   const positionMethod = "GET";
   const positionPath = "/v1/openPositions";
