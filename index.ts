@@ -900,6 +900,155 @@ const bestCandidate =
     );
   }
 });
+
+app.get("/walk-forward", async (c) => {
+  const apiKey = process.env.TWELVE_DATA_API_KEY;
+  if (!apiKey) return c.json({ error: "TWELVE_DATA_API_KEY is not set" }, 500);
+
+  try {
+    const response = await fetch(
+      `https://api.twelvedata.com/time_series?symbol=USD/JPY&interval=1h&outputsize=500&apikey=${apiKey}`
+    );
+    const data = (await response.json()) as any;
+    if (!data.values || !Array.isArray(data.values)) {
+      return c.json({ error: "Twelve Data API error", details: data }, 500);
+    }
+
+    const candles = data.values.slice().reverse().map((item: any) => ({
+      time: item.datetime,
+      close: Number(item.close),
+      high: Number(item.high),
+      low: Number(item.low),
+    })).filter((item: any) =>
+      Number.isFinite(item.close) && Number.isFinite(item.high) && Number.isFinite(item.low)
+    );
+
+    const splitIndex = Math.floor(candles.length * 0.70);
+    const fastSmaCandidates = [3, 5, 7];
+    const slowSmaCandidates = [8, 10, 12];
+    const buyRsiCandidates = [55, 60, 65];
+    const sellRsiCandidates = [35, 40, 45];
+    const stopLossCandidates = [3, 3.5, 4, 4.5, 4.618, 5, 5.5, 6];
+
+    const evaluate = (params: any, startIndex: number, endIndexExclusive: number) => {
+      let trades = 0, wins = 0, losses = 0, totalPips = 0;
+      let grossProfit = 0, grossLoss = 0, equity = 0, peakEquity = 0, maxDrawdown = 0;
+      let buyTrades = 0, buyPips = 0, sellTrades = 0, sellPips = 0;
+
+      for (let i = Math.max(14, startIndex); i < Math.min(endIndexExclusive, candles.length - 1); i++) {
+        const history = candles.slice(0, i + 1).map((item: any) => item.close);
+        const fast = sma(history, params.fastSma);
+        const slow = sma(history, params.slowSma);
+        const rsi14 = rsi(history, 14);
+        if (fast === null || slow === null || rsi14 === null) continue;
+
+        let signal = "WAIT";
+        if (fast > slow && rsi14 < params.buyRsi) signal = "BUY";
+        else if (fast < slow && rsi14 > params.sellRsi) signal = "SELL";
+        if (signal === "WAIT") continue;
+
+        const tradeHour = Number(candles[i].time.slice(11, 13));
+        if (![0, 6].includes(tradeHour)) continue;
+
+        const entry = candles[i].close;
+        const nextCandle = candles[i + 1];
+        let pips = signal === "BUY"
+          ? (nextCandle.close - entry) * 100
+          : (entry - nextCandle.close) * 100;
+        const stopPrice = signal === "BUY"
+          ? entry - params.stopLoss / 100
+          : entry + params.stopLoss / 100;
+        const stopHit = signal === "BUY"
+          ? nextCandle.low <= stopPrice
+          : nextCandle.high >= stopPrice;
+        if (stopHit) pips = -params.stopLoss;
+
+        trades++;
+        totalPips += pips;
+        if (signal === "BUY") { buyTrades++; buyPips += pips; }
+        else { sellTrades++; sellPips += pips; }
+        if (pips > 0) { wins++; grossProfit += pips; }
+        else if (pips < 0) { losses++; grossLoss += Math.abs(pips); }
+        equity += pips;
+        peakEquity = Math.max(peakEquity, equity);
+        maxDrawdown = Math.max(maxDrawdown, peakEquity - equity);
+      }
+
+      const winRate = trades > 0 ? wins / trades * 100 : 0;
+      const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? null : 0);
+      return { trades, wins, losses, winRate, totalPips, profitFactor, maxDrawdown, buyTrades, buyPips, sellTrades, sellPips };
+    };
+
+    const trainingResults: any[] = [];
+    for (const fastSma of fastSmaCandidates) {
+      for (const slowSma of slowSmaCandidates) {
+        if (fastSma >= slowSma) continue;
+        for (const buyRsi of buyRsiCandidates) {
+          for (const sellRsi of sellRsiCandidates) {
+            for (const stopLoss of stopLossCandidates) {
+              const params = { fastSma, slowSma, buyRsi, sellRsi, stopLoss };
+              const metrics = evaluate(params, 14, splitIndex);
+              const pfForScore = typeof metrics.profitFactor === "number" ? metrics.profitFactor : 0;
+              const score = metrics.totalPips + pfForScore * 10 - metrics.maxDrawdown * 0.5;
+              trainingResults.push({ ...params, ...metrics, score });
+            }
+          }
+        }
+      }
+    }
+
+    const eligible = trainingResults.filter((r: any) =>
+      r.trades >= 10 && r.totalPips > 0 && typeof r.profitFactor === "number" && r.profitFactor > 1
+    ).sort((a: any, b: any) => b.score - a.score);
+
+    const selected = eligible.length > 0 ? eligible[0] : null;
+    if (!selected) {
+      return c.json({
+        system: "Chagatto-1 Walk Forward Validation",
+        pair: "USDJPY", interval: "1h", candles: candles.length,
+        split: { trainingPercent: 70, validationPercent: 30, splitIndex },
+        combinationsTested: trainingResults.length,
+        selected: null,
+        note: "No training candidate passed the minimum filters. Live parameters are NOT changed."
+      });
+    }
+
+    const params = {
+      fastSma: selected.fastSma, slowSma: selected.slowSma,
+      buyRsi: selected.buyRsi, sellRsi: selected.sellRsi, stopLoss: selected.stopLoss
+    };
+    const validation = evaluate(params, splitIndex, candles.length - 1);
+
+    return c.json({
+      system: "Chagatto-1 Walk Forward Validation",
+      pair: "USDJPY", interval: "1h", candles: candles.length,
+      split: {
+        trainingPercent: 70, validationPercent: 30, splitIndex,
+        trainingFrom: candles[0]?.time, trainingTo: candles[splitIndex - 1]?.time,
+        validationFrom: candles[splitIndex]?.time, validationTo: candles[candles.length - 1]?.time
+      },
+      combinationsTested: trainingResults.length,
+      selectedParameters: params,
+      training: {
+        trades: selected.trades, wins: selected.wins, losses: selected.losses,
+        winRate: selected.winRate, totalPips: selected.totalPips,
+        profitFactor: selected.profitFactor, maxDrawdown: selected.maxDrawdown,
+        buyTrades: selected.buyTrades, buyPips: selected.buyPips,
+        sellTrades: selected.sellTrades, sellPips: selected.sellPips,
+        score: selected.score
+      },
+      validation,
+      validationPassed: validation.trades >= 5 && validation.totalPips > 0 && typeof validation.profitFactor === "number" && validation.profitFactor > 1,
+      note: "Parameters are selected only on the first 70% and then frozen for the final 30%. Research only; live parameters are NOT changed."
+    });
+  } catch (error) {
+    return c.json({
+      error: "WALK_FORWARD_FAILED",
+      message: error instanceof Error ? error.message : String(error),
+    }, 500);
+  }
+});
+
 app.get("/gmo-test", async (c) => {
   const apiKey = process.env.GMO_API_KEY;
   const apiSecret = process.env.GMO_API_SECRET;
