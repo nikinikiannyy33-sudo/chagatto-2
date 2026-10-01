@@ -1074,7 +1074,7 @@ async function gmoPrivateGet(path: string, query = "") {
 
 async function getTodayRealizedPnlJst() {
   const todayJst = jstParts().date;
-  const data = await gmoPrivateGet("/v1/latestExecutions");
+  const data = await gmoPrivateGet("/v1/latestExecutions", "?symbol=USD_JPY&count=100");
   const rows = Array.isArray(data?.data)
     ? data.data
     : Array.isArray(data?.data?.list)
