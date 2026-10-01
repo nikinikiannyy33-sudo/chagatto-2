@@ -1984,6 +1984,83 @@ app.get("/gmo-safety-status", (c) => c.json({
   safetyHaltReason: gmoSafetyHaltReason,
 }));
 
+
+// 注文経路の計算だけを検証する安全なシミュレーション。
+// GMO APIへの注文・決済リクエストは一切送信しない。
+app.get("/order-path-test", (c) => {
+  const side = String(c.req.query("side") || "BUY").toUpperCase();
+  const entryPrice = Number(c.req.query("entryPrice") || "150");
+  const stopDistance = Number(c.req.query("stopDistance") || "0.5");
+  const availableAmount = Number(c.req.query("availableAmount") || "100000");
+
+  if (
+    (side !== "BUY" && side !== "SELL") ||
+    !Number.isFinite(entryPrice) || entryPrice <= 0 ||
+    !Number.isFinite(stopDistance) || stopDistance <= 0 ||
+    !Number.isFinite(availableAmount) || availableAmount <= 0
+  ) {
+    return c.json({
+      mode: "SIMULATION_ONLY",
+      orderSent: false,
+      error: "INVALID_TEST_PARAMETERS",
+    }, 400);
+  }
+
+  const riskRate = 0.02;
+  const maxRiskYen = availableAmount * riskRate;
+  const rawSize = maxRiskYen / stopDistance;
+  const calculatedOrderSize = Math.floor(rawSize);
+  const internalMaxOrderSize = 1000;
+  const brokerMaxOrderSize = 500000;
+  const orderSize = Math.min(
+    calculatedOrderSize,
+    internalMaxOrderSize,
+    brokerMaxOrderSize
+  );
+
+  const rawStopPrice =
+    side === "BUY"
+      ? entryPrice - stopDistance
+      : entryPrice + stopDistance;
+  const stopPrice = rawStopPrice.toFixed(3);
+  const stopSide = side === "BUY" ? "SELL" : "BUY";
+  const emergencyCloseSide = stopSide;
+
+  return c.json({
+    mode: "SIMULATION_ONLY",
+    orderSent: false,
+    gmoOrderApiCalled: false,
+    input: {
+      side,
+      entryPrice,
+      stopDistance,
+      availableAmount,
+    },
+    calculation: {
+      riskRate,
+      maxRiskYen,
+      calculatedOrderSize,
+      internalMaxOrderSize,
+      finalOrderSize: orderSize,
+      stopPrice,
+      stopSide,
+      emergencyCloseSide,
+    },
+    checks: {
+      orderSizeWithinInternalLimit: orderSize <= internalMaxOrderSize,
+      stopIsBelowEntryForBuy:
+        side !== "BUY" || Number(stopPrice) < entryPrice,
+      stopIsAboveEntryForSell:
+        side !== "SELL" || Number(stopPrice) > entryPrice,
+      stopSideIsOpposite:
+        (side === "BUY" && stopSide === "SELL") ||
+        (side === "SELL" && stopSide === "BUY"),
+      emergencyCloseSideIsOpposite:
+        emergencyCloseSide === stopSide,
+    },
+  });
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
