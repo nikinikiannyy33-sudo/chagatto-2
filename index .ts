@@ -971,26 +971,8 @@ app.get("/gmo-signal", async (c) => {
       signal = "SELL";
     }
   }
-  const accountBalance = 50000;
-const riskRate = 0.02;
-const maxRiskYen = accountBalance * riskRate;
-
 const stopDistance =
   atr14 !== null ? atr14 * 1.5 : null;
-
-let orderSize = 0;
-
-if (stopDistance !== null && stopDistance > 0) {
-  const rawSize = maxRiskYen / stopDistance;
-
-  // 100通貨単位に切り下げ
-  orderSize = Math.floor(rawSize / 100) * 100;
-
-  // 最低100通貨
-  if (orderSize < 100) {
-    orderSize = 100;
-  }
-}
 
   return c.json({
     system: "Chagatto-2",
@@ -1004,8 +986,6 @@ if (stopDistance !== null && stopDistance > 0) {
     rsi14,
     atr14,
 stopDistance,
-maxRiskYen,
-orderSize,
     signal,
     time: new Date().toISOString(),
   });
