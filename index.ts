@@ -971,10 +971,26 @@ app.get("/gmo-signal", async (c) => {
       signal = "SELL";
     }
   }
-  // シグナルAPIでは口座残高や注文数量を仮定しない。
-  // 実注文数量は /gmo-order がGMO口座の availableAmount を取得して計算する。
-  const stopDistance =
-    atr14 !== null ? atr14 * 1.5 : null;
+  const accountBalance = 50000;
+const riskRate = 0.02;
+const maxRiskYen = accountBalance * riskRate;
+
+const stopDistance =
+  atr14 !== null ? atr14 * 1.5 : null;
+
+let orderSize = 0;
+
+if (stopDistance !== null && stopDistance > 0) {
+  const rawSize = maxRiskYen / stopDistance;
+
+  // 100通貨単位に切り下げ
+  orderSize = Math.floor(rawSize / 100) * 100;
+
+  // 最低100通貨
+  if (orderSize < 100) {
+    orderSize = 100;
+  }
+}
 
   return c.json({
     system: "Chagatto-2",
@@ -988,6 +1004,8 @@ app.get("/gmo-signal", async (c) => {
     rsi14,
     atr14,
 stopDistance,
+maxRiskYen,
+orderSize,
     signal,
     time: new Date().toISOString(),
   });
@@ -1212,7 +1230,7 @@ if (!Number.isFinite(stopDistance) || stopDistance <= 0) {
 const rawSize = maxRiskYen / stopDistance;
 
 // GMO FX USD/JPY の取引ルール
-const minOrderSize = 10000;
+const minOrderSize = 100;
 const brokerMaxOrderSize = 500000;
 const sizeStep = 1;
 
@@ -1221,7 +1239,7 @@ const calculatedOrderSize =
   Math.floor(rawSize / sizeStep) * sizeStep;
 
 // チャガット2号独自の安全上限
-const internalMaxOrderSize = 10000;
+const internalMaxOrderSize = 1000;
 
 const orderSize = Math.min(
   calculatedOrderSize,
@@ -2241,8 +2259,8 @@ const positions = Array.isArray(positionsData?.data)
     ? positionsData.data.list
     : [];
 
-// このエンドポイントは監視専用。実際のSTOP注文は /gmo-order が発注する。
-// 固定値0.20は実運用のATR×1.5と不整合になるため、ここでは閾値判定しない。
+const stopDistance = 0.20;
+
 const checks = positions.map((p: any) => {
   const entryPrice = Number(p.price);
   const side = p.side;
@@ -2252,12 +2270,25 @@ const checks = positions.map((p: any) => {
       ? bid
       : Number(tickerData?.data?.[0]?.ask);
 
+  const stopPrice =
+    side === "BUY"
+      ? entryPrice - stopDistance
+      : entryPrice + stopDistance;
+
+  const stopTriggered =
+    side === "BUY"
+      ? currentPrice <= stopPrice
+      : currentPrice >= stopPrice;
+
   return {
     positionId: p.positionId,
     side,
     size: p.size,
     entryPrice,
     currentPrice,
+    stopPrice,
+    stopDistance,
+    stopTriggered,
   };
 });
 
@@ -2269,7 +2300,6 @@ return c.json({
   positionCount: positions.length,
   checks,
   action: "CHECK_ONLY",
-  note: "Actual STOP protection is managed by /gmo-order; no fixed stop threshold is used here.",
 });
 });
 const port = Number(process.env.PORT || 8080);
