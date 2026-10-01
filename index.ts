@@ -971,8 +971,26 @@ app.get("/gmo-signal", async (c) => {
       signal = "SELL";
     }
   }
+  const accountBalance = 50000;
+const riskRate = 0.02;
+const maxRiskYen = accountBalance * riskRate;
+
 const stopDistance =
   atr14 !== null ? atr14 * 1.5 : null;
+
+let orderSize = 0;
+
+if (stopDistance !== null && stopDistance > 0) {
+  const rawSize = maxRiskYen / stopDistance;
+
+  // 100通貨単位に切り下げ
+  orderSize = Math.floor(rawSize / 100) * 100;
+
+  // 最低100通貨
+  if (orderSize < 100) {
+    orderSize = 100;
+  }
+}
 
   return c.json({
     system: "Chagatto-2",
@@ -986,11 +1004,28 @@ const stopDistance =
     rsi14,
     atr14,
 stopDistance,
+maxRiskYen,
+orderSize,
     signal,
     time: new Date().toISOString(),
   });
 });
 let gmoOrderInProgress = false;
+let gmoSafetyHalt = false;
+let gmoSafetyHaltReason: string | null = null;
+let gmoSafetyHaltAt: string | null = null;
+function activateGmoSafetyHalt(reason: string) {
+  gmoSafetyHalt = true;
+  gmoSafetyHaltReason = reason;
+  gmoSafetyHaltAt = new Date().toISOString();
+}
+app.get("/gmo-safety-status", (c) => c.json({
+  safetyHalt: gmoSafetyHalt,
+  reason: gmoSafetyHaltReason,
+  haltedAt: gmoSafetyHaltAt,
+  liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+  orderInProgress: gmoOrderInProgress,
+}));
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
@@ -1005,10 +1040,10 @@ app.post("/gmo-order", async (c) => {
   const receivedToken = c.req.header("X-ADMIN-TOKEN");
 
   if (!adminToken || receivedToken !== adminToken) {
-    return c.json({
-      orderSent: false,
-      error: "Unauthorized",
-    }, 401);
+    return c.json({ orderSent: false, error: "Unauthorized" }, 401);
+  }
+  if (gmoSafetyHalt) {
+    return c.json({ orderSent: false, error: "SAFETY_HALT_ACTIVE", reason: gmoSafetyHaltReason, haltedAt: gmoSafetyHaltAt }, 503);
   }
   if (gmoOrderInProgress) {
   return c.json({
@@ -1358,6 +1393,7 @@ if (totalExecutedSize >= orderSize) {
   }
 
 if (executions.length === 0) {
+  activateGmoSafetyHalt("EXECUTION_STATE_UNKNOWN_AFTER_RECONCILIATION");
   // executions APIだけで約定を確認できない場合、建玉を再照合する。
   // 新規注文前に建玉ゼロを確認済みなので、ここで現れた同方向の建玉を
   // 今回注文の約定結果として復旧し、STOP保護へ進める。
@@ -1439,6 +1475,7 @@ const totalExecutedSize = executions.reduce(
 );
 
 if (!Number.isFinite(totalExecutedSize) || totalExecutedSize <= 0) {
+  activateGmoSafetyHalt("INVALID_EXECUTED_SIZE");
   return c.json({
     orderSent: true,
     stopOrderSent: false,
@@ -1545,6 +1582,7 @@ if (
   // 残注文の取消可否が不明なままSTOPを置くと、その後の追加約定分が
   // 無保護になる可能性があるため、ここでは自動運転を継続しない。
   if (!remainderCancelSucceeded) {
+    activateGmoSafetyHalt("PARTIAL_FILL_REMAINDER_CANCEL_FAILED");
     return c.json({
       orderSent: true,
       stopOrderSent: false,
@@ -1585,6 +1623,7 @@ for (const x of executions) {
     !Number.isFinite(size) ||
     size <= 0
   ) {
+    activateGmoSafetyHalt("INVALID_EXECUTION_DATA");
     return c.json({
       orderSent: true,
       stopOrderSent: false,
@@ -1612,6 +1651,7 @@ if (
   settlePosition.length === 0 ||
   settlePosition.length > 10
 ) {
+  activateGmoSafetyHalt("INVALID_SETTLE_POSITION_DATA");
   return c.json({
     orderSent: true,
     stopOrderSent: false,
@@ -1834,6 +1874,10 @@ const protectionState = stopConfirmed
       ? "PROTECTION_FAILED"
       : "PROTECTION_UNKNOWN";
 
+if (!stopConfirmed) {
+  activateGmoSafetyHalt(`PROTECTION_NOT_CONFIRMED:${protectionState}`);
+}
+
 return c.json({
   orderSent: true,
   stopOrderSent: stopConfirmed,
@@ -1878,10 +1922,10 @@ app.post("/gmo-auto-run", async (c) => {
   const receivedToken = c.req.header("X-ADMIN-TOKEN");
 
   if (!adminToken || receivedToken !== adminToken) {
-    return c.json({
-      autoRun: false,
-      error: "Unauthorized",
-    }, 401);
+    return c.json({ autoRun: false, error: "Unauthorized" }, 401);
+  }
+  if (gmoSafetyHalt) {
+    return c.json({ autoRun: false, action: "NO_ORDER", error: "SAFETY_HALT_ACTIVE", reason: gmoSafetyHaltReason, haltedAt: gmoSafetyHaltAt }, 503);
   }
 
   // シグナルをサーバー内部で取得
