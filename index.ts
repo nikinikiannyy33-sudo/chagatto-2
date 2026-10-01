@@ -1934,6 +1934,30 @@ app.get("/gmo-daily-pnl", async (c) => {
   }
 });
 
+// DRY-RUN only: verify the daily-loss decision without sending any order.
+// This endpoint never calls /gmo-order and never sends an order to GMO.
+app.get("/daily-loss-guard-test", (c) => {
+  const raw = c.req.query("pnl");
+  const simulatedPnl = Number(raw);
+  if (!Number.isFinite(simulatedPnl)) {
+    return c.json({
+      orderSent: false,
+      error: "pnl query parameter must be a number",
+      example: "/daily-loss-guard-test?pnl=-1200",
+    }, 400);
+  }
+
+  const tradingAllowed = simulatedPnl > DAILY_LOSS_LIMIT_YEN;
+  return c.json({
+    mode: "SIMULATION_ONLY",
+    orderSent: false,
+    simulatedPnl,
+    dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
+    tradingAllowed,
+    decision: tradingAllowed ? "PASS_DAILY_LOSS_GUARD" : "STOP_DAILY_LOSS",
+  });
+});
+
 app.get("/scheduler-status", (c) => c.json({
   schedule: "every hour at minute 05 JST",
   liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
