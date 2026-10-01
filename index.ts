@@ -1014,6 +1014,199 @@ let gmoOrderInProgress = false;
 let gmoSafetyHalt = false;
 let gmoSafetyHaltReason: string | null = null;
 
+// ===== Chagatto-1 safety scheduler patch =====
+// 検証中は Railway の LIVE_TRADING_ENABLED=false のままにする。
+const DAILY_LOSS_LIMIT_YEN = -1200;
+let schedulerInProgress = false;
+let lastSchedulerJstHourKey: string | null = null;
+let lastSchedulerResult: any = null;
+
+function jstParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value || "";
+  return {
+    date: `${get("year")}-${get("month")}-${get("day")}`,
+    hour: get("hour"),
+    minute: get("minute"),
+  };
+}
+
+function toJstDateString(value: unknown) {
+  const d = new Date(String(value ?? ""));
+  if (!Number.isFinite(d.getTime())) return null;
+  return jstParts(d).date;
+}
+
+async function gmoPrivateGet(path: string, query = "") {
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
+  if (!apiKey || !apiSecret) throw new Error("GMO API keys are not set");
+
+  const timestamp = Date.now().toString();
+  const method = "GET";
+  const sign = crypto
+    .createHmac("sha256", apiSecret)
+    .update(timestamp + method + path)
+    .digest("hex");
+
+  const response = await fetch(`https://forex-api.coin.z.com/private${path}${query}`, {
+    method,
+    headers: {
+      "API-KEY": apiKey,
+      "API-TIMESTAMP": timestamp,
+      "API-SIGN": sign,
+    },
+  });
+  const data: any = await response.json();
+  if (!response.ok || data?.status !== 0) {
+    throw new Error(`GMO ${path} failed: ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+async function getTodayRealizedPnlJst() {
+  const todayJst = jstParts().date;
+  const data = await gmoPrivateGet("/v1/latestExecutions");
+  const rows = Array.isArray(data?.data)
+    ? data.data
+    : Array.isArray(data?.data?.list)
+      ? data.data.list
+      : [];
+
+  const todayRows = rows.filter((x: any) => toJstDateString(x?.timestamp) === todayJst);
+  let pnl = 0;
+  let closeCount = 0;
+
+  for (const x of todayRows) {
+    const lossGain = Number(x?.lossGain);
+    // lossGain が返る決済約定だけを日次確定損益へ加算する。
+    if (!Number.isFinite(lossGain)) continue;
+    const fee = Number(x?.fee ?? 0);
+    const settledSwap = Number(x?.settledSwap ?? 0);
+    pnl += lossGain + (Number.isFinite(fee) ? fee : 0) + (Number.isFinite(settledSwap) ? settledSwap : 0);
+    closeCount += 1;
+  }
+
+  return { dateJst: todayJst, pnl, closeCount, fetchedCount: rows.length };
+}
+
+async function getUsdJpyOpenPositionCount() {
+  const data = await gmoPrivateGet("/v1/openPositions", "?symbol=USD_JPY&count=100");
+  const rows = Array.isArray(data?.data)
+    ? data.data
+    : Array.isArray(data?.data?.list)
+      ? data.data.list
+      : [];
+  return rows.length;
+}
+
+function schedulerBaseUrl() {
+  const explicit = process.env.PUBLIC_BASE_URL?.replace(/\/$/, "");
+  if (explicit) return explicit;
+  const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
+  if (railwayDomain) return `https://${railwayDomain}`;
+  return `http://127.0.0.1:${Number(process.env.PORT || 8080)}`;
+}
+
+async function runHourlySafetyCycle() {
+  if (schedulerInProgress) return;
+  schedulerInProgress = true;
+  const startedAt = new Date().toISOString();
+
+  try {
+    const daily = await getTodayRealizedPnlJst();
+    if (daily.pnl <= DAILY_LOSS_LIMIT_YEN) {
+      lastSchedulerResult = { startedAt, action: "STOP_DAILY_LOSS", daily };
+      console.log("[scheduler] daily loss stop", lastSchedulerResult);
+      return;
+    }
+
+    const positionCount = await getUsdJpyOpenPositionCount();
+    if (positionCount > 0) {
+      lastSchedulerResult = { startedAt, action: "SKIP_OPEN_POSITION", daily, positionCount };
+      console.log("[scheduler] open position exists", lastSchedulerResult);
+      return;
+    }
+
+    const baseUrl = schedulerBaseUrl();
+    const signalResponse = await fetch(`${baseUrl}/gmo-signal`);
+    const signalData: any = await signalResponse.json();
+    if (!signalResponse.ok) throw new Error(`gmo-signal failed: ${JSON.stringify(signalData)}`);
+
+    const signal = String(signalData?.signal ?? "WAIT");
+    if (signal !== "BUY" && signal !== "SELL") {
+      lastSchedulerResult = { startedAt, action: "WAIT", daily, signalData };
+      console.log("[scheduler] WAIT", lastSchedulerResult);
+      return;
+    }
+
+    // LIVE=false の検証中は注文APIを呼ばず、ここまでの判定だけ記録する。
+    if (process.env.LIVE_TRADING_ENABLED !== "true") {
+      lastSchedulerResult = { startedAt, action: "DRY_RUN", daily, signal, signalData };
+      console.log("[scheduler] DRY_RUN", lastSchedulerResult);
+      return;
+    }
+
+    const adminToken = process.env.ADMIN_TOKEN;
+    if (!adminToken) throw new Error("ADMIN_TOKEN is not set");
+    const orderResponse = await fetch(`${baseUrl}/gmo-order`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-ADMIN-TOKEN": adminToken },
+      body: JSON.stringify({ side: signal }),
+    });
+    const orderData: any = await orderResponse.json();
+    lastSchedulerResult = {
+      startedAt,
+      action: orderResponse.ok ? "ORDER_REQUESTED" : "ORDER_REJECTED",
+      daily,
+      signal,
+      orderData,
+    };
+    console.log("[scheduler] order result", lastSchedulerResult);
+  } catch (error: any) {
+    lastSchedulerResult = { startedAt, action: "ERROR", error: String(error?.message ?? error) };
+    console.error("[scheduler] error", lastSchedulerResult);
+  } finally {
+    schedulerInProgress = false;
+  }
+}
+
+app.get("/gmo-daily-pnl", async (c) => {
+  try {
+    const daily = await getTodayRealizedPnlJst();
+    return c.json({ ...daily, dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN, tradingAllowed: daily.pnl > DAILY_LOSS_LIMIT_YEN });
+  } catch (error: any) {
+    return c.json({ error: String(error?.message ?? error) }, 500);
+  }
+});
+
+app.get("/scheduler-status", (c) => c.json({
+  schedule: "every hour at minute 05 JST",
+  liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+  inProgress: schedulerInProgress,
+  lastJstHourKey: lastSchedulerJstHourKey,
+  lastResult: lastSchedulerResult,
+}));
+
+// 20秒ごとに時計を確認し、JSTの毎時05分に1回だけ実行する。
+setInterval(() => {
+  const now = jstParts();
+  if (now.minute !== "05") return;
+  const hourKey = `${now.date}T${now.hour}`;
+  if (lastSchedulerJstHourKey === hourKey) return;
+  lastSchedulerJstHourKey = hourKey;
+  void runHourlySafetyCycle();
+}, 20_000);
+// ===== end safety scheduler patch =====
+
 app.get("/gmo-safety-status", (c) => c.json({
   liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
   orderInProgress: gmoOrderInProgress,
@@ -1319,8 +1512,6 @@ const rootOrderId = Number(
 );
 
 if (!Number.isFinite(orderId) || !Number.isFinite(rootOrderId)) {
-  gmoSafetyHalt = true;
-gmoSafetyHaltReason = "ORDER_ID_NOT_FOUND";
   return c.json({
     orderSent: true,
     stopOrderSent: false,
@@ -1483,8 +1674,6 @@ const totalExecutedSize = executions.reduce(
 );
 
 if (!Number.isFinite(totalExecutedSize) || totalExecutedSize <= 0) {
-  gmoSafetyHalt = true;
-gmoSafetyHaltReason = "INVALID_EXECUTED_SIZE";
   return c.json({
     orderSent: true,
     stopOrderSent: false,
