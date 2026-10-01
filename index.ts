@@ -462,6 +462,170 @@ app.get("/auto-backtest", async (c) => {
     }, 500);
   }
 });
+app.get("/take-profit-backtest", async (c) => {
+  const apiKey = process.env.TWELVE_DATA_API_KEY;
+
+  if (!apiKey) {
+    return c.json({ error: "TWELVE_DATA_API_KEY is not set" }, 500);
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.twelvedata.com/time_series?symbol=USD/JPY&interval=1h&outputsize=500&apikey=${apiKey}`
+    );
+    const data = await response.json() as any;
+
+    if (!data.values || !Array.isArray(data.values)) {
+      return c.json({ error: "Twelve Data API error", details: data }, 500);
+    }
+
+    const candles = data.values
+      .slice()
+      .reverse()
+      .map((item: any) => ({
+        time: item.datetime,
+        close: Number(item.close),
+        high: Number(item.high),
+        low: Number(item.low),
+      }))
+      .filter((item: any) =>
+        Number.isFinite(item.close) &&
+        Number.isFinite(item.high) &&
+        Number.isFinite(item.low)
+      );
+
+    const stopLoss = 4.618;
+    const tpRatios: Array<number | null> = [null, 1.0, 1.5, 2.0];
+    const results: any[] = [];
+
+    for (const tpRatio of tpRatios) {
+      let trades = 0;
+      let wins = 0;
+      let losses = 0;
+      let totalPips = 0;
+      let grossProfit = 0;
+      let grossLoss = 0;
+      let equity = 0;
+      let peakEquity = 0;
+      let maxDrawdown = 0;
+      let stopHits = 0;
+      let takeProfitHits = 0;
+      let ambiguousBothHit = 0;
+
+      for (let i = 14; i < candles.length - 1; i++) {
+        const history = candles.slice(0, i + 1).map((item: any) => item.close);
+        const sma5 = sma(history, 5);
+        const sma10 = sma(history, 10);
+        const rsi14 = rsi(history, 14);
+
+        if (sma5 === null || sma10 === null || rsi14 === null) continue;
+
+        let signal = "WAIT";
+        if (sma5 > sma10 && rsi14 < 60) signal = "BUY";
+        else if (sma5 < sma10 && rsi14 > 40) signal = "SELL";
+        if (signal === "WAIT") continue;
+
+        const tradeHour = Number(candles[i].time.slice(11, 13));
+        if (![0, 6].includes(tradeHour)) continue;
+
+        const entry = candles[i].close;
+        const nextCandle = candles[i + 1];
+        if (!nextCandle) continue;
+
+        let pips = signal === "BUY"
+          ? (nextCandle.close - entry) * 100
+          : (entry - nextCandle.close) * 100;
+
+        const stopPrice = signal === "BUY"
+          ? entry - stopLoss / 100
+          : entry + stopLoss / 100;
+        const stopHit = signal === "BUY"
+          ? nextCandle.low <= stopPrice
+          : nextCandle.high >= stopPrice;
+
+        let tpHit = false;
+        let takeProfitPips: number | null = null;
+        if (tpRatio !== null) {
+          takeProfitPips = stopLoss * tpRatio;
+          const tpPrice = signal === "BUY"
+            ? entry + takeProfitPips / 100
+            : entry - takeProfitPips / 100;
+          tpHit = signal === "BUY"
+            ? nextCandle.high >= tpPrice
+            : nextCandle.low <= tpPrice;
+        }
+
+        // 1時間足OHLCだけでは、同じ足の中でSLとTPのどちらが先に
+        // 到達したか判定できない。両方に触れた足は安全側にSL先着とする。
+        if (stopHit && tpHit) {
+          ambiguousBothHit++;
+          stopHits++;
+          pips = -stopLoss;
+        } else if (stopHit) {
+          stopHits++;
+          pips = -stopLoss;
+        } else if (tpHit && takeProfitPips !== null) {
+          takeProfitHits++;
+          pips = takeProfitPips;
+        }
+
+        trades++;
+        totalPips += pips;
+        if (pips > 0) {
+          wins++;
+          grossProfit += pips;
+        } else if (pips < 0) {
+          losses++;
+          grossLoss += Math.abs(pips);
+        }
+
+        equity += pips;
+        peakEquity = Math.max(peakEquity, equity);
+        maxDrawdown = Math.max(maxDrawdown, peakEquity - equity);
+      }
+
+      const winRate = trades > 0 ? (wins / trades) * 100 : 0;
+      const profitFactor = grossLoss > 0
+        ? grossProfit / grossLoss
+        : grossProfit > 0 ? Infinity : 0;
+
+      results.push({
+        mode: tpRatio === null ? "NO_FIXED_TP" : `TP_${tpRatio}R`,
+        stopLossPips: stopLoss,
+        takeProfitPips: tpRatio === null ? null : stopLoss * tpRatio,
+        riskReward: tpRatio === null ? null : `1:${tpRatio}`,
+        trades,
+        wins,
+        losses,
+        winRate,
+        totalPips,
+        profitFactor,
+        maxDrawdown,
+        stopHits,
+        takeProfitHits,
+        ambiguousBothHit,
+      });
+    }
+
+    return c.json({
+      system: "Chagatto-1 Take Profit Backtest",
+      pair: "USDJPY",
+      interval: "1h",
+      candlesRequested: 500,
+      stopLossPips: stopLoss,
+      tested: ["NO_FIXED_TP", "1:1", "1:1.5", "1:2"],
+      results,
+      assumption: "If SL and TP are both touched within the same 1h candle, SL is counted first because OHLC data cannot determine intrabar order.",
+      note: "Comparison only. Live-trading parameters are not changed.",
+    });
+  } catch (error) {
+    return c.json({
+      error: "TAKE_PROFIT_BACKTEST_FAILED",
+      message: error instanceof Error ? error.message : String(error),
+    }, 500);
+  }
+});
+
 app.get("/auto-optimize", async (c) => {
   const apiKey = process.env.TWELVE_DATA_API_KEY;
 
