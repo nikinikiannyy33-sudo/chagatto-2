@@ -1221,6 +1221,142 @@ app.get("/direction-walk-forward", async (c) => {
   }
 });
 
+
+app.get("/multi-window-validation", async (c) => {
+  const apiKey = process.env.TWELVE_DATA_API_KEY;
+  if (!apiKey) return c.json({ error: "TWELVE_DATA_API_KEY is not set" }, 500);
+
+  try {
+    const requestedCandles = 2000;
+    const response = await fetch(
+      `https://api.twelvedata.com/time_series?symbol=USD/JPY&interval=1h&outputsize=${requestedCandles}&apikey=${apiKey}`
+    );
+    const data = (await response.json()) as any;
+    if (!data.values || !Array.isArray(data.values)) {
+      return c.json({ error: "Twelve Data API error", details: data }, 500);
+    }
+
+    const candles = data.values.slice().reverse().map((item: any) => ({
+      time: item.datetime,
+      close: Number(item.close),
+      high: Number(item.high),
+      low: Number(item.low),
+    })).filter((item: any) =>
+      Number.isFinite(item.close) && Number.isFinite(item.high) && Number.isFinite(item.low)
+    );
+
+    const params = { fastSma: 7, slowSma: 10, buyRsi: 60, sellRsi: 45, stopLoss: 6 };
+
+    const evaluate = (startIndex: number, endIndexExclusive: number) => {
+      let trades = 0, wins = 0, losses = 0, totalPips = 0;
+      let grossProfit = 0, grossLoss = 0, equity = 0, peakEquity = 0, maxDrawdown = 0;
+      let buyTrades = 0, buyPips = 0, sellTrades = 0, sellPips = 0;
+
+      for (let i = Math.max(14, startIndex); i < Math.min(endIndexExclusive, candles.length - 1); i++) {
+        const history = candles.slice(0, i + 1).map((item: any) => item.close);
+        const fast = sma(history, params.fastSma);
+        const slow = sma(history, params.slowSma);
+        const rsi14 = rsi(history, 14);
+        if (fast === null || slow === null || rsi14 === null) continue;
+
+        let signal = "WAIT";
+        if (fast > slow && rsi14 < params.buyRsi) signal = "BUY";
+        else if (fast < slow && rsi14 > params.sellRsi) signal = "SELL";
+        if (signal === "WAIT") continue;
+
+        const tradeHour = Number(candles[i].time.slice(11, 13));
+        if (![0, 6].includes(tradeHour)) continue;
+
+        const entry = candles[i].close;
+        const nextCandle = candles[i + 1];
+        let pips = signal === "BUY"
+          ? (nextCandle.close - entry) * 100
+          : (entry - nextCandle.close) * 100;
+
+        const stopPrice = signal === "BUY"
+          ? entry - params.stopLoss / 100
+          : entry + params.stopLoss / 100;
+        const stopHit = signal === "BUY"
+          ? nextCandle.low <= stopPrice
+          : nextCandle.high >= stopPrice;
+        if (stopHit) pips = -params.stopLoss;
+
+        trades++;
+        totalPips += pips;
+        if (signal === "BUY") { buyTrades++; buyPips += pips; }
+        else { sellTrades++; sellPips += pips; }
+
+        if (pips > 0) { wins++; grossProfit += pips; }
+        else if (pips < 0) { losses++; grossLoss += Math.abs(pips); }
+
+        equity += pips;
+        peakEquity = Math.max(peakEquity, equity);
+        maxDrawdown = Math.max(maxDrawdown, peakEquity - equity);
+      }
+
+      return {
+        trades, wins, losses,
+        winRate: trades ? wins / trades * 100 : 0,
+        totalPips,
+        profitFactor: grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? null : 0),
+        maxDrawdown,
+        buyTrades, buyPips, sellTrades, sellPips
+      };
+    };
+
+    const windowCount = 5;
+    const usableEnd = candles.length - 1;
+    const windowSize = Math.floor(usableEnd / windowCount);
+    const windows: any[] = [];
+
+    for (let w = 0; w < windowCount; w++) {
+      const start = w * windowSize;
+      const end = w === windowCount - 1 ? usableEnd : (w + 1) * windowSize;
+      const metrics = evaluate(start, end);
+      windows.push({
+        window: w + 1,
+        from: candles[start]?.time,
+        to: candles[Math.max(start, end - 1)]?.time,
+        ...metrics,
+        passed: metrics.trades >= 5 &&
+          metrics.totalPips > 0 &&
+          (metrics.profitFactor === null || metrics.profitFactor > 1)
+      });
+    }
+
+    const positiveWindows = windows.filter((w: any) => w.totalPips > 0).length;
+    const pfAboveOneWindows = windows.filter((w: any) =>
+      w.profitFactor === null || (typeof w.profitFactor === "number" && w.profitFactor > 1)
+    ).length;
+    const total = evaluate(14, usableEnd);
+
+    return c.json({
+      system: "Chagatto-1 Multi Window Validation",
+      pair: "USDJPY",
+      interval: "1h",
+      candlesRequested: requestedCandles,
+      candlesReceived: candles.length,
+      fixedParameters: params,
+      method: "The same frozen parameters are tested across 5 chronological non-overlapping windows. No parameter optimization is performed inside these windows.",
+      windows,
+      summary: {
+        positiveWindows,
+        pfAboveOneWindows,
+        windowCount,
+        allWindowsPassed: windows.every((w: any) => w.passed),
+        total
+      },
+      liveParametersChanged: false,
+      note: "Research only. LIVE_TRADING_ENABLED is not changed by this endpoint."
+    });
+  } catch (error) {
+    return c.json({
+      error: "MULTI_WINDOW_VALIDATION_FAILED",
+      message: error instanceof Error ? error.message : String(error),
+    }, 500);
+  }
+});
+
 app.get("/gmo-test", async (c) => {
   const apiKey = process.env.GMO_API_KEY;
   const apiSecret = process.env.GMO_API_SECRET;
