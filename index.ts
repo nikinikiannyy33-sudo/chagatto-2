@@ -1013,19 +1013,14 @@ orderSize,
 let gmoOrderInProgress = false;
 let gmoSafetyHalt = false;
 let gmoSafetyHaltReason: string | null = null;
-let gmoSafetyHaltAt: string | null = null;
-function activateGmoSafetyHalt(reason: string) {
-  gmoSafetyHalt = true;
-  gmoSafetyHaltReason = reason;
-  gmoSafetyHaltAt = new Date().toISOString();
-}
+
 app.get("/gmo-safety-status", (c) => c.json({
-  safetyHalt: gmoSafetyHalt,
-  reason: gmoSafetyHaltReason,
-  haltedAt: gmoSafetyHaltAt,
   liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
   orderInProgress: gmoOrderInProgress,
+  safetyHalt: gmoSafetyHalt,
+  safetyHaltReason: gmoSafetyHaltReason,
 }));
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
@@ -1040,11 +1035,19 @@ app.post("/gmo-order", async (c) => {
   const receivedToken = c.req.header("X-ADMIN-TOKEN");
 
   if (!adminToken || receivedToken !== adminToken) {
-    return c.json({ orderSent: false, error: "Unauthorized" }, 401);
+    return c.json({
+      orderSent: false,
+      error: "Unauthorized",
+    }, 401);
   }
   if (gmoSafetyHalt) {
-    return c.json({ orderSent: false, error: "SAFETY_HALT_ACTIVE", reason: gmoSafetyHaltReason, haltedAt: gmoSafetyHaltAt }, 503);
+    return c.json({
+      orderSent: false,
+      error: "SAFETY_HALT",
+      reason: gmoSafetyHaltReason,
+    }, 503);
   }
+
   if (gmoOrderInProgress) {
   return c.json({
     orderSent: false,
@@ -1393,7 +1396,6 @@ if (totalExecutedSize >= orderSize) {
   }
 
 if (executions.length === 0) {
-  activateGmoSafetyHalt("EXECUTION_STATE_UNKNOWN_AFTER_RECONCILIATION");
   // executions APIだけで約定を確認できない場合、建玉を再照合する。
   // 新規注文前に建玉ゼロを確認済みなので、ここで現れた同方向の建玉を
   // 今回注文の約定結果として復旧し、STOP保護へ進める。
@@ -1457,12 +1459,16 @@ if (executions.length === 0) {
 }
 
 if (executions.length === 0) {
-  // 約定なしと断定はしない。注文状態が不明なため本番運用では要監視。
+  // 注文送信後に約定状態を確定できない場合は、以後の自動新規注文を停止する。
+  // 「約定していない」と推測して運転を続けない。
+  gmoSafetyHalt = true;
+  gmoSafetyHaltReason = "EXECUTION_STATE_UNKNOWN_AFTER_RECONCILIATION";
   return c.json({
     orderSent: true,
     stopOrderSent: false,
+    safetyHalt: true,
     orderId,
-    error: "EXECUTION_STATE_UNKNOWN_AFTER_RECONCILIATION",
+    error: gmoSafetyHaltReason,
     executionData,
   }, 202);
 }
@@ -1475,7 +1481,6 @@ const totalExecutedSize = executions.reduce(
 );
 
 if (!Number.isFinite(totalExecutedSize) || totalExecutedSize <= 0) {
-  activateGmoSafetyHalt("INVALID_EXECUTED_SIZE");
   return c.json({
     orderSent: true,
     stopOrderSent: false,
@@ -1582,13 +1587,16 @@ if (
   // 残注文の取消可否が不明なままSTOPを置くと、その後の追加約定分が
   // 無保護になる可能性があるため、ここでは自動運転を継続しない。
   if (!remainderCancelSucceeded) {
-    activateGmoSafetyHalt("PARTIAL_FILL_REMAINDER_CANCEL_FAILED");
+    // 残注文の状態が不明なまま次の自動注文を許可しない。
+    gmoSafetyHalt = true;
+    gmoSafetyHaltReason = "PARTIAL_FILL_REMAINDER_CANCEL_FAILED";
     return c.json({
       orderSent: true,
       stopOrderSent: false,
+      safetyHalt: true,
       orderId,
       rootOrderId,
-      error: "PARTIAL_FILL_REMAINDER_CANCEL_FAILED",
+      error: gmoSafetyHaltReason,
       executedSize: totalExecutedSize,
       requestedSize: orderSize,
       entryOrderStatus,
@@ -1623,12 +1631,14 @@ for (const x of executions) {
     !Number.isFinite(size) ||
     size <= 0
   ) {
-    activateGmoSafetyHalt("INVALID_EXECUTION_DATA");
+    gmoSafetyHalt = true;
+    gmoSafetyHaltReason = "INVALID_EXECUTION_DATA";
     return c.json({
       orderSent: true,
       stopOrderSent: false,
       orderId,
       error: "INVALID_EXECUTION_DATA",
+      safetyHalt: true,
     }, 500);
   }
 
@@ -1651,7 +1661,8 @@ if (
   settlePosition.length === 0 ||
   settlePosition.length > 10
 ) {
-  activateGmoSafetyHalt("INVALID_SETTLE_POSITION_DATA");
+  gmoSafetyHalt = true;
+  gmoSafetyHaltReason = "INVALID_EXECUTION_DATA";
   return c.json({
     orderSent: true,
     stopOrderSent: false,
@@ -1874,8 +1885,9 @@ const protectionState = stopConfirmed
       ? "PROTECTION_FAILED"
       : "PROTECTION_UNKNOWN";
 
-if (!stopConfirmed) {
-  activateGmoSafetyHalt(`PROTECTION_NOT_CONFIRMED:${protectionState}`);
+if (protectionState === "PROTECTION_FAILED" || protectionState === "PROTECTION_UNKNOWN") {
+  gmoSafetyHalt = true;
+  gmoSafetyHaltReason = protectionState;
 }
 
 return c.json({
@@ -1918,14 +1930,22 @@ emergencyCloseError,
 // 外部スケジューラから 08:00 / 15:00 / 21:00 (JST) に呼び出す。
 // LIVE_TRADING_ENABLED=false の間は実注文されない。
 app.post("/gmo-auto-run", async (c) => {
+  if (gmoSafetyHalt) {
+    return c.json({
+      autoRun: false,
+      error: "SAFETY_HALT",
+      reason: gmoSafetyHaltReason,
+    }, 503);
+  }
+
   const adminToken = process.env.ADMIN_TOKEN;
   const receivedToken = c.req.header("X-ADMIN-TOKEN");
 
   if (!adminToken || receivedToken !== adminToken) {
-    return c.json({ autoRun: false, error: "Unauthorized" }, 401);
-  }
-  if (gmoSafetyHalt) {
-    return c.json({ autoRun: false, action: "NO_ORDER", error: "SAFETY_HALT_ACTIVE", reason: gmoSafetyHaltReason, haltedAt: gmoSafetyHaltAt }, 503);
+    return c.json({
+      autoRun: false,
+      error: "Unauthorized",
+    }, 401);
   }
 
   // シグナルをサーバー内部で取得
