@@ -1319,6 +1319,8 @@ const rootOrderId = Number(
 );
 
 if (!Number.isFinite(orderId) || !Number.isFinite(rootOrderId)) {
+  gmoSafetyHalt = true;
+gmoSafetyHaltReason = "ORDER_ID_NOT_FOUND";
   return c.json({
     orderSent: true,
     stopOrderSent: false,
@@ -1481,6 +1483,8 @@ const totalExecutedSize = executions.reduce(
 );
 
 if (!Number.isFinite(totalExecutedSize) || totalExecutedSize <= 0) {
+  gmoSafetyHalt = true;
+gmoSafetyHaltReason = "INVALID_EXECUTED_SIZE";
   return c.json({
     orderSent: true,
     stopOrderSent: false,
