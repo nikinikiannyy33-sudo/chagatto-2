@@ -1,0 +1,1348 @@
+import { Hono } from "hono";
+import { serve } from "@hono/node-server";
+import crypto from "node:crypto";
+
+const app = new Hono();
+
+const SYMBOL = "USD_JPY";
+const DAILY_LOSS_LIMIT_YEN = 1200;
+const AUTO_RUN_MINUTE_JST = 5;
+
+let gmoOrderInProgress = false;
+let gmoSafetyHalt = false;
+let gmoSafetyHaltReason: string | null = null;
+let schedulerInProgress = false;
+let lastScheduledHourKey: string | null = null;
+let lastSchedulerResult: any = null;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function sma(values: number[], period: number) {
+  if (values.length < period) return null;
+  const part = values.slice(-period);
+  return part.reduce((a, b) => a + b, 0) / period;
+}
+
+function rsi(values: number[], period = 14) {
+  if (values.length <= period) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = values.length - period; i < values.length; i++) {
+    const diff = values[i] - values[i - 1];
+    if (diff > 0) gains += diff;
+    if (diff < 0) losses += Math.abs(diff);
+  }
+  if (losses === 0) return 100;
+  const rs = gains / losses;
+  return 100 - 100 / (1 + rs);
+}
+
+function atr(candles: { high: number; low: number; close: number }[], period = 14) {
+  if (candles.length <= period) return null;
+  const ranges: number[] = [];
+  for (let i = 1; i < candles.length; i++) {
+    ranges.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low - candles[i - 1].close)
+    ));
+  }
+  if (ranges.length < period) return null;
+  const recent = ranges.slice(-period);
+  return recent.reduce((a, b) => a + b, 0) / period;
+}
+
+function signRequest(timestamp: string, method: string, path: string, secret: string, body = "") {
+  return crypto.createHmac("sha256", secret)
+    .update(timestamp + method + path + body)
+    .digest("hex");
+}
+
+function extractList(data: any): any[] {
+  if (Array.isArray(data?.data?.list)) return data.data.list;
+  if (Array.isArray(data?.data)) return data.data;
+  return [];
+}
+
+function jstParts(date = new Date()) {
+  const jst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
+  return {
+    year: jst.getUTCFullYear(),
+    month: jst.getUTCMonth() + 1,
+    day: jst.getUTCDate(),
+    hour: jst.getUTCHours(),
+    minute: jst.getUTCMinutes(),
+  };
+}
+
+function jstDayKey(date = new Date()) {
+  const p = jstParts(date);
+  return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
+}
+
+function jstHourKey(date = new Date()) {
+  const p = jstParts(date);
+  return `${jstDayKey(date)}-${String(p.hour).padStart(2, "0")}`;
+}
+
+function isTodayJst(value: unknown) {
+  const d = new Date(String(value ?? ""));
+  return Number.isFinite(d.getTime()) && jstDayKey(d) === jstDayKey();
+}
+
+async function getDailyRealizedPnl() {
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
+
+  if (!apiKey || !apiSecret) {
+    return { ok: false, error: "GMO_API_KEYS_NOT_SET", dailyPnl: null };
+  }
+
+  const timestamp = Date.now().toString();
+  const method = "GET";
+  const path = "/v1/latestExecutions";
+  const sign = signRequest(timestamp, method, path, apiSecret);
+
+  try {
+    const response = await fetch(
+      `https://forex-api.coin.z.com/private/v1/latestExecutions?symbol=${SYMBOL}&count=100`,
+      {
+        method,
+        headers: {
+          "API-KEY": apiKey,
+          "API-TIMESTAMP": timestamp,
+          "API-SIGN": sign,
+        },
+      }
+    );
+
+    const data: any = await response.json();
+
+    if (!response.ok || data?.status !== 0) {
+      return { ok: false, error: "LATEST_EXECUTIONS_FAILED", dailyPnl: null, data };
+    }
+
+    const all = extractList(data);
+    const today = all.filter((x: any) => isTodayJst(x.timestamp));
+    const closes = today.filter((x: any) => x.symbol === SYMBOL && x.settleType === "CLOSE");
+
+    // 当日だけで100件に達している場合は取りこぼしの可能性があるので新規取引を止める。
+    if (all.length >= 100 && today.length >= 100) {
+      return {
+        ok: false,
+        error: "DAILY_EXECUTIONS_MAY_BE_TRUNCATED",
+        dailyPnl: null,
+        executionCount: all.length,
+      };
+    }
+
+    let dailyPnl = 0;
+    for (const x of closes) {
+      const lossGain = Number(x.lossGain ?? 0);
+      const fee = Number(x.fee ?? 0);
+      const settledSwap = Number(x.settledSwap ?? 0);
+
+      if (![lossGain, fee, settledSwap].every(Number.isFinite)) {
+        return { ok: false, error: "INVALID_DAILY_PNL_DATA", dailyPnl: null };
+      }
+
+      dailyPnl += lossGain + fee + settledSwap;
+    }
+
+    return {
+      ok: true,
+      dayJst: jstDayKey(),
+      dailyPnl,
+      closeExecutions: closes.length,
+      executionCount: all.length,
+      lossLimitYen: DAILY_LOSS_LIMIT_YEN,
+      lossLimitReached: dailyPnl <= -DAILY_LOSS_LIMIT_YEN,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: "LATEST_EXECUTIONS_REQUEST_FAILED",
+      dailyPnl: null,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function getOpenPositions() {
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
+
+  if (!apiKey || !apiSecret) {
+    return { ok: false, error: "GMO_API_KEYS_NOT_SET", positions: [] as any[] };
+  }
+
+  const timestamp = Date.now().toString();
+  const method = "GET";
+  const path = "/v1/openPositions";
+  const sign = signRequest(timestamp, method, path, apiSecret);
+
+  try {
+    const response = await fetch(
+      `https://forex-api.coin.z.com/private/v1/openPositions?symbol=${SYMBOL}&count=100`,
+      {
+        method,
+        headers: {
+          "API-KEY": apiKey,
+          "API-TIMESTAMP": timestamp,
+          "API-SIGN": sign,
+        },
+      }
+    );
+
+    const data: any = await response.json();
+
+    if (!response.ok || data?.status !== 0) {
+      return { ok: false, error: "OPEN_POSITIONS_FAILED", positions: [], data };
+    }
+
+    return { ok: true, positions: extractList(data) };
+  } catch (error) {
+    return {
+      ok: false,
+      error: "OPEN_POSITIONS_REQUEST_FAILED",
+      positions: [],
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function loadKlines() {
+  const now = new Date();
+  const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+
+  if (jst.getUTCHours() < 6) jst.setUTCDate(jst.getUTCDate() - 1);
+
+  const formatDate = (d: Date) =>
+    d.getUTCFullYear().toString() +
+    String(d.getUTCMonth() + 1).padStart(2, "0") +
+    String(d.getUTCDate()).padStart(2, "0");
+
+  const currentDate = formatDate(jst);
+  const previous = new Date(jst);
+  previous.setUTCDate(previous.getUTCDate() - 1);
+
+  while (previous.getUTCDay() === 0 || previous.getUTCDay() === 6) {
+    previous.setUTCDate(previous.getUTCDate() - 1);
+  }
+
+  const previousDate = formatDate(previous);
+
+  const getKlines = async (date: string) => {
+    const response = await fetch(
+      `https://forex-api.coin.z.com/public/v1/klines?symbol=${SYMBOL}&priceType=BID&interval=1hour&date=${date}`
+    );
+    const data: any = await response.json();
+    if (data.status !== 0 || !Array.isArray(data.data)) return [];
+
+    return data.data.map((x: any) => ({
+      time: Number(x.openTime),
+      open: Number(x.open),
+      high: Number(x.high),
+      low: Number(x.low),
+      close: Number(x.close),
+    }));
+  };
+
+  const candles = [
+    ...(await getKlines(previousDate)),
+    ...(await getKlines(currentDate)),
+  ].sort((a: any, b: any) => a.time - b.time);
+
+  return { previousDate, currentDate, candles };
+}
+
+async function getSignalData() {
+  const { candles } = await loadKlines();
+  const completed = candles.filter((x: any) => x.time + 60 * 60 * 1000 <= Date.now());
+  const closes = completed.map((x: any) => x.close);
+
+  if (closes.length < 15) {
+    return { ok: false, status: 500, data: { error: "Not enough candles", candleCount: closes.length } };
+  }
+
+  const sma7 = sma(closes, 7);
+  const sma8 = sma(closes, 8);
+  const rsi14 = rsi(closes, 14);
+  const atr14 = atr(completed, 14);
+
+  let signal = "WAIT";
+  if (sma7 !== null && sma8 !== null && rsi14 !== null) {
+    if (sma7 > sma8 && rsi14 < 60) signal = "BUY";
+    else if (sma7 < sma8 && rsi14 > 45) signal = "SELL";
+  }
+
+  const stopDistance = atr14 !== null ? atr14 * 1.5 : null;
+
+  return {
+    ok: true,
+    status: 200,
+    data: {
+      system: "Chagatto-2",
+      source: "GMO Coin FX",
+      symbol: SYMBOL,
+      interval: "1hour",
+      candleCount: closes.length,
+      price: closes[closes.length - 1],
+      sma7,
+      sma8,
+      rsi14,
+      atr14,
+      stopDistance,
+      signal,
+      time: new Date().toISOString(),
+    },
+  };
+}
+
+async function runAutoFlow(baseUrl: string, adminToken: string) {
+  if (process.env.LIVE_TRADING_ENABLED !== "true") {
+    return { status: 200, data: { autoRun: true, action: "LIVE_TRADING_DISABLED" } };
+  }
+
+  if (gmoSafetyHalt) {
+    return {
+      status: 503,
+      data: { autoRun: false, error: "SAFETY_HALT", reason: gmoSafetyHaltReason },
+    };
+  }
+
+  const pnl: any = await getDailyRealizedPnl();
+
+  if (!pnl.ok) {
+    return {
+      status: 503,
+      data: { autoRun: false, action: "NO_ORDER", error: "DAILY_PNL_CHECK_FAILED", pnl },
+    };
+  }
+
+  if (pnl.lossLimitReached) {
+    return {
+      status: 200,
+      data: { autoRun: true, action: "DAILY_LOSS_LIMIT_REACHED", pnl },
+    };
+  }
+
+  const positions = await getOpenPositions();
+
+  if (!positions.ok) {
+    return {
+      status: 503,
+      data: { autoRun: false, action: "NO_ORDER", error: "POSITION_CHECK_FAILED" },
+    };
+  }
+
+  if (positions.positions.length > 0) {
+    return {
+      status: 200,
+      data: {
+        autoRun: true,
+        action: "POSITION_EXISTS_NO_NEW_ENTRY",
+        positionCount: positions.positions.length,
+        pnl,
+      },
+    };
+  }
+
+  const signalResult = await getSignalData();
+
+  if (!signalResult.ok) {
+    return {
+      status: 500,
+      data: { autoRun: false, error: "SIGNAL_API_ERROR", signalData: signalResult.data },
+    };
+  }
+
+  const signal = String(signalResult.data.signal);
+
+  if (signal !== "BUY" && signal !== "SELL") {
+    return {
+      status: 200,
+      data: { autoRun: true, action: "NO_ORDER", signal, signalData: signalResult.data, pnl },
+    };
+  }
+
+  try {
+    const response = await fetch(new URL("/gmo-order", baseUrl).toString(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-ADMIN-TOKEN": adminToken,
+      },
+      body: JSON.stringify({ side: signal }),
+    });
+
+    const text = await response.text();
+    let orderData: any;
+    try { orderData = JSON.parse(text); }
+    catch { orderData = { rawResponse: text }; }
+
+    return {
+      status: response.status,
+      data: {
+        autoRun: true,
+        action: response.ok ? "ORDER_FLOW_COMPLETED" : "ORDER_FLOW_REJECTED",
+        signal,
+        orderHttpStatus: response.status,
+        orderData,
+        pnl,
+      },
+    };
+  } catch (error) {
+    return {
+      status: 500,
+      data: {
+        autoRun: false,
+        action: "ORDER_REQUEST_FAILED",
+        signal,
+        message: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+}
+
+app.get("/", (c) => c.json({
+  system: "Chagatto-2",
+  status: "running",
+  mode: "FX verification system",
+}));
+
+app.get("/health", (c) => c.json({ status: "ok", system: "Chagatto-2" }));
+
+app.get("/test", (c) => c.json({
+  system: "Chagatto-2",
+  test: "success",
+  time: new Date().toISOString(),
+}));
+
+app.get("/gmo-test", async (c) => {
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
+  if (!apiKey || !apiSecret) return c.json({ error: "GMO API keys are not set" }, 500);
+
+  const timestamp = Date.now().toString();
+  const method = "GET";
+  const path = "/v1/account/assets";
+  const sign = signRequest(timestamp, method, path, apiSecret);
+
+  const response = await fetch(
+    "https://forex-api.coin.z.com/private/v1/account/assets",
+    {
+      method,
+      headers: {
+        "API-KEY": apiKey,
+        "API-TIMESTAMP": timestamp,
+        "API-SIGN": sign,
+      },
+    }
+  );
+
+  return c.json({ connected: response.ok, data: await response.json() });
+});
+
+app.get("/gmo-price", async (c) => {
+  const response = await fetch("https://forex-api.coin.z.com/public/v1/ticker");
+  const data: any = await response.json();
+
+  if (data.status !== 0 || !Array.isArray(data.data)) {
+    return c.json({ error: "Failed to get GMO FX price", data }, 500);
+  }
+
+  const x = data.data.find((item: any) => item.symbol === SYMBOL);
+  if (!x) return c.json({ error: "USD_JPY not found" }, 404);
+
+  return c.json({
+    system: "Chagatto-2",
+    source: "GMO Coin FX",
+    symbol: x.symbol,
+    bid: Number(x.bid),
+    ask: Number(x.ask),
+    status: x.status,
+    timestamp: x.timestamp,
+  });
+});
+
+app.get("/gmo-klines", async (c) => {
+  const x = await loadKlines();
+  return c.json({
+    system: "Chagatto-2",
+    source: "GMO Coin FX",
+    symbol: SYMBOL,
+    interval: "1hour",
+    previousDate: x.previousDate,
+    currentDate: x.currentDate,
+    candleCount: x.candles.length,
+    candles: x.candles.slice(-30),
+  });
+});
+
+app.get("/gmo-signal", async (c) => {
+  const result = await getSignalData();
+  return c.json(result.data, result.status as any);
+});
+
+app.get("/gmo-daily-pnl", async (c) => {
+  const result: any = await getDailyRealizedPnl();
+  return c.json(result, result.ok ? 200 : 503);
+});
+
+app.get("/gmo-safety-status", async (c) => {
+  const pnl = await getDailyRealizedPnl();
+  return c.json({
+    liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+    orderInProgress: gmoOrderInProgress,
+    safetyHalt: gmoSafetyHalt,
+    safetyHaltReason: gmoSafetyHaltReason,
+    dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
+    dailyPnl: pnl,
+    scheduler: {
+      enabled: true,
+      runMinuteJst: AUTO_RUN_MINUTE_JST,
+      inProgress: schedulerInProgress,
+      lastScheduledHourKey,
+      lastResult: lastSchedulerResult,
+    },
+  });
+});
+
+app.post("/gmo-order", async (c) => {
+  if (process.env.LIVE_TRADING_ENABLED !== "true") {
+    return c.json({ orderSent: false, error: "LIVE_TRADING_ENABLED is false" }, 403);
+  }
+
+  const adminToken = process.env.ADMIN_TOKEN;
+  const receivedToken = c.req.header("X-ADMIN-TOKEN");
+  if (!adminToken || receivedToken !== adminToken) {
+    return c.json({ orderSent: false, error: "Unauthorized" }, 401);
+  }
+
+  if (gmoSafetyHalt) {
+    return c.json({ orderSent: false, error: "SAFETY_HALT", reason: gmoSafetyHaltReason }, 503);
+  }
+
+  if (gmoOrderInProgress) {
+    return c.json({ orderSent: false, error: "ORDER_ALREADY_IN_PROGRESS" }, 409);
+  }
+
+  gmoOrderInProgress = true;
+
+  try {
+    const apiKey = process.env.GMO_API_KEY;
+    const apiSecret = process.env.GMO_API_SECRET;
+
+    if (!apiKey || !apiSecret) {
+      return c.json({ orderSent: false, error: "GMO API keys are not set" }, 500);
+    }
+
+    const pnl: any = await getDailyRealizedPnl();
+    if (!pnl.ok) {
+      return c.json({ orderSent: false, error: "DAILY_PNL_CHECK_FAILED", pnl }, 503);
+    }
+    if (pnl.lossLimitReached) {
+      return c.json({ orderSent: false, error: "DAILY_LOSS_LIMIT_REACHED", pnl }, 409);
+    }
+
+    const body = await c.req.json();
+    const side = body.side;
+    if (side !== "BUY" && side !== "SELL") {
+      return c.json({ orderSent: false, error: "side must be BUY or SELL" }, 400);
+    }
+
+    const existing = await getOpenPositions();
+    if (!existing.ok) {
+      return c.json({ orderSent: false, error: "Failed to check open positions" }, 500);
+    }
+    if (existing.positions.length > 0) {
+      return c.json({
+        orderSent: false,
+        reason: "POSITION_ALREADY_EXISTS",
+        positionCount: existing.positions.length,
+      }, 409);
+    }
+
+    const assetTimestamp = Date.now().toString();
+    const assetPath = "/v1/account/assets";
+    const assetSign = signRequest(assetTimestamp, "GET", assetPath, apiSecret);
+
+    const assetResponse = await fetch(
+      "https://forex-api.coin.z.com/private/v1/account/assets",
+      {
+        method: "GET",
+        headers: {
+          "API-KEY": apiKey,
+          "API-TIMESTAMP": assetTimestamp,
+          "API-SIGN": assetSign,
+        },
+      }
+    );
+
+    const assetData: any = await assetResponse.json();
+    const accountAsset = Array.isArray(assetData?.data) ? assetData.data[0] : assetData?.data;
+    const availableAmount = Number(accountAsset?.availableAmount);
+
+    if (!assetResponse.ok || assetData?.status !== 0 ||
+        !Number.isFinite(availableAmount) || availableAmount <= 0) {
+      return c.json({ orderSent: false, error: "NO_AVAILABLE_FUNDS" }, 409);
+    }
+
+    const signalResult = await getSignalData();
+    if (!signalResult.ok) {
+      return c.json({ orderSent: false, error: "SIGNAL_API_ERROR" }, 500);
+    }
+
+    const currentSignal = String(signalResult.data.signal);
+    if (currentSignal !== "BUY" && currentSignal !== "SELL") {
+      return c.json({ orderSent: false, error: "NO_TRADE_SIGNAL", signal: currentSignal }, 409);
+    }
+    if (side !== currentSignal) {
+      return c.json({
+        orderSent: false,
+        error: "SIGNAL_SIDE_MISMATCH",
+        requestedSide: side,
+        signal: currentSignal,
+      }, 409);
+    }
+
+    const stopDistance = Number(signalResult.data.stopDistance);
+    if (!Number.isFinite(stopDistance) || stopDistance <= 0) {
+      return c.json({ orderSent: false, error: "Invalid stopDistance" }, 500);
+    }
+
+    const maxRiskYen = availableAmount * 0.02;
+    const calculatedOrderSize = Math.floor(maxRiskYen / stopDistance);
+    const orderSize = Math.min(calculatedOrderSize, 1000, 500000);
+
+    if (orderSize < 100) {
+      return c.json({
+        orderSent: false,
+        error: "ORDER_SIZE_BELOW_MINIMUM",
+        calculatedOrderSize,
+        minOrderSize: 100,
+        maxRiskYen,
+        stopDistance,
+      }, 409);
+    }
+
+    const timestamp = Date.now().toString();
+    const path = "/v1/order";
+    const orderBody = JSON.stringify({
+      symbol: SYMBOL,
+      side,
+      size: String(orderSize),
+      executionType: "MARKET",
+    });
+    const sign = signRequest(timestamp, "POST", path, apiSecret, orderBody);
+
+    let response: Response;
+    let data: any;
+
+    try {
+      response = await fetch(
+        "https://forex-api.coin.z.com/private/v1/order",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "API-KEY": apiKey,
+            "API-TIMESTAMP": timestamp,
+            "API-SIGN": sign,
+          },
+          body: orderBody,
+        }
+      );
+      data = await response.json();
+    } catch (error) {
+      gmoSafetyHalt = true;
+      gmoSafetyHaltReason = "ENTRY_ORDER_RESPONSE_UNKNOWN";
+      return c.json({
+        orderSent: "UNKNOWN",
+        safetyHalt: true,
+        error: gmoSafetyHaltReason,
+        message: error instanceof Error ? error.message : String(error),
+      }, 503);
+    }
+
+    if (!response.ok || data.status !== 0) {
+      return c.json({ orderSent: false, symbol: SYMBOL, side, size: String(orderSize), data }, 500);
+    }
+
+    const orderResult = Array.isArray(data?.data) ? data.data[0] : data?.data;
+    const orderId = Number(orderResult?.orderId ?? orderResult);
+    const rootOrderId = Number(orderResult?.rootOrderId ?? orderId);
+
+    if (!Number.isFinite(orderId) || !Number.isFinite(rootOrderId)) {
+      gmoSafetyHalt = true;
+      gmoSafetyHaltReason = "ORDER_ID_NOT_FOUND";
+      return c.json({
+        orderSent: true,
+        stopOrderSent: false,
+        error: gmoSafetyHaltReason,
+        data,
+      }, 500);
+    }
+
+    let executions: any[] = [];
+    let executionData: any = null;
+
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      await sleep(1000);
+
+      const ts = Date.now().toString();
+      const p = "/v1/executions";
+      const sg = signRequest(ts, "GET", p, apiSecret);
+
+      try {
+        const er = await fetch(
+          `https://forex-api.coin.z.com/private/v1/executions?orderId=${orderId}`,
+          {
+            method: "GET",
+            headers: {
+              "API-KEY": apiKey,
+              "API-TIMESTAMP": ts,
+              "API-SIGN": sg,
+            },
+          }
+        );
+
+        executionData = await er.json();
+        executions = extractList(executionData).filter(
+          (x: any) =>
+            Number(x.orderId) === orderId &&
+            x.symbol === SYMBOL &&
+            x.settleType === "OPEN"
+        );
+
+        const filled = executions.reduce((s: number, x: any) => s + Number(x.size || 0), 0);
+        if (filled >= orderSize) break;
+      } catch {
+        executionData = { error: "EXECUTION_API_RETRY", attempt };
+      }
+    }
+
+    if (executions.length === 0) {
+      await sleep(1000);
+      const reconciled = await getOpenPositions();
+
+      if (reconciled.ok) {
+        executions = reconciled.positions
+          .filter(
+            (p: any) =>
+              p.symbol === SYMBOL &&
+              p.side === side &&
+              Number(p.positionId) > 0 &&
+              Number(p.size) > 0 &&
+              Number(p.price) > 0
+          )
+          .map((p: any) => ({
+            orderId,
+            symbol: SYMBOL,
+            settleType: "OPEN",
+            positionId: p.positionId,
+            size: p.size,
+            price: p.price,
+            reconciledFromOpenPositions: true,
+          }));
+      }
+    }
+
+    if (executions.length === 0) {
+      gmoSafetyHalt = true;
+      gmoSafetyHaltReason = "EXECUTION_STATE_UNKNOWN_AFTER_RECONCILIATION";
+      return c.json({
+        orderSent: true,
+        stopOrderSent: false,
+        safetyHalt: true,
+        orderId,
+        error: gmoSafetyHaltReason,
+        executionData,
+      }, 202);
+    }
+
+    const totalExecutedSize = executions.reduce(
+      (s: number, x: any) => s + Number(x.size || 0), 0
+    );
+
+    if (!Number.isFinite(totalExecutedSize) || totalExecutedSize <= 0) {
+      gmoSafetyHalt = true;
+      gmoSafetyHaltReason = "INVALID_EXECUTED_SIZE";
+      return c.json({
+        orderSent: true,
+        stopOrderSent: false,
+        orderId,
+        error: gmoSafetyHaltReason,
+        executedSize: totalExecutedSize,
+      }, 500);
+    }
+
+    let entryOrderStatus: string | null = null;
+    let entryOrderData: any = null;
+
+    if (totalExecutedSize < orderSize) {
+      const ts = Date.now().toString();
+      const p = "/v1/orders";
+      const sg = signRequest(ts, "GET", p, apiSecret);
+
+      try {
+        const rr = await fetch(
+          `https://forex-api.coin.z.com/private/v1/orders?orderId=${orderId}`,
+          {
+            method: "GET",
+            headers: {
+              "API-KEY": apiKey,
+              "API-TIMESTAMP": ts,
+              "API-SIGN": sg,
+            },
+          }
+        );
+        entryOrderData = await rr.json();
+        entryOrderStatus =
+          extractList(entryOrderData).find((x: any) => Number(x.orderId) === orderId)?.status ?? null;
+      } catch (error) {
+        entryOrderData = { error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+
+    const partialExecution = totalExecutedSize < orderSize;
+    let remainderCancelAttempted = false;
+    let remainderCancelSucceeded = false;
+    let remainderCancelData: any = null;
+
+    if (
+      partialExecution &&
+      ["WAITING", "ORDERED", "MODIFYING"].includes(String(entryOrderStatus))
+    ) {
+      remainderCancelAttempted = true;
+
+      const ts = Date.now().toString();
+      const p = "/v1/cancelOrders";
+      const cancelBody = JSON.stringify({ rootOrderIds: [rootOrderId] });
+      const sg = signRequest(ts, "POST", p, apiSecret, cancelBody);
+
+      try {
+        const rr = await fetch(
+          "https://forex-api.coin.z.com/private/v1/cancelOrders",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "API-KEY": apiKey,
+              "API-TIMESTAMP": ts,
+              "API-SIGN": sg,
+            },
+            body: cancelBody,
+          }
+        );
+
+        const t = await rr.text();
+        try { remainderCancelData = JSON.parse(t); }
+        catch { remainderCancelData = { rawResponse: t }; }
+
+        remainderCancelSucceeded = rr.ok && remainderCancelData?.status === 0;
+      } catch (error) {
+        remainderCancelData = {
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+
+      // 取消に失敗しても、既に約定済みの建玉にはSTOP保護を試みる。
+      // ただし安全停止は維持して、その後の新規注文は禁止する。
+      if (!remainderCancelSucceeded) {
+        gmoSafetyHalt = true;
+        gmoSafetyHaltReason = "PARTIAL_FILL_REMAINDER_CANCEL_FAILED";
+      }
+
+      await sleep(1100);
+    }
+
+    const weightedPriceTotal = executions.reduce(
+      (s: number, x: any) => s + Number(x.price) * Number(x.size), 0
+    );
+    const entryPrice = weightedPriceTotal / totalExecutedSize;
+
+    const positionMap = new Map<number, number>();
+
+    for (const x of executions) {
+      const positionId = Number(x.positionId);
+      const size = Number(x.size);
+
+      if (
+        !Number.isFinite(positionId) || positionId <= 0 ||
+        !Number.isFinite(size) || size <= 0
+      ) {
+        gmoSafetyHalt = true;
+        gmoSafetyHaltReason = "INVALID_EXECUTION_DATA";
+        return c.json({
+          orderSent: true,
+          stopOrderSent: false,
+          orderId,
+          error: gmoSafetyHaltReason,
+          safetyHalt: true,
+        }, 500);
+      }
+
+      positionMap.set(positionId, (positionMap.get(positionId) || 0) + size);
+    }
+
+    const settlePosition = Array.from(positionMap.entries())
+      .map(([positionId, size]) => ({ positionId, size: String(size) }));
+
+    if (
+      !Number.isFinite(entryPrice) || entryPrice <= 0 ||
+      settlePosition.length === 0 || settlePosition.length > 10
+    ) {
+      gmoSafetyHalt = true;
+      gmoSafetyHaltReason = "INVALID_EXECUTION_DATA";
+      return c.json({
+        orderSent: true,
+        stopOrderSent: false,
+        orderId,
+        error: gmoSafetyHaltReason,
+      }, 500);
+    }
+
+    const stopPrice =
+      (side === "BUY" ? entryPrice - stopDistance : entryPrice + stopDistance).toFixed(3);
+    const stopSide = side === "BUY" ? "SELL" : "BUY";
+
+    const stopTimestamp = Date.now().toString();
+    const stopPath = "/v1/closeOrder";
+    const stopClientOrderId = `CS${orderId}${Date.now()}`.slice(0, 36);
+
+    const stopBody = JSON.stringify({
+      symbol: SYMBOL,
+      side: stopSide,
+      clientOrderId: stopClientOrderId,
+      executionType: "STOP",
+      stopPrice,
+      settlePosition,
+    });
+
+    const stopSign = signRequest(
+      stopTimestamp, "POST", stopPath, apiSecret, stopBody
+    );
+
+    let stopResponse: Response | null = null;
+    let stopData: any = null;
+    let stopRequestError: string | null = null;
+
+    try {
+      stopResponse = await fetch(
+        "https://forex-api.coin.z.com/private/v1/closeOrder",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "API-KEY": apiKey,
+            "API-TIMESTAMP": stopTimestamp,
+            "API-SIGN": stopSign,
+          },
+          body: stopBody,
+        }
+      );
+
+      const t = await stopResponse.text();
+      try { stopData = JSON.parse(t); }
+      catch { stopData = { rawResponse: t }; }
+    } catch (error) {
+      stopRequestError = error instanceof Error ? error.message : String(error);
+    }
+
+    let stopConfirmedByActiveOrders = false;
+    let matchedStopOrder: any = null;
+    let activeOrdersCheckSucceeded = false;
+
+    if (stopResponse === null || !stopResponse.ok || stopData?.status !== 0) {
+      await sleep(1000);
+
+      const ts = Date.now().toString();
+      const p = "/v1/activeOrders";
+      const sg = signRequest(ts, "GET", p, apiSecret);
+
+      try {
+        const rr = await fetch(
+          `https://forex-api.coin.z.com/private/v1/activeOrders?symbol=${SYMBOL}&count=100`,
+          {
+            method: "GET",
+            headers: {
+              "API-KEY": apiKey,
+              "API-TIMESTAMP": ts,
+              "API-SIGN": sg,
+            },
+          }
+        );
+
+        const d: any = await rr.json();
+        activeOrdersCheckSucceeded = rr.ok && d?.status === 0;
+
+        matchedStopOrder = extractList(d).find(
+          (x: any) =>
+            x.clientOrderId === stopClientOrderId &&
+            x.symbol === SYMBOL &&
+            x.executionType === "STOP" &&
+            x.settleType === "CLOSE"
+        ) ?? null;
+
+        stopConfirmedByActiveOrders = matchedStopOrder !== null;
+      } catch {}
+    }
+
+    const stopConfirmed =
+      (stopResponse !== null && stopResponse.ok && stopData?.status === 0) ||
+      stopConfirmedByActiveOrders;
+
+    let emergencyCloseAttempted = false;
+    let emergencyCloseSucceeded = false;
+    let emergencyCloseData: any = null;
+    let emergencyCloseError: string | null = null;
+
+    if (!stopConfirmed && activeOrdersCheckSucceeded) {
+      emergencyCloseAttempted = true;
+
+      const ts = Date.now().toString();
+      const p = "/v1/closeOrder";
+      const clientOrderId = `CE${orderId}${Date.now()}`.slice(0, 36);
+
+      const b = JSON.stringify({
+        symbol: SYMBOL,
+        side: stopSide,
+        clientOrderId,
+        executionType: "MARKET",
+        settlePosition,
+      });
+
+      const sg = signRequest(ts, "POST", p, apiSecret, b);
+
+      try {
+        const rr = await fetch(
+          "https://forex-api.coin.z.com/private/v1/closeOrder",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "API-KEY": apiKey,
+              "API-TIMESTAMP": ts,
+              "API-SIGN": sg,
+            },
+            body: b,
+          }
+        );
+
+        const t = await rr.text();
+        try { emergencyCloseData = JSON.parse(t); }
+        catch { emergencyCloseData = { rawResponse: t }; }
+
+        emergencyCloseSucceeded = rr.ok && emergencyCloseData?.status === 0;
+      } catch (error) {
+        emergencyCloseError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    const protectionState =
+      stopConfirmed ? "STOP_CONFIRMED" :
+      emergencyCloseSucceeded ? "EMERGENCY_CLOSE_SENT" :
+      activeOrdersCheckSucceeded ? "PROTECTION_FAILED" :
+      "PROTECTION_UNKNOWN";
+
+    if (
+      protectionState === "PROTECTION_FAILED" ||
+      protectionState === "PROTECTION_UNKNOWN"
+    ) {
+      gmoSafetyHalt = true;
+      gmoSafetyHaltReason = protectionState;
+    }
+
+    return c.json({
+      orderSent: true,
+      stopOrderSent: stopConfirmed,
+      symbol: SYMBOL,
+      side,
+      orderId,
+      rootOrderId,
+      entryPrice,
+      executedSize: totalExecutedSize,
+      requestedSize: orderSize,
+      partialExecution,
+      entryOrderStatus,
+      remainderCancelAttempted,
+      remainderCancelSucceeded,
+      remainderCancelData,
+      entryOrderData,
+      positions: settlePosition,
+      stopDistance,
+      stopPrice,
+      stopClientOrderId,
+      stopData,
+      stopRequestError,
+      stopConfirmedByActiveOrders,
+      matchedStopOrder,
+      activeOrdersCheckSucceeded,
+      protectionState,
+      emergencyCloseAttempted,
+      emergencyCloseSucceeded,
+      emergencyCloseData,
+      emergencyCloseError,
+      safetyHalt: gmoSafetyHalt,
+      safetyHaltReason: gmoSafetyHaltReason,
+    });
+  } finally {
+    gmoOrderInProgress = false;
+  }
+});
+
+app.post("/gmo-auto-run", async (c) => {
+  const adminToken = process.env.ADMIN_TOKEN;
+  const receivedToken = c.req.header("X-ADMIN-TOKEN");
+
+  if (!adminToken || receivedToken !== adminToken) {
+    return c.json({ autoRun: false, error: "Unauthorized" }, 401);
+  }
+
+  const result = await runAutoFlow(c.req.url, adminToken);
+  return c.json(result.data, result.status as any);
+});
+
+app.get("/gmo-positions", async (c) => {
+  const result = await getOpenPositions();
+
+  if (!result.ok) {
+    return c.json({
+      connected: false,
+      error: "Failed to get open positions",
+      data: result,
+    }, 500);
+  }
+
+  return c.json({
+    system: "Chagatto-2",
+    source: "GMO Coin FX",
+    symbol: SYMBOL,
+    positionCount: result.positions.length,
+    hasPosition: result.positions.length > 0,
+    positions: result.positions,
+  });
+});
+
+app.post("/gmo-close", async (c) => {
+  if (process.env.LIVE_TRADING_ENABLED !== "true") {
+    return c.json({ closeSent: false, error: "LIVE_TRADING_ENABLED is false" }, 403);
+  }
+
+  const adminToken = process.env.ADMIN_TOKEN;
+  const receivedToken = c.req.header("X-ADMIN-TOKEN");
+
+  if (!adminToken || receivedToken !== adminToken) {
+    return c.json({ closeSent: false, error: "Unauthorized" }, 401);
+  }
+
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
+
+  if (!apiKey || !apiSecret) {
+    return c.json({ closeSent: false, error: "GMO API keys are not set" }, 500);
+  }
+
+  const body = await c.req.json();
+  const positionId = Number(body.positionId);
+  const positionSide = body.positionSide;
+  const sizeValue = Number(body.size);
+
+  if (!Number.isFinite(positionId) ||
+      !Number.isFinite(sizeValue) || sizeValue <= 0 ||
+      (positionSide !== "BUY" && positionSide !== "SELL")) {
+    return c.json({ closeSent: false, error: "Invalid close request" }, 400);
+  }
+
+  // GMO側の実建玉と一致する場合だけ決済する。
+  const positions = await getOpenPositions();
+
+  if (!positions.ok) {
+    return c.json({ closeSent: false, error: "POSITION_CHECK_FAILED" }, 503);
+  }
+
+  const actual = positions.positions.find(
+    (p: any) => Number(p.positionId) === positionId && p.symbol === SYMBOL
+  );
+
+  if (!actual) {
+    return c.json({ closeSent: false, error: "POSITION_NOT_FOUND" }, 404);
+  }
+
+  if (actual.side !== positionSide || Number(actual.size) !== sizeValue) {
+    return c.json({
+      closeSent: false,
+      error: "POSITION_DATA_MISMATCH",
+    }, 409);
+  }
+
+  const closeSide = positionSide === "BUY" ? "SELL" : "BUY";
+  const timestamp = Date.now().toString();
+  const path = "/v1/closeOrder";
+
+  const closeBody = JSON.stringify({
+    symbol: SYMBOL,
+    side: closeSide,
+    executionType: "MARKET",
+    settlePosition: [{ positionId, size: String(sizeValue) }],
+  });
+
+  const sign = signRequest(timestamp, "POST", path, apiSecret, closeBody);
+
+  const response = await fetch(
+    "https://forex-api.coin.z.com/private/v1/closeOrder",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "API-KEY": apiKey,
+        "API-TIMESTAMP": timestamp,
+        "API-SIGN": sign,
+      },
+      body: closeBody,
+    }
+  );
+
+  const data: any = await response.json();
+
+  return c.json({
+    closeSent: response.ok && data.status === 0,
+    symbol: SYMBOL,
+    positionId,
+    positionSide,
+    closeSide,
+    size: String(sizeValue),
+    executionType: "MARKET",
+    data,
+  });
+});
+
+app.get("/gmo-stop-check", async (c) => {
+  const tickerResponse = await fetch(
+    `https://forex-api.coin.z.com/public/v1/ticker?symbol=${SYMBOL}`
+  );
+  const tickerData: any = await tickerResponse.json();
+
+  const bid = Number(tickerData?.data?.[0]?.bid);
+  const ask = Number(tickerData?.data?.[0]?.ask);
+
+  if (!Number.isFinite(bid)) {
+    return c.json({ error: "Failed to get USD_JPY bid" }, 500);
+  }
+
+  const positions = await getOpenPositions();
+
+  if (!positions.ok) {
+    return c.json({ error: "Failed to get positions" }, 500);
+  }
+
+  const stopDistance = 0.20;
+
+  const checks = positions.positions.map((p: any) => {
+    const entryPrice = Number(p.price);
+    const currentPrice = p.side === "BUY" ? bid : ask;
+    const stopPrice =
+      p.side === "BUY" ? entryPrice - stopDistance : entryPrice + stopDistance;
+
+    return {
+      positionId: p.positionId,
+      side: p.side,
+      size: p.size,
+      entryPrice,
+      currentPrice,
+      stopPrice,
+      stopDistance,
+      stopTriggered:
+        p.side === "BUY" ? currentPrice <= stopPrice : currentPrice >= stopPrice,
+    };
+  });
+
+  return c.json({
+    system: "Chagatto-2",
+    symbol: SYMBOL,
+    bid,
+    ask,
+    positionCount: positions.positions.length,
+    checks,
+    action: "CHECK_ONLY",
+  });
+});
+
+// 既存URLとの互換性を残す研究用エンドポイント
+app.get("/fx-test", (c) => c.json({
+  system: "Chagatto-2",
+  note: "Live automation uses GMO /gmo-signal.",
+}));
+app.get("/backtest", (c) => c.json({
+  system: "Chagatto-2",
+  note: "Backtest endpoint disabled in production build.",
+}));
+app.get("/auto-backtest", (c) => c.json({
+  system: "Chagatto-2",
+  note: "Research endpoint disabled in production build.",
+}));
+app.get("/auto-optimize", (c) => c.json({
+  system: "Chagatto-2",
+  note: "Research endpoint disabled in production build.",
+}));
+
+const port = Number(process.env.PORT || 8080);
+const internalBaseUrl = `http://127.0.0.1:${port}`;
+
+serve({
+  fetch: app.fetch,
+  port,
+  hostname: "0.0.0.0",
+});
+
+console.log(`Chagatto-2 started PORT=${port}`);
+
+// JST毎時05分に自動判定。
+// 30秒ごとに時計を確認するが、同じJST時間帯では1回だけ実行する。
+setInterval(async () => {
+  const p = jstParts();
+
+  if (p.minute !== AUTO_RUN_MINUTE_JST || schedulerInProgress) return;
+
+  const hourKey = jstHourKey();
+  if (lastScheduledHourKey === hourKey) return;
+
+  lastScheduledHourKey = hourKey;
+  schedulerInProgress = true;
+
+  try {
+    const adminToken = process.env.ADMIN_TOKEN;
+
+    if (!adminToken) {
+      lastSchedulerResult = {
+        time: new Date().toISOString(),
+        hourKey,
+        error: "ADMIN_TOKEN_NOT_SET",
+      };
+      return;
+    }
+
+    const result = await runAutoFlow(internalBaseUrl, adminToken);
+
+    lastSchedulerResult = {
+      time: new Date().toISOString(),
+      hourKey,
+      httpStatus: result.status,
+      ...result.data,
+    };
+
+    console.log("Hourly auto-run:", JSON.stringify(lastSchedulerResult));
+  } catch (error) {
+    lastSchedulerResult = {
+      time: new Date().toISOString(),
+      hourKey,
+      error: error instanceof Error ? error.message : String(error),
+    };
+
+    console.error("Hourly auto-run failed:", error);
+  } finally {
+    schedulerInProgress = false;
+  }
+}, 30_000);
