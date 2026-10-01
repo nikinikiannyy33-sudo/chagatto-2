@@ -2061,6 +2061,113 @@ app.get("/order-path-test", (c) => {
   });
 });
 
+
+// Research only: compare three exit methods on historical USD/JPY 1h candles.
+// No GMO private/order API is called. Live parameters are not changed.
+app.get("/exit-strategy-backtest", async (c) => {
+  const apiKey = process.env.TWELVE_DATA_API_KEY;
+  if (!apiKey) return c.json({ error: "TWELVE_DATA_API_KEY is not set" }, 500);
+
+  try {
+    const requestedCandles = 2000;
+    const response = await fetch(
+      `https://api.twelvedata.com/time_series?symbol=USD/JPY&interval=1h&outputsize=${requestedCandles}&apikey=${apiKey}`
+    );
+    const data = await response.json() as any;
+    if (!data.values || !Array.isArray(data.values)) {
+      return c.json({ error: "Twelve Data API error", details: data }, 500);
+    }
+
+    const candles = data.values.slice().reverse().map((x: any) => ({
+      time: x.datetime, close: Number(x.close), high: Number(x.high), low: Number(x.low)
+    })).filter((x: any) =>
+      Number.isFinite(x.close) && Number.isFinite(x.high) && Number.isFinite(x.low)
+    );
+
+    const p = { fastSma: 7, slowSma: 10, buyRsi: 60, sellRsi: 45, stopLossPips: 6 };
+    const closes = candles.map((x: any) => x.close);
+    const sma = (n: number, i: number) => {
+      if (i + 1 < n) return null;
+      let s = 0; for (let j=i-n+1;j<=i;j++) s += closes[j];
+      return s/n;
+    };
+    const rsi = (n: number, i: number) => {
+      if (i < n) return null;
+      let g=0,l=0;
+      for (let j=i-n+1;j<=i;j++) {
+        const d=closes[j]-closes[j-1]; if(d>=0) g+=d; else l-=d;
+      }
+      if (l===0) return 100;
+      const rs=(g/n)/(l/n); return 100-(100/(1+rs));
+    };
+    const signal = (i:number) => {
+      const f=sma(p.fastSma,i), s=sma(p.slowSma,i), r=rsi(14,i);
+      if(f===null||s===null||r===null) return "WAIT";
+      if(f>s && r>=p.buyRsi) return "BUY";
+      if(f<s && r<=p.sellRsi) return "SELL";
+      return "WAIT";
+    };
+
+    const run = (mode:"OPPOSITE_SIGNAL"|"FIXED_1R"|"TRAILING_1R") => {
+      const stop = p.stopLossPips/100;
+      let pos:any=null; const results:number[]=[];
+      for(let i=20;i<candles.length;i++){
+        const sig=signal(i), x=candles[i];
+        if(!pos){
+          if(sig==="BUY") pos={side:"BUY",entry:x.close,hard:x.close-stop,best:x.close,trail:x.close-stop};
+          else if(sig==="SELL") pos={side:"SELL",entry:x.close,hard:x.close+stop,best:x.close,trail:x.close+stop};
+          continue;
+        }
+        let exit:number|null=null;
+        if(pos.side==="BUY"){
+          if(x.low<=pos.hard) exit=pos.hard;
+          else if(mode==="FIXED_1R" && x.high>=pos.entry+stop) exit=pos.entry+stop;
+          else if(mode==="OPPOSITE_SIGNAL" && sig==="SELL") exit=x.close;
+          else if(mode==="TRAILING_1R"){
+            pos.best=Math.max(pos.best,x.high);
+            if(pos.best>=pos.entry+stop) pos.trail=Math.max(pos.trail,pos.best-stop);
+            if(x.low<=pos.trail) exit=pos.trail;
+          }
+          if(exit!==null) results.push((exit-pos.entry)*100);
+        } else {
+          if(x.high>=pos.hard) exit=pos.hard;
+          else if(mode==="FIXED_1R" && x.low<=pos.entry-stop) exit=pos.entry-stop;
+          else if(mode==="OPPOSITE_SIGNAL" && sig==="BUY") exit=x.close;
+          else if(mode==="TRAILING_1R"){
+            pos.best=Math.min(pos.best,x.low);
+            if(pos.best<=pos.entry-stop) pos.trail=Math.min(pos.trail,pos.best+stop);
+            if(x.high>=pos.trail) exit=pos.trail;
+          }
+          if(exit!==null) results.push((pos.entry-exit)*100);
+        }
+        if(exit!==null) pos=null;
+      }
+      const wins=results.filter(x=>x>0), losses=results.filter(x=>x<=0);
+      const gw=wins.reduce((a,b)=>a+b,0), gl=-losses.reduce((a,b)=>a+b,0);
+      let eq=0,peak=0,dd=0;
+      for(const x of results){eq+=x;peak=Math.max(peak,eq);dd=Math.max(dd,peak-eq);}
+      return {
+        mode, trades:results.length, wins:wins.length, losses:losses.length,
+        winRate:results.length?wins.length/results.length*100:0,
+        totalPips:results.reduce((a,b)=>a+b,0),
+        profitFactor:gl>0?gw/gl:null, maxDrawdownPips:dd
+      };
+    };
+
+    return c.json({
+      system:"Chagatto-1 Exit Strategy Backtest",
+      researchOnly:true, liveParametersChanged:false,
+      symbol:"USD/JPY", interval:"1hour",
+      candlesRequested:requestedCandles, candlesReceived:candles.length,
+      fixedParameters:p,
+      results:[run("OPPOSITE_SIGNAL"),run("FIXED_1R"),run("TRAILING_1R")],
+      note:"Research only. No GMO order API is called and LIVE_TRADING_ENABLED is unchanged."
+    });
+  } catch(error) {
+    return c.json({error:"EXIT_STRATEGY_BACKTEST_FAILED",message:error instanceof Error?error.message:String(error)},500);
+  }
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
