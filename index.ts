@@ -2168,6 +2168,124 @@ app.get("/exit-strategy-backtest", async (c) => {
   }
 });
 
+
+// Research only: fixed 1R trailing exit tested over 5 chronological windows.
+// No optimization inside windows, no GMO private/order API, no live parameter changes.
+app.get("/trailing-multi-window", async (c) => {
+  const apiKey = process.env.TWELVE_DATA_API_KEY;
+  if (!apiKey) return c.json({ error: "TWELVE_DATA_API_KEY is not set" }, 500);
+
+  try {
+    const requestedCandles = 2000;
+    const response = await fetch(
+      `https://api.twelvedata.com/time_series?symbol=USD/JPY&interval=1h&outputsize=${requestedCandles}&apikey=${apiKey}`
+    );
+    const data = await response.json() as any;
+    if (!data.values || !Array.isArray(data.values)) {
+      return c.json({ error: "Twelve Data API error", details: data }, 500);
+    }
+
+    const candles = data.values.slice().reverse().map((x:any)=>({
+      time:x.datetime, close:Number(x.close), high:Number(x.high), low:Number(x.low)
+    })).filter((x:any)=>Number.isFinite(x.close)&&Number.isFinite(x.high)&&Number.isFinite(x.low));
+
+    const p={fastSma:7,slowSma:10,buyRsi:60,sellRsi:45,stopLossPips:6,trailingR:1};
+    const sma=(arr:number[],n:number,i:number)=>{
+      if(i+1<n)return null; let s=0; for(let j=i-n+1;j<=i;j++)s+=arr[j]; return s/n;
+    };
+    const rsi=(arr:number[],n:number,i:number)=>{
+      if(i<n)return null; let g=0,l=0;
+      for(let j=i-n+1;j<=i;j++){const d=arr[j]-arr[j-1];if(d>=0)g+=d;else l-=d;}
+      if(l===0)return 100; const rs=(g/n)/(l/n); return 100-100/(1+rs);
+    };
+
+    const runWindow=(part:any[])=>{
+      const closes=part.map((x:any)=>x.close);
+      const signal=(i:number)=>{
+        const f=sma(closes,p.fastSma,i),s=sma(closes,p.slowSma,i),r=rsi(closes,14,i);
+        if(f===null||s===null||r===null)return "WAIT";
+        if(f>s&&r>=p.buyRsi)return "BUY";
+        if(f<s&&r<=p.sellRsi)return "SELL";
+        return "WAIT";
+      };
+      const stop=p.stopLossPips/100;
+      let pos:any=null; const pnl:number[]=[];
+      for(let i=20;i<part.length;i++){
+        const sig=signal(i),x=part[i];
+        if(!pos){
+          if(sig==="BUY")pos={side:"BUY",entry:x.close,hard:x.close-stop,best:x.close,trail:x.close-stop};
+          else if(sig==="SELL")pos={side:"SELL",entry:x.close,hard:x.close+stop,best:x.close,trail:x.close+stop};
+          continue;
+        }
+        let exit:number|null=null;
+        if(pos.side==="BUY"){
+          if(x.low<=pos.hard)exit=pos.hard;
+          else{
+            pos.best=Math.max(pos.best,x.high);
+            if(pos.best>=pos.entry+stop)pos.trail=Math.max(pos.trail,pos.best-stop);
+            if(x.low<=pos.trail)exit=pos.trail;
+          }
+          if(exit!==null)pnl.push((exit-pos.entry)*100);
+        }else{
+          if(x.high>=pos.hard)exit=pos.hard;
+          else{
+            pos.best=Math.min(pos.best,x.low);
+            if(pos.best<=pos.entry-stop)pos.trail=Math.min(pos.trail,pos.best+stop);
+            if(x.high>=pos.trail)exit=pos.trail;
+          }
+          if(exit!==null)pnl.push((pos.entry-exit)*100);
+        }
+        if(exit!==null)pos=null;
+      }
+      const wins=pnl.filter(x=>x>0),losses=pnl.filter(x=>x<=0);
+      const gw=wins.reduce((a,b)=>a+b,0),gl=-losses.reduce((a,b)=>a+b,0);
+      let eq=0,peak=0,dd=0;
+      for(const x of pnl){eq+=x;peak=Math.max(peak,eq);dd=Math.max(dd,peak-eq);}
+      const total=pnl.reduce((a,b)=>a+b,0);
+      const pf=gl>0?gw/gl:null;
+      return {
+        trades:pnl.length,wins:wins.length,losses:losses.length,
+        winRate:pnl.length?wins.length/pnl.length*100:0,
+        totalPips:total,profitFactor:pf,maxDrawdownPips:dd,
+        passed: total>0 && pf!==null && pf>1
+      };
+    };
+
+    const windowCount=5;
+    const size=Math.floor(candles.length/windowCount);
+    const windows=[];
+    for(let w=0;w<windowCount;w++){
+      const start=w*size;
+      const end=w===windowCount-1?candles.length:(w+1)*size;
+      const part=candles.slice(start,end);
+      windows.push({
+        window:`W${w+1}`,
+        start:part[0]?.time??null,end:part[part.length-1]?.time??null,
+        ...runWindow(part)
+      });
+    }
+
+    const positiveWindows=windows.filter(x=>x.totalPips>0).length;
+    const pfAboveOneWindows=windows.filter(x=>x.profitFactor!==null&&x.profitFactor>1).length;
+    return c.json({
+      system:"Chagatto-1 Trailing Multi Window Validation",
+      researchOnly:true,liveParametersChanged:false,
+      symbol:"USD/JPY",interval:"1hour",
+      candlesRequested:requestedCandles,candlesReceived:candles.length,
+      fixedParameters:p,
+      method:"Frozen 1R trailing parameters across 5 chronological non-overlapping windows; no optimization inside windows.",
+      windows,
+      summary:{
+        positiveWindows,pfAboveOneWindows,windowCount,
+        allWindowsPassed:windows.every(x=>x.passed)
+      },
+      note:"Research only. No GMO order API is called and LIVE_TRADING_ENABLED is unchanged."
+    });
+  } catch(error) {
+    return c.json({error:"TRAILING_MULTI_WINDOW_FAILED",message:error instanceof Error?error.message:String(error)},500);
+  }
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
