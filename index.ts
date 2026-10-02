@@ -2730,6 +2730,70 @@ app.get("/trailing-conservative-validation", async (c) => {
   }
 });
 
+
+// Final pre-live research: direction breakdown + frozen candidate comparison.
+// Research only. No GMO private/order/changeOrder API and no live parameter changes.
+app.get("/prelive-final-analysis", async (c) => {
+  try {
+    const apiKey=process.env.TWELVE_DATA_API_KEY||"";
+    if(!apiKey) return c.json({error:"TWELVE_DATA_API_KEY_MISSING",researchOnly:true},500);
+    const costPips=0.4, pip=0.01;
+    const rr=await fetch(`https://api.twelvedata.com/time_series?symbol=USD/JPY&interval=1h&outputsize=2000&apikey=${encodeURIComponent(apiKey)}`);
+    const jj:any=await rr.json();
+    if(!Array.isArray(jj?.values)) return c.json({error:"TWELVE_DATA_ERROR",detail:jj,researchOnly:true},502);
+    const bars=jj.values.slice().reverse().map((v:any)=>({t:String(v.datetime),open:+v.open,high:+v.high,low:+v.low,close:+v.close}))
+      .filter((x:any)=>[x.open,x.high,x.low,x.close].every(Number.isFinite));
+
+    function sma(a:any[],i:number,n:number){if(i<n-1)return null;let s=0;for(let k=i-n+1;k<=i;k++)s+=a[k].close;return s/n}
+    function rsi(a:any[],i:number,n=14){if(i<n)return null;let g=0,l=0;for(let k=i-n+1;k<=i;k++){let d=a[k].close-a[k-1].close;if(d>=0)g+=d;else l-=d}if(l===0)return 100;let rs=(g/n)/(l/n);return 100-100/(1+rs)}
+    function run(a:any[],p:any,mode="BOTH"){
+      const dist=p.stop*pip; let pos:any=null,tr:any[]=[];
+      for(let i=20;i<a.length;i++){
+        const b=a[i],f=sma(a,i,p.fast),s=sma(a,i,p.slow),r=rsi(a,i); if(f==null||s==null||r==null)continue;
+        if(!pos){
+          let side=f>s&&r>=p.buy?"BUY":f<s&&r<=p.sell?"SELL":null;
+          if(side && (mode==="BOTH"||mode===side))pos={side,entry:b.close,stop:side==="BUY"?b.close-dist:b.close+dist,best:b.close};
+          continue;
+        }
+        let ex:any=null;
+        if(pos.side==="BUY"&&b.low<=pos.stop)ex=pos.stop;
+        if(pos.side==="SELL"&&b.high>=pos.stop)ex=pos.stop;
+        if(ex!=null){let pp=(pos.side==="BUY"?(ex-pos.entry):(pos.entry-ex))/pip-costPips;tr.push({side:pos.side,pips:pp});pos=null;continue}
+        if(pos.side==="BUY"){pos.best=Math.max(pos.best,b.high);if(pos.best>=pos.entry+dist)pos.stop=Math.max(pos.stop,pos.best-dist)}
+        else{pos.best=Math.min(pos.best,b.low);if(pos.best<=pos.entry-dist)pos.stop=Math.min(pos.stop,pos.best+dist)}
+      }
+      let gp=0,gl=0,eq=0,pk=0,dd=0,w=0;for(const x of tr){if(x.pips>0){gp+=x.pips;w++}else gl+=-x.pips;eq+=x.pips;pk=Math.max(pk,eq);dd=Math.max(dd,pk-eq)}
+      return {trades:tr.length,wins:w,totalPips:tr.reduce((s,x)=>s+x.pips,0),profitFactor:gl?gp/gl:(gp?999:null),maxDrawdownPips:dd};
+    }
+    const usable=bars.slice(20), size=Math.floor(usable.length/5);
+    const base={fast:7,slow:10,buy:60,sell:45,stop:6};
+    const candidates=[
+      {name:"BASE",...base},
+      {name:"RSI_STRICT",fast:7,slow:10,buy:65,sell:40,stop:6},
+      {name:"SMA_WIDER",fast:5,slow:12,buy:60,sell:45,stop:6},
+      {name:"STOP_8",fast:7,slow:10,buy:60,sell:45,stop:8}
+    ];
+    const windows:any[]=[];
+    for(let w=0;w<5;w++){
+      const a=usable.slice(w*size,w===4?usable.length:(w+1)*size);
+      windows.push({window:`W${w+1}`,from:a[0]?.t,to:a[a.length-1]?.t,
+        baseBoth:run(a,base,"BOTH"),baseBuy:run(a,base,"BUY"),baseSell:run(a,base,"SELL")});
+    }
+    const comparison=candidates.map(p=>{
+      const ws=[];for(let w=0;w<5;w++){const a=usable.slice(w*size,w===4?usable.length:(w+1)*size);const m=run(a,p,"BOTH");ws.push({...m,passed:m.totalPips>0&&(m.profitFactor??0)>1})}
+      const agg=run(usable,p,"BOTH");
+      return {candidate:p,positiveWindows:ws.filter(x=>x.passed).length,windows:ws,aggregate:agg};
+    });
+    return c.json({
+      system:"Chagatto-1 Pre-Live Final Analysis",researchOnly:true,liveParametersChanged:false,
+      gmoPrivateApiCalled:false,orderSent:false,changeOrderApiCalled:false,
+      assumptions:{conservativeIntrabar:true,roundTripCostPips:costPips},
+      directionBreakdown:windows,candidateComparison:comparison,
+      rule:"No candidate is auto-applied. LIVE remains false."
+    });
+  }catch(e:any){return c.json({error:"PRELIVE_ANALYSIS_FAILED",message:String(e?.message||e),researchOnly:true},500)}
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
