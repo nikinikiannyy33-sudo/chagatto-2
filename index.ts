@@ -1761,7 +1761,6 @@ let gmoSafetyHaltReason: string | null = null;
 // ===== Chagatto-1 safety scheduler patch =====
 // 検証中は Railway の LIVE_TRADING_ENABLED=false のままにする。
 const DAILY_LOSS_LIMIT_YEN = -1200;
-const DAILY_PROFIT_LIMIT_YEN = 2000;
 const MAX_DAILY_TRADES = 20;
 const TARGET_LOSS_PER_TRADE_YEN = 100;
 const TARGET_PROFIT_PER_TRADE_YEN = 200;
@@ -1876,12 +1875,7 @@ async function runHourlySafetyCycle() {
       console.log("[scheduler] daily loss stop", lastSchedulerResult);
       return;
     }
-    if (daily.pnl >= DAILY_PROFIT_LIMIT_YEN) {
-      lastSchedulerResult = { startedAt, action: "STOP_DAILY_PROFIT", daily };
-      console.log("[scheduler] daily profit stop", lastSchedulerResult);
-      return;
-    }
-    if (daily.closeCount >= MAX_DAILY_TRADES) {
+if (daily.closeCount >= MAX_DAILY_TRADES) {
       lastSchedulerResult = { startedAt, action: "STOP_DAILY_TRADE_COUNT", daily };
       console.log("[scheduler] daily trade-count stop", lastSchedulerResult);
       return;
@@ -1957,11 +1951,9 @@ app.get("/gmo-daily-pnl", async (c) => {
     return c.json({
       ...daily,
       dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
-      dailyProfitLimitYen: DAILY_PROFIT_LIMIT_YEN,
       maxDailyTrades: MAX_DAILY_TRADES,
       tradingAllowed:
         daily.pnl > DAILY_LOSS_LIMIT_YEN &&
-        daily.pnl < DAILY_PROFIT_LIMIT_YEN &&
         daily.closeCount < MAX_DAILY_TRADES
     });
   } catch (error: any) {
@@ -3022,15 +3014,7 @@ app.post("/gmo-order", async (c) => {
       dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
     }, 409);
   }
-  if (orderDailyPnl.pnl >= DAILY_PROFIT_LIMIT_YEN) {
-    return c.json({
-      orderSent: false,
-      error: "DAILY_PROFIT_LIMIT_REACHED",
-      daily: orderDailyPnl,
-      dailyProfitLimitYen: DAILY_PROFIT_LIMIT_YEN,
-    }, 409);
-  }
-  if (orderDailyPnl.closeCount >= MAX_DAILY_TRADES) {
+if (orderDailyPnl.closeCount >= MAX_DAILY_TRADES) {
     return c.json({
       orderSent: false,
       error: "MAX_DAILY_TRADES_REACHED",
@@ -3921,7 +3905,6 @@ takeProfitPrice,
 targetLossPerTradeYen: TARGET_LOSS_PER_TRADE_YEN,
 targetProfitPerTradeYen: TARGET_PROFIT_PER_TRADE_YEN,
 dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
-dailyProfitLimitYen: DAILY_PROFIT_LIMIT_YEN,
 maxDailyTrades: MAX_DAILY_TRADES,
 stopClientOrderId,
 stopData,
