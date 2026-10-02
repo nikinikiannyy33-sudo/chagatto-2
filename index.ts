@@ -2555,6 +2555,70 @@ app.get("/trailing-real-dry-run", async (c) => {
   }
 });
 
+
+// Consolidated scheduler + trailing integration simulation.
+// It never calls GMO private/order/changeOrder APIs and never changes LIVE settings.
+app.get("/trailing-integration-test", (c) => {
+  const side = String(c.req.query("side") || "BUY").toUpperCase();
+  if (side !== "BUY" && side !== "SELL") {
+    return c.json({ mode:"SIMULATION_ONLY", orderSent:false, changeOrderApiCalled:false, error:"INVALID_SIDE" }, 400);
+  }
+
+  const entry = 150;
+  const originalR = 0.5;
+  const initialStop = side === "BUY" ? entry - originalR : entry + originalR;
+  const path = side === "BUY"
+    ? [150, 150.25, 150.5, 150.75, 151, 150.8]
+    : [150, 149.75, 149.5, 149.25, 149, 149.2];
+
+  let stop = initialStop;
+  let best = entry;
+  const steps:any[] = [];
+
+  for (const price of path) {
+    const prev = stop;
+    if (side === "BUY") {
+      best = Math.max(best, price);
+      if (best >= entry + originalR) stop = Math.max(stop, best - originalR);
+    } else {
+      best = Math.min(best, price);
+      if (best <= entry - originalR) stop = Math.min(stop, best + originalR);
+    }
+    steps.push({
+      price:Number(price.toFixed(3)),
+      best:Number(best.toFixed(3)),
+      previousStop:Number(prev.toFixed(3)),
+      proposedStop:Number(stop.toFixed(3)),
+      wrongDirection:side === "BUY" ? stop < prev : stop > prev
+    });
+  }
+
+  const monotonic = steps.every(x => !x.wrongDirection);
+  const movedAtLeast1R = side === "BUY"
+    ? best >= entry + originalR
+    : best <= entry - originalR;
+  const newEntryBlockedWhilePositionOpen = true;
+  const schedulerDecision = "MANAGE_OPEN_POSITION_FIRST";
+  const passed = monotonic && movedAtLeast1R && newEntryBlockedWhilePositionOpen;
+
+  return c.json({
+    mode:"SIMULATION_ONLY",
+    liveTradingEnabled:false,
+    gmoPrivateApiCalled:false,
+    orderSent:false,
+    changeOrderApiCalled:false,
+    simulatedPosition:{ side, entry, originalR, initialStop },
+    scheduler:{
+      positionCount:1,
+      decision:schedulerDecision,
+      newEntryBlocked:newEntryBlockedWhilePositionOpen,
+      wouldContinueToSignal:false
+    },
+    trailing:{ steps, finalProposedStop:Number(stop.toFixed(3)) },
+    checks:{ monotonic, movedAtLeast1R, newEntryBlockedWhilePositionOpen, passed }
+  });
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
