@@ -2794,6 +2794,54 @@ app.get("/prelive-final-analysis", async (c) => {
   }catch(e:any){return c.json({error:"PRELIVE_ANALYSIS_FAILED",message:String(e?.message||e),researchOnly:true},500)}
 });
 
+
+// Pre-live fail-closed gate simulation.
+// Verifies the exact decision policy before any live changeOrder wiring is enabled.
+// No GMO private/order/changeOrder API is called here.
+app.get("/prelive-safety-gate-test", (c) => {
+  const scenario=String(c.req.query("scenario")||"PASS").toUpperCase();
+  const base:any={
+    liveTradingEnabled:false,
+    positionCount:1,
+    protectiveStopFound:true,
+    originalRRecovered:true,
+    trailingMovedProfitDirectionOnly:true,
+    dailyLossGuardPassed:true,
+    onePositionOnly:true,
+    duplicateGuardPassed:true,
+    proposedStopValid:true
+  };
+  if(scenario==="NO_STOP") base.protectiveStopFound=false;
+  if(scenario==="NO_R") base.originalRRecovered=false;
+  if(scenario==="DAILY_LOSS") base.dailyLossGuardPassed=false;
+  if(scenario==="MULTI_POSITION"){base.positionCount=2;base.onePositionOnly=false;}
+  if(scenario==="WRONG_DIRECTION") base.trailingMovedProfitDirectionOnly=false;
+  if(scenario==="INVALID_PRICE") base.proposedStopValid=false;
+
+  const checks=[
+    base.positionCount===1,
+    base.protectiveStopFound,
+    base.originalRRecovered,
+    base.trailingMovedProfitDirectionOnly,
+    base.dailyLossGuardPassed,
+    base.onePositionOnly,
+    base.duplicateGuardPassed,
+    base.proposedStopValid
+  ];
+  const allPassed=checks.every(Boolean);
+  return c.json({
+    mode:"SIMULATION_ONLY",
+    scenario,
+    liveTradingEnabled:false,
+    gmoPrivateApiCalled:false,
+    orderSent:false,
+    changeOrderApiCalled:false,
+    checks:base,
+    decision:allPassed?"READY_TO_CHANGE_STOP_DRY_RUN":"FAIL_CLOSED_DO_NOT_CHANGE_STOP",
+    allPassed
+  });
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
