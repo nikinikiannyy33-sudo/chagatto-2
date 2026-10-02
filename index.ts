@@ -1876,13 +1876,27 @@ async function runHourlySafetyCycle() {
     }
 
     const positionCount = await getUsdJpyOpenPositionCount();
+    const baseUrl = schedulerBaseUrl();
     if (positionCount > 0) {
-      lastSchedulerResult = { startedAt, action: "SKIP_OPEN_POSITION", daily, positionCount };
-      console.log("[scheduler] open position exists", lastSchedulerResult);
+      // Position management always takes priority over new entries.
+      // While LIVE=false this calls the REAL_DATA_DRY_RUN endpoint only;
+      // it never sends an order or changeOrder request.
+      const managementResponse = await fetch(`${baseUrl}/trailing-real-dry-run`);
+      const managementData: any = await managementResponse.json();
+      if (!managementResponse.ok) {
+        throw new Error(`trailing management dry run failed: ${JSON.stringify(managementData)}`);
+      }
+      lastSchedulerResult = {
+        startedAt,
+        action: "MANAGE_OPEN_POSITION_DRY_RUN",
+        daily,
+        positionCount,
+        managementData,
+      };
+      console.log("[scheduler] position management dry run", lastSchedulerResult);
       return;
     }
 
-    const baseUrl = schedulerBaseUrl();
     const signalResponse = await fetch(`${baseUrl}/gmo-signal`);
     const signalData: any = await signalResponse.json();
     if (!signalResponse.ok) throw new Error(`gmo-signal failed: ${JSON.stringify(signalData)}`);
@@ -1956,6 +1970,40 @@ app.get("/daily-loss-guard-test", (c) => {
     tradingAllowed,
     decision: tradingAllowed ? "PASS_DAILY_LOSS_GUARD" : "STOP_DAILY_LOSS",
   });
+});
+
+app.get("/scheduler-position-test", async (c) => {
+  try {
+    const positionCount = await getUsdJpyOpenPositionCount();
+    if (positionCount === 0) {
+      return c.json({
+        mode: "REAL_DATA_DRY_RUN",
+        liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+        orderSent: false,
+        changeOrderApiCalled: false,
+        positionCount: 0,
+        decision: "NO_POSITION_NO_MANAGEMENT",
+        schedulerWouldContinueToSignal: true,
+      });
+    }
+    const r = await fetch(`${schedulerBaseUrl()}/trailing-real-dry-run`);
+    const managementData:any = await r.json();
+    return c.json({
+      mode: "REAL_DATA_DRY_RUN",
+      liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+      orderSent: false,
+      changeOrderApiCalled: false,
+      positionCount,
+      decision: "MANAGE_OPEN_POSITION_DRY_RUN",
+      schedulerWouldContinueToSignal: false,
+      managementData,
+    }, r.ok ? 200 : 502);
+  } catch (error) {
+    return c.json({
+      mode: "REAL_DATA_DRY_RUN", orderSent:false, changeOrderApiCalled:false,
+      error:error instanceof Error ? error.message : String(error)
+    }, 500);
+  }
 });
 
 app.get("/scheduler-status", (c) => c.json({
