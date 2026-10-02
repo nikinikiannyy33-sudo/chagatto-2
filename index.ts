@@ -2619,6 +2619,117 @@ app.get("/trailing-integration-test", (c) => {
   });
 });
 
+
+// Conservative trailing validation:
+// - Uses the PREVIOUS completed bar's trailing level for the current bar,
+//   so the current candle high/low cannot retroactively tighten its own stop.
+// - Applies configurable round-trip transaction cost in pips.
+// - Research only. No GMO private/order/changeOrder API.
+app.get("/trailing-conservative-validation", async (c) => {
+  try {
+    const apiKey = process.env.TWELVE_DATA_API_KEY || "";
+    if (!apiKey) return c.json({ error:"TWELVE_DATA_API_KEY_MISSING", researchOnly:true }, 500);
+
+    const costPipsRaw = Number(c.req.query("costPips") || "0.4");
+    const costPips = Number.isFinite(costPipsRaw) && costPipsRaw >= 0 ? costPipsRaw : 0.4;
+    const url = `https://api.twelvedata.com/time_series?symbol=USD/JPY&interval=1h&outputsize=2000&apikey=${encodeURIComponent(apiKey)}`;
+    const rr = await fetch(url);
+    const jj:any = await rr.json();
+    if (!Array.isArray(jj?.values)) return c.json({ error:"TWELVE_DATA_ERROR", detail:jj, researchOnly:true }, 502);
+
+    const bars = jj.values.slice().reverse().map((v:any)=>({
+      t:String(v.datetime),
+      open:Number(v.open), high:Number(v.high), low:Number(v.low), close:Number(v.close)
+    })).filter((x:any)=>[x.open,x.high,x.low,x.close].every(Number.isFinite));
+
+    const fast=7, slow=10, buyRsi=60, sellRsi=45, stopPips=6;
+    const pip=0.01, dist=stopPips*pip;
+
+    function rsiAt(arr:any[], i:number, n=14){
+      if(i<n) return null;
+      let g=0,l=0;
+      for(let k=i-n+1;k<=i;k++){ const d=arr[k].close-arr[k-1].close; if(d>=0)g+=d; else l-=d; }
+      if(l===0) return 100;
+      const rs=(g/n)/(l/n); return 100-(100/(1+rs));
+    }
+    function smaAt(arr:any[], i:number,n:number){
+      if(i<n-1)return null; let s=0; for(let k=i-n+1;k<=i;k++)s+=arr[k].close; return s/n;
+    }
+    function run(arr:any[]){
+      let pos:any=null, trades:any[]=[];
+      for(let i=20;i<arr.length;i++){
+        const b=arr[i], sf=smaAt(arr,i,fast), ss=smaAt(arr,i,slow), r=rsiAt(arr,i,14);
+        if(sf==null||ss==null||r==null) continue;
+        if(!pos){
+          const side=sf>ss && r>=buyRsi ? "BUY" : sf<ss && r<=sellRsi ? "SELL" : null;
+          if(side) pos={side,entry:b.close,stop:side==="BUY"?b.close-dist:b.close+dist,best:b.close,entryTime:b.t};
+          continue;
+        }
+
+        // Critical conservative ordering: first test CURRENT bar against stop
+        // that was known BEFORE this bar began.
+        let exit:any=null;
+        if(pos.side==="BUY" && b.low<=pos.stop) exit=pos.stop;
+        if(pos.side==="SELL" && b.high>=pos.stop) exit=pos.stop;
+        if(exit!=null){
+          let pips=(pos.side==="BUY"?(exit-pos.entry):(pos.entry-exit))/pip;
+          pips-=costPips;
+          trades.push({pips,entryTime:pos.entryTime,exitTime:b.t});
+          pos=null;
+          continue;
+        }
+
+        // Only after surviving this completed bar may its extreme tighten NEXT bar's stop.
+        if(pos.side==="BUY"){
+          pos.best=Math.max(pos.best,b.high);
+          if(pos.best>=pos.entry+dist) pos.stop=Math.max(pos.stop,pos.best-dist);
+        }else{
+          pos.best=Math.min(pos.best,b.low);
+          if(pos.best<=pos.entry-dist) pos.stop=Math.min(pos.stop,pos.best+dist);
+        }
+      }
+      const wins=trades.filter(x=>x.pips>0), losses=trades.filter(x=>x.pips<=0);
+      const gp=wins.reduce((s,x)=>s+x.pips,0), gl=Math.abs(losses.reduce((s,x)=>s+x.pips,0));
+      let eq=0,peak=0,dd=0; for(const t of trades){eq+=t.pips;peak=Math.max(peak,eq);dd=Math.max(dd,peak-eq);}
+      return {trades:trades.length,wins:wins.length,losses:losses.length,
+        winRate:trades.length?wins.length/trades.length*100:0,
+        totalPips:trades.reduce((s,x)=>s+x.pips,0),
+        profitFactor:gl?gp/gl:(gp>0?999:null),maxDrawdownPips:dd};
+    }
+
+    const usable=bars.slice(20);
+    const size=Math.floor(usable.length/5);
+    const windows:any[]=[];
+    for(let w=0;w<5;w++){
+      const start=w*size, end=w===4?usable.length:(w+1)*size;
+      const arr=usable.slice(start,end), m=run(arr);
+      windows.push({window:`W${w+1}`,from:arr[0]?.t,to:arr[arr.length-1]?.t,...m,
+        passed:m.totalPips>0 && (m.profitFactor??0)>1});
+    }
+    const aggregate=run(usable);
+    const positiveWindows=windows.filter(x=>x.totalPips>0).length;
+    const pfAboveOneWindows=windows.filter(x=>(x.profitFactor??0)>1).length;
+
+    return c.json({
+      system:"Chagatto-1 Conservative Trailing Validation",
+      researchOnly:true, liveParametersChanged:false,
+      gmoPrivateApiCalled:false, orderSent:false, changeOrderApiCalled:false,
+      symbol:"USD/JPY", interval:"1hour", candlesReceived:bars.length,
+      fixedParameters:{fastSma:fast,slowSma:slow,buyRsi,sellRsi,stopLossPips:stopPips,trailingR:1},
+      assumptions:{
+        intrabarBiasFix:"current bar is checked against the previous completed bar stop; current bar extreme can only tighten the next bar stop",
+        roundTripCostPips:costPips,
+        note:"cost is a research assumption, not a claim about current GMO spread"
+      },
+      windows,
+      summary:{positiveWindows,pfAboveOneWindows,windowCount:5,aggregate,
+        allWindowsPassed:positiveWindows===5 && pfAboveOneWindows===5}
+    });
+  } catch(e:any) {
+    return c.json({error:"CONSERVATIVE_VALIDATION_FAILED",message:String(e?.message||e),researchOnly:true},500);
+  }
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
