@@ -1717,24 +1717,9 @@ app.get("/gmo-signal", async (c) => {
       signal = "SELL";
     }
   }
-const maxRiskYen = 100;
-
-const stopDistance =
-  atr14 !== null ? atr14 * 1.5 : null;
-
-let orderSize = 0;
-
-if (stopDistance !== null && stopDistance > 0) {
-  const rawSize = maxRiskYen / stopDistance;
-
-  // 100通貨単位に切り下げ
-  orderSize = Math.floor(rawSize / 100) * 100;
-
-  // 最低100通貨
-  if (orderSize < 100) {
-    orderSize = 100;
-  }
-}
+const maxRiskYen = TARGET_LOSS_PER_TRADE_YEN;
+const stopDistance = FIXED_STOP_DISTANCE;
+const orderSize = FIXED_ORDER_SIZE;
 
   return c.json({
     system: "Chagatto-2",
@@ -1762,7 +1747,10 @@ let gmoSafetyHaltReason: string | null = null;
 // 検証中は Railway の LIVE_TRADING_ENABLED=false のままにする。
 const DAILY_LOSS_LIMIT_YEN = -1200;
 const MAX_DAILY_TRADES = 20;
-const TARGET_LOSS_PER_TRADE_YEN = 100;
+const FIXED_ORDER_SIZE = 1000;
+const FIXED_STOP_DISTANCE = 0.150; // 15 pips on USD/JPY
+const FIXED_TAKE_PROFIT_DISTANCE = 0.200; // 20 pips on USD/JPY
+const TARGET_LOSS_PER_TRADE_YEN = 150;
 const TARGET_PROFIT_PER_TRADE_YEN = 200;
 let schedulerInProgress = false;
 let lastSchedulerJstHourKey: string | null = null;
@@ -3158,8 +3146,8 @@ if (
   }, 409);
 }
 
-// 1回の損失目標は約100円。STOP幅はATR由来のまま、数量でリスクを調整する。
-const maxRiskYen = Math.min(TARGET_LOSS_PER_TRADE_YEN, availableAmount);
+// 1000通貨固定。SL15pipsなら理論上の最大損失は約150円（手数料等を除く）。
+const maxRiskYen = TARGET_LOSS_PER_TRADE_YEN;
 
 // 現在のATR×1.5を取得するためシグナルAPIを呼ぶ
 const signalResponse = await fetch(
@@ -3199,47 +3187,8 @@ if (side !== currentSignal) {
     signal: currentSignal,
   }, 409);
 }
-const stopDistance = Number(signalData.stopDistance);
-
-if (!Number.isFinite(stopDistance) || stopDistance <= 0) {
-  return c.json({
-    orderSent: false,
-    error: "Invalid stopDistance",
-  }, 500);
-}
-
-// 損失上限から注文数量を計算
-const rawSize = maxRiskYen / stopDistance;
-
-// GMO FX USD/JPY の取引ルール
-const minOrderSize = 100;
-const brokerMaxOrderSize = 500000;
-const sizeStep = 1;
-
-// リスクから注文数量を計算
-const calculatedOrderSize =
-  Math.floor(rawSize / sizeStep) * sizeStep;
-
-// チャガット2号独自の安全上限
-const internalMaxOrderSize = 1000;
-
-const orderSize = Math.min(
-  calculatedOrderSize,
-  internalMaxOrderSize,
-  brokerMaxOrderSize
-);
-
-// 100通貨でも約100円リスクを超えるSTOP幅なら、その取引は見送る。
-if (orderSize < minOrderSize) {
-  return c.json({
-    orderSent: false,
-    error: "ORDER_SIZE_BELOW_MINIMUM",
-    calculatedOrderSize,
-    minOrderSize,
-    maxRiskYen,
-    stopDistance,
-  }, 409);
-}
+const stopDistance = FIXED_STOP_DISTANCE;
+const orderSize = FIXED_ORDER_SIZE;
 
   const timestamp = Date.now().toString();
   const method = "POST";
@@ -3652,19 +3601,17 @@ if (
     error: "INVALID_EXECUTION_DATA",
   }, 500);
 }
-// 約定価格を基準に、約-100円の損切りと約+200円の利益確定をOCOで同時設定。
-// STOP幅はATR由来、数量を調整して損失額を約100円にする。
+// 1000通貨固定、TP20pips / SL15pips をOCOで同時設定。
 const rawStopPrice =
   side === "BUY"
-    ? entryPrice - stopDistance
-    : entryPrice + stopDistance;
+    ? entryPrice - FIXED_STOP_DISTANCE
+    : entryPrice + FIXED_STOP_DISTANCE;
 
-// 利益額は数量から価格幅へ変換する（USD/JPY: 価格差 × 通貨数量 ≒ 円損益）
-const takeProfitDistance = TARGET_PROFIT_PER_TRADE_YEN / totalExecutedSize;
+const takeProfitDistance = FIXED_TAKE_PROFIT_DISTANCE;
 const rawTakeProfitPrice =
   side === "BUY"
-    ? entryPrice + takeProfitDistance
-    : entryPrice - takeProfitDistance;
+    ? entryPrice + FIXED_TAKE_PROFIT_DISTANCE
+    : entryPrice - FIXED_TAKE_PROFIT_DISTANCE;
 
 // USD/JPYは小数第3位までに丸める
 const stopPrice = rawStopPrice.toFixed(3);
@@ -3904,6 +3851,9 @@ stopPrice,
 takeProfitPrice,
 targetLossPerTradeYen: TARGET_LOSS_PER_TRADE_YEN,
 targetProfitPerTradeYen: TARGET_PROFIT_PER_TRADE_YEN,
+fixedOrderSize: FIXED_ORDER_SIZE,
+stopLossPips: 15,
+takeProfitPips: 20,
 dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
 maxDailyTrades: MAX_DAILY_TRADES,
 stopClientOrderId,
