@@ -1717,9 +1717,7 @@ app.get("/gmo-signal", async (c) => {
       signal = "SELL";
     }
   }
-  const accountBalance = 50000;
-const riskRate = 0.02;
-const maxRiskYen = accountBalance * riskRate;
+const maxRiskYen = 100;
 
 const stopDistance =
   atr14 !== null ? atr14 * 1.5 : null;
@@ -1763,6 +1761,10 @@ let gmoSafetyHaltReason: string | null = null;
 // ===== Chagatto-1 safety scheduler patch =====
 // 検証中は Railway の LIVE_TRADING_ENABLED=false のままにする。
 const DAILY_LOSS_LIMIT_YEN = -1200;
+const DAILY_PROFIT_LIMIT_YEN = 2000;
+const MAX_DAILY_TRADES = 20;
+const TARGET_LOSS_PER_TRADE_YEN = 100;
+const TARGET_PROFIT_PER_TRADE_YEN = 200;
 let schedulerInProgress = false;
 let lastSchedulerJstHourKey: string | null = null;
 let lastSchedulerResult: any = null;
@@ -1874,6 +1876,16 @@ async function runHourlySafetyCycle() {
       console.log("[scheduler] daily loss stop", lastSchedulerResult);
       return;
     }
+    if (daily.pnl >= DAILY_PROFIT_LIMIT_YEN) {
+      lastSchedulerResult = { startedAt, action: "STOP_DAILY_PROFIT", daily };
+      console.log("[scheduler] daily profit stop", lastSchedulerResult);
+      return;
+    }
+    if (daily.closeCount >= MAX_DAILY_TRADES) {
+      lastSchedulerResult = { startedAt, action: "STOP_DAILY_TRADE_COUNT", daily };
+      console.log("[scheduler] daily trade-count stop", lastSchedulerResult);
+      return;
+    }
 
     const positionCount = await getUsdJpyOpenPositionCount();
     const baseUrl = schedulerBaseUrl();
@@ -1942,7 +1954,16 @@ async function runHourlySafetyCycle() {
 app.get("/gmo-daily-pnl", async (c) => {
   try {
     const daily = await getTodayRealizedPnlJst();
-    return c.json({ ...daily, dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN, tradingAllowed: daily.pnl > DAILY_LOSS_LIMIT_YEN });
+    return c.json({
+      ...daily,
+      dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
+      dailyProfitLimitYen: DAILY_PROFIT_LIMIT_YEN,
+      maxDailyTrades: MAX_DAILY_TRADES,
+      tradingAllowed:
+        daily.pnl > DAILY_LOSS_LIMIT_YEN &&
+        daily.pnl < DAILY_PROFIT_LIMIT_YEN &&
+        daily.closeCount < MAX_DAILY_TRADES
+    });
   } catch (error: any) {
     return c.json({ error: String(error?.message ?? error) }, 500);
   }
@@ -3001,6 +3022,22 @@ app.post("/gmo-order", async (c) => {
       dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
     }, 409);
   }
+  if (orderDailyPnl.pnl >= DAILY_PROFIT_LIMIT_YEN) {
+    return c.json({
+      orderSent: false,
+      error: "DAILY_PROFIT_LIMIT_REACHED",
+      daily: orderDailyPnl,
+      dailyProfitLimitYen: DAILY_PROFIT_LIMIT_YEN,
+    }, 409);
+  }
+  if (orderDailyPnl.closeCount >= MAX_DAILY_TRADES) {
+    return c.json({
+      orderSent: false,
+      error: "MAX_DAILY_TRADES_REACHED",
+      daily: orderDailyPnl,
+      maxDailyTrades: MAX_DAILY_TRADES,
+    }, 409);
+  }
 
   if (gmoSafetyHalt) {
     return c.json({
@@ -3137,9 +3174,8 @@ if (
   }, 409);
 }
 
-// 1回の最大リスク＝取引余力の2%
-const riskRate = 0.02;
-const maxRiskYen = availableAmount * riskRate;
+// 1回の損失目標は約100円。STOP幅はATR由来のまま、数量でリスクを調整する。
+const maxRiskYen = Math.min(TARGET_LOSS_PER_TRADE_YEN, availableAmount);
 
 // 現在のATR×1.5を取得するためシグナルAPIを呼ぶ
 const signalResponse = await fetch(
@@ -3209,7 +3245,7 @@ const orderSize = Math.min(
   brokerMaxOrderSize
 );
 
-// 最小注文数量に届かなければ注文しない
+// 100通貨でも約100円リスクを超えるSTOP幅なら、その取引は見送る。
 if (orderSize < minOrderSize) {
   return c.json({
     orderSent: false,
@@ -3632,14 +3668,23 @@ if (
     error: "INVALID_EXECUTION_DATA",
   }, 500);
 }
-// 約定価格を基準にSTOP価格を固定
+// 約定価格を基準に、約-100円の損切りと約+200円の利益確定をOCOで同時設定。
+// STOP幅はATR由来、数量を調整して損失額を約100円にする。
 const rawStopPrice =
   side === "BUY"
     ? entryPrice - stopDistance
     : entryPrice + stopDistance;
 
+// 利益額は数量から価格幅へ変換する（USD/JPY: 価格差 × 通貨数量 ≒ 円損益）
+const takeProfitDistance = TARGET_PROFIT_PER_TRADE_YEN / totalExecutedSize;
+const rawTakeProfitPrice =
+  side === "BUY"
+    ? entryPrice + takeProfitDistance
+    : entryPrice - takeProfitDistance;
+
 // USD/JPYは小数第3位までに丸める
 const stopPrice = rawStopPrice.toFixed(3);
+const takeProfitPrice = rawTakeProfitPrice.toFixed(3);
 
 // 決済方向は新規注文と逆
 const stopSide =
@@ -3648,17 +3693,15 @@ const stopSide =
 const stopTimestamp = Date.now().toString();
 const stopMethod = "POST";
 const stopPath = "/v1/closeOrder";
-// 1Rトレーリングで必要な「新規時のSTOP距離」を注文IDへ保存する。
-// GMO clientOrderId は半角英数字36文字以内なので、小数点を使わず0.001円単位で保持。
-const trailingDistanceTicks = Math.max(1, Math.round(stopDistance * 1000));
 const stopClientOrderId =
-  `CT${orderId}D${trailingDistanceTicks}`.slice(0, 36);
+  `CO${orderId}${Date.now()}`.slice(0, 36);
 
 const stopBody = JSON.stringify({
   symbol: "USD_JPY",
   side: stopSide,
   clientOrderId: stopClientOrderId,
-  executionType: "STOP",
+  executionType: "OCO",
+  limitPrice: takeProfitPrice,
   stopPrice,
   settlePosition,
 });
@@ -3757,7 +3800,7 @@ if (
         (x: any) =>
           x.clientOrderId === stopClientOrderId &&
           x.symbol === "USD_JPY" &&
-          x.executionType === "STOP" &&
+          (x.executionType === "STOP" || x.executionType === "LIMIT") &&
           x.settleType === "CLOSE"
       ) ?? null;
 
@@ -3874,6 +3917,12 @@ return c.json({
   positions: settlePosition,
   stopDistance,
 stopPrice,
+takeProfitPrice,
+targetLossPerTradeYen: TARGET_LOSS_PER_TRADE_YEN,
+targetProfitPerTradeYen: TARGET_PROFIT_PER_TRADE_YEN,
+dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
+dailyProfitLimitYen: DAILY_PROFIT_LIMIT_YEN,
+maxDailyTrades: MAX_DAILY_TRADES,
 stopClientOrderId,
 stopData,
 stopRequestError,
