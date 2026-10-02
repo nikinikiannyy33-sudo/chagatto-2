@@ -2871,6 +2871,62 @@ app.get("/change-order-request-preview", async (c) => {
   }catch(e:any){return c.json({error:"CHANGE_ORDER_PREVIEW_FAILED",message:String(e?.message||e),changeOrderApiCalled:false},500)}
 });
 
+
+// Production changeOrder gate.
+// Fail-closed: this route never sends unless LIVE_TRADING_ENABLED=true AND explicit execute=true
+// AND all supplied safety facts pass. Default/browser access is always dry-run.
+app.post("/change-order-live-gate", async (c) => {
+  try {
+    const live=String(process.env.LIVE_TRADING_ENABLED||"false").toLowerCase()==="true";
+    const body:any=await c.req.json().catch(()=>({}));
+    const execute=body?.execute===true;
+    const orderId=String(body?.orderId||"");
+    const price=String(body?.price||"");
+    const checks={
+      validOrderId:/^\d+$/.test(orderId),
+      validPrice:/^\d+(\.\d+)?$/.test(price)&&Number(price)>0,
+      protectiveStopFound:body?.protectiveStopFound===true,
+      originalRRecovered:body?.originalRRecovered===true,
+      trailingMovedProfitDirectionOnly:body?.trailingMovedProfitDirectionOnly===true,
+      dailyLossGuardPassed:body?.dailyLossGuardPassed===true,
+      onePositionOnly:body?.onePositionOnly===true,
+      duplicateGuardPassed:body?.duplicateGuardPassed===true
+    };
+    const safetyPassed=Object.values(checks).every(Boolean);
+    if(!live || !execute || !safetyPassed){
+      return c.json({
+        mode:"FAIL_CLOSED",
+        liveTradingEnabled:live,executeRequested:execute,checks,safetyPassed,
+        privateApiCalled:false,changeOrderApiCalled:false,orderSent:false,
+        decision:!live?"BLOCKED_LIVE_FALSE":!execute?"BLOCKED_EXECUTE_FALSE":"BLOCKED_SAFETY_CHECK"
+      });
+    }
+    const apiKey=process.env.GMO_API_KEY||"", secret=process.env.GMO_API_SECRET||"";
+    if(!apiKey||!secret) return c.json({decision:"BLOCKED_API_CREDENTIALS",privateApiCalled:false,changeOrderApiCalled:false},500);
+    const path="/v1/changeOrder", method="POST", payload=JSON.stringify({orderId:Number(orderId),price});
+    const ts=Date.now().toString();
+    const crypto=await import("node:crypto");
+    const sig=crypto.createHmac("sha256",secret).update(ts+method+path+payload).digest("hex");
+    const rr=await fetch("https://forex-api.coin.z.com/private/v1/changeOrder",{
+      method,headers:{"API-KEY":apiKey,"API-TIMESTAMP":ts,"API-SIGN":sig,"Content-Type":"application/json"},body:payload
+    });
+    const result:any=await rr.json().catch(()=>({httpStatus:rr.status}));
+    return c.json({mode:"LIVE_CHANGE_ORDER",liveTradingEnabled:true,executeRequested:true,checks,safetyPassed:true,
+      privateApiCalled:true,changeOrderApiCalled:true,orderSent:true,httpStatus:rr.status,gmo:result});
+  }catch(e:any){return c.json({error:"CHANGE_ORDER_LIVE_GATE_FAILED",message:String(e?.message||e)},500)}
+});
+
+// Browser-safe verification of the production gate. Never calls private API.
+app.get("/change-order-live-gate-test", (c) => {
+  const live=String(process.env.LIVE_TRADING_ENABLED||"false").toLowerCase()==="true";
+  return c.json({
+    mode:"GATE_VERIFICATION_ONLY",liveTradingEnabled:live,
+    defaultBrowserAccessCanSend:false,requiresPost:true,requiresExecuteTrue:true,
+    requiresAllSafetyChecks:true,privateApiCalled:false,changeOrderApiCalled:false,orderSent:false,
+    decision:live?"WARNING_LIVE_IS_TRUE":"PASS_LIVE_FALSE_BLOCKS_REAL_CHANGE_ORDER"
+  });
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
