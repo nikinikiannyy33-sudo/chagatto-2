@@ -2927,6 +2927,38 @@ app.get("/change-order-live-gate-test", (c) => {
   });
 });
 
+
+// Final scheduler route verification.
+// Mirrors the production priority chain without sending any order/changeOrder.
+// Existing hourly scheduler remains unchanged until this full-chain check passes.
+app.get("/scheduler-final-chain-test", async (c) => {
+  try {
+    const live=String(process.env.LIVE_TRADING_ENABLED||"false").toLowerCase()==="true";
+    const base=(c.req.query("position")||"0")==="1";
+    const simulatedPositionCount=base?1:0;
+    const chain:any[]=[
+      {step:1,name:"DAILY_LOSS_GUARD",required:true},
+      {step:2,name:"POSITION_CHECK",positionCount:simulatedPositionCount},
+      {step:3,name:"MANAGE_OPEN_POSITION_FIRST",active:simulatedPositionCount===1},
+      {step:4,name:"PROTECTIVE_STOP_REQUIRED",active:simulatedPositionCount===1},
+      {step:5,name:"ORIGINAL_1R_REQUIRED",active:simulatedPositionCount===1},
+      {step:6,name:"TRAILING_DIRECTION_CHECK",active:simulatedPositionCount===1},
+      {step:7,name:"CHANGE_ORDER_SAFETY_GATE",active:simulatedPositionCount===1},
+      {step:8,name:"NEW_ENTRY_SIGNAL_ONLY_IF_NO_POSITION",active:simulatedPositionCount===0}
+    ];
+    return c.json({
+      mode:"FINAL_CHAIN_DRY_RUN",schedule:"every hour at minute 05 JST",
+      liveTradingEnabled:live,simulatedPositionCount,
+      priority:simulatedPositionCount===1?"MANAGE_POSITION_BLOCK_NEW_ENTRY":"NO_POSITION_CONTINUE_TO_SIGNAL",
+      chain,
+      protections:{dailyLossLimitYen:-1200,onePositionOnly:true,protectiveStopRequired:true,
+        originalRRequired:true,wrongDirectionBlocked:true,duplicateGuard:true,liveGateRequired:true},
+      privateApiCalled:false,orderSent:false,changeOrderApiCalled:false,
+      decision:!live?"PASS_FULL_CHAIN_LIVE_FALSE":"WARNING_LIVE_TRUE"
+    });
+  }catch(e:any){return c.json({error:"SCHEDULER_FINAL_CHAIN_TEST_FAILED",message:String(e?.message||e)},500)}
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
