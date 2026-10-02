@@ -2420,6 +2420,93 @@ app.get("/trailing-state-test", (c) => {
   });
 });
 
+
+// REAL-DATA DRY RUN: reads GMO open positions + active STOP orders and calculates
+// a restart-safe 1R trailing candidate. It NEVER calls changeOrder or sends orders.
+app.get("/trailing-real-dry-run", async (c) => {
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    return c.json({ mode:"REAL_DATA_DRY_RUN", orderSent:false, changeOrderApiCalled:false, error:"GMO_API_KEYS_NOT_SET" }, 500);
+  }
+
+  async function privateGet(path: string, query: string) {
+    const timestamp = Date.now().toString();
+    const method = "GET";
+    const sign = crypto.createHmac("sha256", apiSecret)
+      .update(timestamp + method + path).digest("hex");
+    const r = await fetch(`https://forex-api.coin.z.com/private${path}${query}`, {
+      method,
+      headers:{"API-KEY":apiKey,"API-TIMESTAMP":timestamp,"API-SIGN":sign},
+    });
+    const data:any = await r.json();
+    if (!r.ok || data?.status !== 0) throw new Error(`${path} failed`);
+    return data;
+  }
+
+  try {
+    const [positionsData, ordersData, tickerResponse] = await Promise.all([
+      privateGet("/v1/openPositions", "?symbol=USD_JPY&count=100"),
+      privateGet("/v1/activeOrders", "?symbol=USD_JPY&count=100"),
+      fetch("https://forex-api.coin.z.com/public/v1/ticker?symbol=USD_JPY"),
+    ]);
+    const tickerData:any = await tickerResponse.json();
+    if (!tickerResponse.ok || tickerData?.status !== 0) throw new Error("ticker failed");
+
+    const positions = Array.isArray(positionsData?.data?.list) ? positionsData.data.list
+      : Array.isArray(positionsData?.data) ? positionsData.data : [];
+    const orders = Array.isArray(ordersData?.data?.list) ? ordersData.data.list
+      : Array.isArray(ordersData?.data) ? ordersData.data : [];
+    const ticker = Array.isArray(tickerData?.data) ? tickerData.data[0] : tickerData?.data;
+
+    const checks = positions.map((p:any) => {
+      const side = String(p.side || "").toUpperCase();
+      const entry = Number(p.price ?? p.executionPrice ?? p.averagePrice);
+      const positionId = String(p.positionId ?? "");
+      const currentPrice = side === "BUY" ? Number(ticker?.bid) : Number(ticker?.ask);
+
+      const stop = orders.find((o:any) => {
+        const cid = String(o.clientOrderId ?? "");
+        const d = parseTrailingDistanceFromClientOrderId(cid);
+        if (d === null || String(o.executionType ?? "").toUpperCase() !== "STOP") return false;
+        const settle = Array.isArray(o.settlePosition) ? o.settlePosition : [];
+        return !positionId || settle.length === 0 || settle.some((x:any) => String(x.positionId ?? "") === positionId);
+      }) ?? null;
+
+      if (!Number.isFinite(entry) || !Number.isFinite(currentPrice) || !stop) {
+        return { positionId, side, entry:Number.isFinite(entry)?entry:null, currentPrice:Number.isFinite(currentPrice)?currentPrice:null,
+          matchedStop:false, decision:"NO_CHANGE", reason:!stop?"TRAILING_STOP_NOT_FOUND":"INVALID_PRICE_DATA" };
+      }
+
+      const distance = parseTrailingDistanceFromClientOrderId(stop.clientOrderId);
+      const oldStop = Number(stop.stopPrice ?? stop.price);
+      if (distance === null || !Number.isFinite(oldStop)) {
+        return { positionId, side, matchedStop:true, decision:"NO_CHANGE", reason:"INVALID_STOP_STATE" };
+      }
+      const movedAtLeast1R = side === "BUY" ? currentPrice >= entry + distance : currentPrice <= entry - distance;
+      const candidate = side === "BUY" ? currentPrice - distance : currentPrice + distance;
+      const proposed = movedAtLeast1R ? (side === "BUY" ? Math.max(oldStop,candidate) : Math.min(oldStop,candidate)) : oldStop;
+      const improves = side === "BUY" ? proposed > oldStop : proposed < oldStop;
+      return {
+        positionId, side, entry:Number(entry.toFixed(3)), currentPrice:Number(currentPrice.toFixed(3)),
+        stopOrderId:stop.orderId ?? null, clientOrderId:stop.clientOrderId ?? null,
+        restoredTrailingDistance:distance, oldStop:Number(oldStop.toFixed(3)),
+        proposedStop:Number(proposed.toFixed(3)), movedAtLeast1R, monotonic:side === "BUY" ? proposed >= oldStop : proposed <= oldStop,
+        decision:improves ? "WOULD_CHANGE_STOP" : "NO_CHANGE"
+      };
+    });
+
+    return c.json({
+      mode:"REAL_DATA_DRY_RUN", source:"GMO Coin FX", symbol:"USD_JPY",
+      orderSent:false, changeOrderApiCalled:false, liveTradingEnabled:process.env.LIVE_TRADING_ENABLED === "true",
+      positionCount:positions.length, activeOrderCount:orders.length, checks
+    });
+  } catch (error) {
+    return c.json({ mode:"REAL_DATA_DRY_RUN", orderSent:false, changeOrderApiCalled:false,
+      error:error instanceof Error ? error.message : String(error) }, 500);
+  }
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
