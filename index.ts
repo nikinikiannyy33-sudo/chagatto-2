@@ -2286,6 +2286,70 @@ app.get("/trailing-multi-window", async (c) => {
   }
 });
 
+
+// Safety simulation only: verify 1R trailing-stop movement.
+// No GMO private/order API is called and no live setting is changed.
+app.get("/trailing-path-test", (c) => {
+  const side = String(c.req.query("side") || "BUY").toUpperCase();
+  const entry = Number(c.req.query("entry") || "150");
+  const distance = Number(c.req.query("distance") || "0.5");
+
+  if ((side !== "BUY" && side !== "SELL") ||
+      !Number.isFinite(entry) || entry <= 0 ||
+      !Number.isFinite(distance) || distance <= 0) {
+    return c.json({ mode:"SIMULATION_ONLY", orderSent:false, error:"INVALID_TEST_PARAMETERS" }, 400);
+  }
+
+  const prices = side === "BUY"
+    ? [entry, entry + distance * 0.5, entry + distance, entry + distance * 1.5, entry + distance * 2]
+    : [entry, entry - distance * 0.5, entry - distance, entry - distance * 1.5, entry - distance * 2];
+
+  let stop = side === "BUY" ? entry - distance : entry + distance;
+  let best = entry;
+  const initialStop = stop;
+  const steps:any[] = [];
+
+  for (const price of prices) {
+    const previousStop = stop;
+    if (side === "BUY") {
+      best = Math.max(best, price);
+      if (best >= entry + distance) stop = Math.max(stop, best - distance);
+    } else {
+      best = Math.min(best, price);
+      if (best <= entry - distance) stop = Math.min(stop, best + distance);
+    }
+
+    steps.push({
+      price:Number(price.toFixed(3)),
+      best:Number(best.toFixed(3)),
+      previousStop:Number(previousStop.toFixed(3)),
+      newStop:Number(stop.toFixed(3)),
+      movedWrongDirection: side === "BUY" ? stop < previousStop : stop > previousStop
+    });
+  }
+
+  const neverMovesWrongDirection = steps.every(x => !x.movedWrongDirection);
+  const reachesBreakEvenAfter1R = side === "BUY"
+    ? steps.some(x => x.best >= entry + distance && x.newStop >= entry)
+    : steps.some(x => x.best <= entry - distance && x.newStop <= entry);
+
+  return c.json({
+    mode:"SIMULATION_ONLY",
+    orderSent:false,
+    gmoOrderApiCalled:false,
+    side,
+    entry,
+    trailingDistance:distance,
+    initialStop:Number(initialStop.toFixed(3)),
+    steps,
+    checks:{
+      neverMovesWrongDirection,
+      reachesBreakEvenAfter1R,
+      passed:neverMovesWrongDirection && reachesBreakEvenAfter1R
+    }
+  });
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
