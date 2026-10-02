@@ -2859,7 +2859,7 @@ app.get("/change-order-request-preview", async (c) => {
       signaturePreview=crypto.createHmac("sha256",process.env.GMO_API_SECRET as string)
         .update(timestamp+method+path+body).digest("hex").slice(0,12)+"…";
     }
-    const validId=/^\\d+$/.test(orderId), validPrice=/^\\d+(\\.\\d+)?$/.test(price)&&Number(price)>0;
+    const validId=/^\d+$/.test(orderId), validPrice=/^\d+(\.\d+)?$/.test(price)&&Number(price)>0;
     return c.json({
       mode:"SIGNED_REQUEST_PREVIEW_ONLY",
       endpoint:"https://forex-api.coin.z.com/private/v1/changeOrder",
