@@ -2842,6 +2842,35 @@ app.get("/prelive-safety-gate-test", (c) => {
   });
 });
 
+
+// GMO FX changeOrder signed-request preview. Never sends a private API request.
+app.get("/change-order-request-preview", async (c) => {
+  try {
+    const orderId=String(c.req.query("orderId")||"123456789");
+    const price=String(c.req.query("price")||"150.000");
+    const live=String(process.env.LIVE_TRADING_ENABLED||"false").toLowerCase()==="true";
+    const path="/v1/changeOrder", method="POST";
+    const body=JSON.stringify({orderId:Number(orderId),price});
+    const timestamp=Date.now().toString();
+    const hasKey=!!process.env.GMO_API_KEY, hasSecret=!!process.env.GMO_API_SECRET;
+    let signaturePreview="NOT_CREATED_NO_SECRET";
+    if(hasSecret){
+      const crypto=await import("node:crypto");
+      signaturePreview=crypto.createHmac("sha256",process.env.GMO_API_SECRET as string)
+        .update(timestamp+method+path+body).digest("hex").slice(0,12)+"…";
+    }
+    const validId=/^\\d+$/.test(orderId), validPrice=/^\\d+(\\.\\d+)?$/.test(price)&&Number(price)>0;
+    return c.json({
+      mode:"SIGNED_REQUEST_PREVIEW_ONLY",
+      endpoint:"https://forex-api.coin.z.com/private/v1/changeOrder",
+      method,requestBody:{orderId:Number(orderId),price},
+      authentication:{apiKeyConfigured:hasKey,apiSecretConfigured:hasSecret,timestampConfigured:true,signaturePreview},
+      safety:{liveTradingEnabled:live,validOrderId:validId,validPrice,privateApiCalled:false,changeOrderApiCalled:false,orderSent:false},
+      decision:(!live&&validId&&validPrice&&hasKey&&hasSecret)?"REQUEST_SHAPE_READY_LIVE_STILL_BLOCKED":"NOT_READY_OR_LIVE_STATE_UNEXPECTED"
+    });
+  }catch(e:any){return c.json({error:"CHANGE_ORDER_PREVIEW_FAILED",message:String(e?.message||e),changeOrderApiCalled:false},500)}
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
