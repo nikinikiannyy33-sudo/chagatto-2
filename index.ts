@@ -2350,6 +2350,76 @@ app.get("/trailing-path-test", (c) => {
   });
 });
 
+
+function parseTrailingDistanceFromClientOrderId(clientOrderId: unknown) {
+  const m = /^CT\d+D(\d+)$/.exec(String(clientOrderId ?? ""));
+  if (!m) return null;
+  const ticks = Number(m[1]);
+  if (!Number.isInteger(ticks) || ticks <= 0) return null;
+  return ticks / 1000;
+}
+
+async function gmoPrivatePost(path: string, bodyObject: Record<string, unknown>) {
+  const apiKey = process.env.GMO_API_KEY;
+  const apiSecret = process.env.GMO_API_SECRET;
+  if (!apiKey || !apiSecret) throw new Error("GMO API keys are not set");
+  const timestamp = Date.now().toString();
+  const method = "POST";
+  const body = JSON.stringify(bodyObject);
+  const sign = crypto.createHmac("sha256", apiSecret)
+    .update(timestamp + method + path + body).digest("hex");
+  const response = await fetch(`https://forex-api.coin.z.com/private${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "API-KEY": apiKey,
+      "API-TIMESTAMP": timestamp,
+      "API-SIGN": sign,
+    },
+    body,
+  });
+  const raw = await response.text();
+  let data: any;
+  try { data = JSON.parse(raw); } catch { data = { rawResponse: raw }; }
+  if (!response.ok || data?.status !== 0) {
+    throw new Error(`GMO ${path} failed: ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+// SIMULATION ONLY: restart-safe 1R trailing state + monotonic STOP update check.
+// It never calls GMO private/order APIs.
+app.get("/trailing-state-test", (c) => {
+  const side = String(c.req.query("side") || "BUY").toUpperCase();
+  const entry = Number(c.req.query("entry") || "150");
+  const distance = Number(c.req.query("distance") || "0.5");
+  const currentPrice = Number(c.req.query("price") || (side === "BUY" ? "151" : "149"));
+  if ((side !== "BUY" && side !== "SELL") || !Number.isFinite(entry) || entry <= 0 ||
+      !Number.isFinite(distance) || distance <= 0 || !Number.isFinite(currentPrice) || currentPrice <= 0) {
+    return c.json({ mode:"SIMULATION_ONLY", orderSent:false, error:"INVALID_TEST_PARAMETERS" }, 400);
+  }
+  const ticks = Math.max(1, Math.round(distance * 1000));
+  const simulatedOrderId = 123456789;
+  const clientOrderId = `CT${simulatedOrderId}D${ticks}`;
+  const restoredDistance = parseTrailingDistanceFromClientOrderId(clientOrderId);
+  if (restoredDistance === null) return c.json({mode:"SIMULATION_ONLY",orderSent:false,error:"STATE_DECODE_FAILED"},500);
+  const initialStop = side === "BUY" ? entry - restoredDistance : entry + restoredDistance;
+  const oldStop = initialStop;
+  const movedAtLeast1R = side === "BUY" ? currentPrice >= entry + restoredDistance : currentPrice <= entry - restoredDistance;
+  const candidate = side === "BUY" ? currentPrice - restoredDistance : currentPrice + restoredDistance;
+  const proposedStop = movedAtLeast1R
+    ? (side === "BUY" ? Math.max(oldStop, candidate) : Math.min(oldStop, candidate))
+    : oldStop;
+  const monotonic = side === "BUY" ? proposedStop >= oldStop : proposedStop <= oldStop;
+  return c.json({
+    mode:"SIMULATION_ONLY", orderSent:false, gmoOrderApiCalled:false, changeOrderApiCalled:false,
+    side, entry, currentPrice, originalTrailingDistance:distance, clientOrderId,
+    restoredTrailingDistance:restoredDistance,
+    initialStop:Number(initialStop.toFixed(3)), proposedStop:Number(proposedStop.toFixed(3)),
+    checks:{ stateSurvivesRestart:restoredDistance === ticks/1000, movedAtLeast1R, monotonic, passed:restoredDistance === ticks/1000 && monotonic }
+  });
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
@@ -3039,8 +3109,11 @@ const stopSide =
 const stopTimestamp = Date.now().toString();
 const stopMethod = "POST";
 const stopPath = "/v1/closeOrder";
+// 1Rトレーリングで必要な「新規時のSTOP距離」を注文IDへ保存する。
+// GMO clientOrderId は半角英数字36文字以内なので、小数点を使わず0.001円単位で保持。
+const trailingDistanceTicks = Math.max(1, Math.round(stopDistance * 1000));
 const stopClientOrderId =
-  `CS${orderId}${Date.now()}`.slice(0, 36);
+  `CT${orderId}D${trailingDistanceTicks}`.slice(0, 36);
 
 const stopBody = JSON.stringify({
   symbol: "USD_JPY",
