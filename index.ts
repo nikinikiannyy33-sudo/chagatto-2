@@ -1774,6 +1774,23 @@ function jstParts(date = new Date()) {
   };
 }
 
+function isGmoFxTradingHoursJst(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Tokyo",
+    weekday: "short",
+    hour: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(now);
+  const weekday = parts.find((p) => p.type === "weekday")?.value || "";
+  const hour = Number(parts.find((p) => p.type === "hour")?.value || "0");
+
+  // GMO外国為替FXの通常取引時間: 月曜07:00〜土曜05:59(JST)
+  if (weekday === "Sun") return false;
+  if (weekday === "Mon") return hour >= 7;
+  if (weekday === "Sat") return hour < 6;
+  return true;
+}
+
 function toJstDateString(value: unknown) {
   const d = new Date(String(value ?? ""));
   if (!Number.isFinite(d.getTime())) return null;
@@ -1857,6 +1874,18 @@ async function runHourlySafetyCycle() {
   const startedAt = new Date().toISOString();
 
   try {
+    if (!isGmoFxTradingHoursJst()) {
+      lastSchedulerResult = {
+        startedAt,
+        action: "STOP_MARKET_CLOSED",
+        reason: "GMO_FX_REGULAR_TRADING_HOURS_CLOSED",
+        regularTradingHours: "Mon 07:00 - Sat 05:59 JST",
+        jst: jstParts(),
+      };
+      console.log("[scheduler] market closed", lastSchedulerResult);
+      return;
+    }
+
     const daily = await getTodayRealizedPnlJst();
     if (daily.pnl <= DAILY_LOSS_LIMIT_YEN) {
       lastSchedulerResult = { startedAt, action: "STOP_DAILY_LOSS", daily };
@@ -2960,7 +2989,27 @@ app.get("/scheduler-final-chain-test", async (c) => {
   }catch(e:any){return c.json({error:"SCHEDULER_FINAL_CHAIN_TEST_FAILED",message:String(e?.message||e)},500)}
 });
 
+app.get("/market-hours-status", (c) => {
+  return c.json({
+    system: "Chagatto-2",
+    timezone: "Asia/Tokyo",
+    regularTradingHours: "Mon 07:00 - Sat 05:59 JST",
+    tradingOpen: isGmoFxTradingHoursJst(),
+    schedulerActionIfClosed: "STOP_MARKET_CLOSED",
+    jst: jstParts(),
+    note: "Holiday/year-end hours and maintenance can differ from regular hours."
+  });
+});
+
 app.post("/gmo-order", async (c) => {
+  if (!isGmoFxTradingHoursJst()) {
+    return c.json({
+      orderSent: false,
+      error: "GMO_FX_MARKET_CLOSED",
+      regularTradingHours: "Mon 07:00 - Sat 05:59 JST",
+      jst: jstParts(),
+    }, 409);
+  }
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
     return c.json({
