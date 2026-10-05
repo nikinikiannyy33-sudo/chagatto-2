@@ -1748,9 +1748,9 @@ let gmoSafetyHaltReason: string | null = null;
 const DAILY_LOSS_LIMIT_YEN = -1200;
 const MAX_DAILY_TRADES = 20;
 const FIXED_ORDER_SIZE = 1000;
-const FIXED_STOP_DISTANCE = 0.150; // 15 pips on USD/JPY
+const FIXED_STOP_DISTANCE = 0.100; // 10 pips on USD/JPY
 const FIXED_TAKE_PROFIT_DISTANCE = 0.200; // 20 pips on USD/JPY
-const TARGET_LOSS_PER_TRADE_YEN = 150;
+const TARGET_LOSS_PER_TRADE_YEN = 100;
 const TARGET_PROFIT_PER_TRADE_YEN = 200;
 let schedulerInProgress = false;
 let lastSchedulerJstHourKey: string | null = null;
@@ -3195,7 +3195,7 @@ if (
   }, 409);
 }
 
-// 1000通貨固定。SL15pipsなら理論上の最大損失は約150円（手数料等を除く）。
+// 1000通貨固定。SL10pipsなら理論上の最大損失は約100円（手数料等を除く）。
 const maxRiskYen = TARGET_LOSS_PER_TRADE_YEN;
 
 // 現在のATR×1.5を取得するためシグナルAPIを呼ぶ
@@ -3650,7 +3650,7 @@ if (
     error: "INVALID_EXECUTION_DATA",
   }, 500);
 }
-// 1000通貨固定、TP20pips / SL15pips をOCOで同時設定。
+// 1000通貨固定、TP20pips / SL10pips をOCOで同時設定。
 const rawStopPrice =
   side === "BUY"
     ? entryPrice - FIXED_STOP_DISTANCE
@@ -3901,7 +3901,7 @@ takeProfitPrice,
 targetLossPerTradeYen: TARGET_LOSS_PER_TRADE_YEN,
 targetProfitPerTradeYen: TARGET_PROFIT_PER_TRADE_YEN,
 fixedOrderSize: FIXED_ORDER_SIZE,
-stopLossPips: 15,
+stopLossPips: 10,
 takeProfitPips: 20,
 dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
 maxDailyTrades: MAX_DAILY_TRADES,
