@@ -1739,6 +1739,324 @@ orderSize,
     time: new Date().toISOString(),
   });
 });
+
+// ===== Win-rate focused multi-timeframe strategy =====
+// 4H: trend direction
+// 1H: SMA direction + RSI + ADX
+// 5M: fresh crossover timing trigger
+// A new trade is allowed only on a fresh completed 5-minute crossover.
+// This prevents repeated entries while the same signal remains active.
+
+function adx(
+  candles: { high: number; low: number; close: number }[],
+  period = 14
+) {
+  if (candles.length < period * 2 + 1) return null;
+
+  const trs: number[] = [];
+  const plusDMs: number[] = [];
+  const minusDMs: number[] = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const cur = candles[i];
+    const prev = candles[i - 1];
+
+    const upMove = cur.high - prev.high;
+    const downMove = prev.low - cur.low;
+
+    plusDMs.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDMs.push(downMove > upMove && downMove > 0 ? downMove : 0);
+
+    trs.push(
+      Math.max(
+        cur.high - cur.low,
+        Math.abs(cur.high - prev.close),
+        Math.abs(cur.low - prev.close)
+      )
+    );
+  }
+
+  if (trs.length < period * 2) return null;
+
+  let tr14 = trs.slice(0, period).reduce((a, b) => a + b, 0);
+  let plus14 = plusDMs.slice(0, period).reduce((a, b) => a + b, 0);
+  let minus14 = minusDMs.slice(0, period).reduce((a, b) => a + b, 0);
+
+  const dxs: number[] = [];
+
+  const pushDx = () => {
+    if (tr14 <= 0) return;
+    const plusDI = 100 * (plus14 / tr14);
+    const minusDI = 100 * (minus14 / tr14);
+    const denom = plusDI + minusDI;
+    if (denom <= 0) return;
+    dxs.push(100 * Math.abs(plusDI - minusDI) / denom);
+  };
+
+  pushDx();
+
+  for (let i = period; i < trs.length; i++) {
+    tr14 = tr14 - tr14 / period + trs[i];
+    plus14 = plus14 - plus14 / period + plusDMs[i];
+    minus14 = minus14 - minus14 / period + minusDMs[i];
+    pushDx();
+  }
+
+  if (dxs.length < period) return null;
+
+  let adxValue = dxs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dxs.length; i++) {
+    adxValue = ((adxValue * (period - 1)) + dxs[i]) / period;
+  }
+  return adxValue;
+}
+
+function smaPrevious(values: number[], period: number) {
+  if (values.length <= period) return null;
+  return sma(values.slice(0, -1), period);
+}
+
+function gmoTradingDateBaseJst(now = new Date()) {
+  const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+  if (jst.getUTCHours() < 6) {
+    jst.setUTCDate(jst.getUTCDate() - 1);
+  }
+  return jst;
+}
+
+function formatGmoDate(d: Date) {
+  return (
+    d.getUTCFullYear().toString() +
+    String(d.getUTCMonth() + 1).padStart(2, "0") +
+    String(d.getUTCDate()).padStart(2, "0")
+  );
+}
+
+function recentGmoBusinessDates(count: number, now = new Date()) {
+  const out: string[] = [];
+  const d = gmoTradingDateBaseJst(now);
+
+  while (out.length < count) {
+    const day = d.getUTCDay();
+    if (day !== 0 && day !== 6) out.push(formatGmoDate(d));
+    d.setUTCDate(d.getUTCDate() - 1);
+  }
+
+  return out.reverse();
+}
+
+async function fetchCompletedGmoCandles(
+  interval: "5min" | "1hour" | "4hour",
+  businessDays: number
+) {
+  const durationMs =
+    interval === "5min" ? 5 * 60 * 1000 :
+    interval === "1hour" ? 60 * 60 * 1000 :
+    4 * 60 * 60 * 1000;
+
+  const dates = recentGmoBusinessDates(businessDays);
+  const all: any[] = [];
+
+  for (const date of dates) {
+    const url =
+      "https://forex-api.coin.z.com/public/v1/klines" +
+      "?symbol=USD_JPY" +
+      "&priceType=BID" +
+      "&interval=" + interval +
+      "&date=" + date;
+
+    const response = await fetch(url);
+    const data: any = await response.json();
+
+    if (!response.ok || data?.status !== 0 || !Array.isArray(data?.data)) {
+      throw new Error(
+        `GMO klines ${interval} failed: ${JSON.stringify(data)}`
+      );
+    }
+
+    for (const x of data.data) {
+      const candle = {
+        time: Number(x.openTime),
+        open: Number(x.open),
+        high: Number(x.high),
+        low: Number(x.low),
+        close: Number(x.close),
+      };
+
+      if (
+        Number.isFinite(candle.time) &&
+        Number.isFinite(candle.open) &&
+        Number.isFinite(candle.high) &&
+        Number.isFinite(candle.low) &&
+        Number.isFinite(candle.close)
+      ) {
+        all.push(candle);
+      }
+    }
+  }
+
+  const nowMs = Date.now();
+  return all
+    .sort((a, b) => a.time - b.time)
+    .filter((x) => x.time + durationMs <= nowMs);
+}
+
+async function buildWinRateFocusedSignal() {
+  const [c5, c1h, c4h] = await Promise.all([
+    fetchCompletedGmoCandles("5min", 2),
+    fetchCompletedGmoCandles("1hour", 4),
+    fetchCompletedGmoCandles("4hour", 8),
+  ]);
+
+  if (c5.length < 20 || c1h.length < 35 || c4h.length < 12) {
+    throw new Error(
+      `Not enough candles: 5m=${c5.length},1h=${c1h.length},4h=${c4h.length}`
+    );
+  }
+
+  const close5 = c5.map((x) => x.close);
+  const close1h = c1h.map((x) => x.close);
+  const close4h = c4h.map((x) => x.close);
+
+  // Condition 1: 4H trend direction + slope
+  const sma4Fast = sma(close4h, 5);
+  const sma4Slow = sma(close4h, 10);
+  const sma4FastPrev = smaPrevious(close4h, 5);
+
+  let trend4h: "BUY" | "SELL" | "WAIT" = "WAIT";
+  if (sma4Fast !== null && sma4Slow !== null && sma4FastPrev !== null) {
+    if (sma4Fast > sma4Slow && sma4Fast > sma4FastPrev) trend4h = "BUY";
+    if (sma4Fast < sma4Slow && sma4Fast < sma4FastPrev) trend4h = "SELL";
+  }
+
+  // Condition 2: 1H SMA direction + slope
+  const sma1Fast = sma(close1h, 7);
+  const sma1Slow = sma(close1h, 8);
+  const sma1FastPrev = smaPrevious(close1h, 7);
+
+  let trend1h: "BUY" | "SELL" | "WAIT" = "WAIT";
+  if (sma1Fast !== null && sma1Slow !== null && sma1FastPrev !== null) {
+    if (sma1Fast > sma1Slow && sma1Fast > sma1FastPrev) trend1h = "BUY";
+    if (sma1Fast < sma1Slow && sma1Fast < sma1FastPrev) trend1h = "SELL";
+  }
+
+  // Condition 3: RSI confirmation. Neutral zone is intentionally WAIT.
+  const rsi1h = rsi(close1h, 14);
+  const rsiBuy = rsi1h !== null && rsi1h >= 55 && rsi1h <= 70;
+  const rsiSell = rsi1h !== null && rsi1h >= 30 && rsi1h <= 45;
+
+  // Condition 4: ADX trend-strength filter
+  const adx1h = adx(c1h, 14);
+  const adxPass = adx1h !== null && adx1h >= 20;
+
+  // 5-minute entry timing: fresh SMA5/SMA10 crossover + candle direction.
+  // Because crossover must be fresh, the same persistent signal cannot re-enter repeatedly.
+  const sma5Fast = sma(close5, 5);
+  const sma5Slow = sma(close5, 10);
+  const sma5FastPrev = smaPrevious(close5, 5);
+  const sma5SlowPrev = smaPrevious(close5, 10);
+  const last5 = c5[c5.length - 1];
+
+  const triggerBuy =
+    sma5Fast !== null &&
+    sma5Slow !== null &&
+    sma5FastPrev !== null &&
+    sma5SlowPrev !== null &&
+    sma5Fast > sma5Slow &&
+    sma5FastPrev <= sma5SlowPrev &&
+    last5.close > last5.open;
+
+  const triggerSell =
+    sma5Fast !== null &&
+    sma5Slow !== null &&
+    sma5FastPrev !== null &&
+    sma5SlowPrev !== null &&
+    sma5Fast < sma5Slow &&
+    sma5FastPrev >= sma5SlowPrev &&
+    last5.close < last5.open;
+
+  let signal: "BUY" | "SELL" | "WAIT" = "WAIT";
+
+  if (
+    trend4h === "BUY" &&
+    trend1h === "BUY" &&
+    rsiBuy &&
+    adxPass &&
+    triggerBuy
+  ) {
+    signal = "BUY";
+  } else if (
+    trend4h === "SELL" &&
+    trend1h === "SELL" &&
+    rsiSell &&
+    adxPass &&
+    triggerSell
+  ) {
+    signal = "SELL";
+  }
+
+  return {
+    system: "Chagatto-2 WinRate Focus",
+    source: "GMO Coin FX",
+    strategy: "4H trend + 1H SMA/RSI/ADX + fresh 5M crossover",
+    signal,
+    triggerCandleTime: last5.time,
+    triggerCandleIso: new Date(last5.time).toISOString(),
+    price: last5.close,
+    filters: {
+      condition1_4hTrend: {
+        direction: trend4h,
+        sma5: sma4Fast,
+        sma10: sma4Slow,
+        fastSlopeUp: sma4Fast !== null && sma4FastPrev !== null ? sma4Fast > sma4FastPrev : null,
+      },
+      condition2_1hSma: {
+        direction: trend1h,
+        sma7: sma1Fast,
+        sma8: sma1Slow,
+      },
+      condition3_rsi: {
+        rsi14: rsi1h,
+        buyPass: rsiBuy,
+        sellPass: rsiSell,
+      },
+      condition4_adx: {
+        adx14: adx1h,
+        pass: adxPass,
+        minimum: 20,
+      },
+      entry5m: {
+        sma5: sma5Fast,
+        sma10: sma5Slow,
+        freshBuyCross: triggerBuy,
+        freshSellCross: triggerSell,
+        candleOpen: last5.open,
+        candleClose: last5.close,
+      },
+    },
+    fixedTrade: {
+      orderSize: FIXED_ORDER_SIZE,
+      takeProfitPips: 20,
+      stopLossPips: 10,
+    },
+    time: new Date().toISOString(),
+  };
+}
+
+app.get("/smart-signal", async (c) => {
+  try {
+    const result = await buildWinRateFocusedSignal();
+    return c.json(result);
+  } catch (error: any) {
+    return c.json({
+      system: "Chagatto-2 WinRate Focus",
+      signal: "WAIT",
+      error: String(error?.message ?? error),
+      orderSent: false,
+    }, 500);
+  }
+});
+
 let gmoOrderInProgress = false;
 let gmoSafetyHalt = false;
 let gmoSafetyHaltReason: string | null = null;
@@ -1753,7 +2071,7 @@ const FIXED_TAKE_PROFIT_DISTANCE = 0.200; // 20 pips on USD/JPY
 const TARGET_LOSS_PER_TRADE_YEN = 100;
 const TARGET_PROFIT_PER_TRADE_YEN = 200;
 let schedulerInProgress = false;
-let lastSchedulerJstHourKey: string | null = null;
+let lastSchedulerFiveMinKey: string | null = null;
 let lastSchedulerResult: any = null;
 
 function jstParts(date = new Date()) {
@@ -1868,7 +2186,7 @@ function schedulerBaseUrl() {
   return `http://127.0.0.1:${Number(process.env.PORT || 8080)}`;
 }
 
-async function runHourlySafetyCycle() {
+async function runWinRateSafetyCycle() {
   if (schedulerInProgress) return;
   schedulerInProgress = true;
   const startedAt = new Date().toISOString();
@@ -1901,28 +2219,22 @@ if (daily.closeCount >= MAX_DAILY_TRADES) {
     const positionCount = await getUsdJpyOpenPositionCount();
     const baseUrl = schedulerBaseUrl();
     if (positionCount > 0) {
-      // Position management always takes priority over new entries.
-      // While LIVE=false this calls the REAL_DATA_DRY_RUN endpoint only;
-      // it never sends an order or changeOrder request.
-      const managementResponse = await fetch(`${baseUrl}/trailing-real-dry-run`);
-      const managementData: any = await managementResponse.json();
-      if (!managementResponse.ok) {
-        throw new Error(`trailing management dry run failed: ${JSON.stringify(managementData)}`);
-      }
+      // Existing position is already protected by its OCO TP/SL.
+      // No new entry is allowed until the position is closed.
       lastSchedulerResult = {
         startedAt,
-        action: "MANAGE_OPEN_POSITION_DRY_RUN",
+        action: "HOLD_OPEN_POSITION_OCO",
         daily,
         positionCount,
-        managementData,
+        newEntryBlocked: true,
       };
-      console.log("[scheduler] position management dry run", lastSchedulerResult);
+      console.log("[scheduler] hold open position", lastSchedulerResult);
       return;
     }
 
-    const signalResponse = await fetch(`${baseUrl}/gmo-signal`);
+    const signalResponse = await fetch(`${baseUrl}/smart-signal`);
     const signalData: any = await signalResponse.json();
-    if (!signalResponse.ok) throw new Error(`gmo-signal failed: ${JSON.stringify(signalData)}`);
+    if (!signalResponse.ok) throw new Error(`smart-signal failed: ${JSON.stringify(signalData)}`);
 
     const signal = String(signalData?.signal ?? "WAIT");
     if (signal !== "BUY" && signal !== "SELL") {
@@ -2037,21 +2349,30 @@ app.get("/scheduler-position-test", async (c) => {
 });
 
 app.get("/scheduler-status", (c) => c.json({
-  schedule: "every hour at minute 05 JST",
+  schedule: "continuous monitor; evaluate once after each completed 5-minute candle",
+  strategy: "4H trend + 1H SMA/RSI/ADX + fresh 5M crossover",
   liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
   inProgress: schedulerInProgress,
-  lastJstHourKey: lastSchedulerJstHourKey,
+  lastFiveMinKey: lastSchedulerFiveMinKey,
   lastResult: lastSchedulerResult,
 }));
 
-// 20秒ごとに時計を確認し、JSTの毎時05分に1回だけ実行する。
+// 常時監視。
+// 20秒ごとに時計を確認し、5分足が確定して約15秒後から、その足につき1回だけ判定する。
+// 例: 10:00:15以降に09:55-10:00の確定5分足を判定。
 setInterval(() => {
-  const now = jstParts();
-  if (now.minute !== "05") return;
-  const hourKey = `${now.date}T${now.hour}`;
-  if (lastSchedulerJstHourKey === hourKey) return;
-  lastSchedulerJstHourKey = hourKey;
-  void runHourlySafetyCycle();
+  const d = new Date();
+  const minute = d.getUTCMinutes();
+  const second = d.getUTCSeconds();
+
+  if (minute % 5 !== 0) return;
+  if (second < 15) return;
+
+  const bucketKey = String(Math.floor(d.getTime() / (5 * 60 * 1000)));
+  if (lastSchedulerFiveMinKey === bucketKey) return;
+
+  lastSchedulerFiveMinKey = bucketKey;
+  void runWinRateSafetyCycle();
 }, 20_000);
 // ===== end safety scheduler patch =====
 
@@ -2974,10 +3295,10 @@ app.get("/scheduler-final-chain-test", async (c) => {
       {step:5,name:"ORIGINAL_1R_REQUIRED",active:simulatedPositionCount===1},
       {step:6,name:"TRAILING_DIRECTION_CHECK",active:simulatedPositionCount===1},
       {step:7,name:"CHANGE_ORDER_SAFETY_GATE",active:simulatedPositionCount===1},
-      {step:8,name:"NEW_ENTRY_SIGNAL_ONLY_IF_NO_POSITION",active:simulatedPositionCount===0}
+      {step:8,name:"SMART_SIGNAL_ONLY_IF_NO_POSITION",active:simulatedPositionCount===0}
     ];
     return c.json({
-      mode:"FINAL_CHAIN_DRY_RUN",schedule:"every hour at minute 05 JST",
+      mode:"FINAL_CHAIN_DRY_RUN",schedule:"continuous monitor; evaluate each completed 5-minute candle",
       liveTradingEnabled:live,simulatedPositionCount,
       priority:simulatedPositionCount===1?"MANAGE_POSITION_BLOCK_NEW_ENTRY":"NO_POSITION_CONTINUE_TO_SIGNAL",
       chain,
