@@ -2382,6 +2382,25 @@ app.get("/scheduler-position-test", async (c) => {
   }
 });
 
+app.get("/system-audit", (c) => c.json({
+  system: "Chagatto-2",
+  strategy: "WINRATE_FOCUS_4H_1H_5M",
+  liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+  schedulerSignalEndpoint: "/smart-signal",
+  orderRecheckSignalEndpoint: "/smart-signal",
+  signalChainConsistent: true,
+  adxMinimum: 15,
+  fixedOrderSize: FIXED_ORDER_SIZE,
+  takeProfitPips: 20,
+  stopLossPips: 10,
+  dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
+  dailyProfitCap: null,
+  maxDailyTrades: MAX_DAILY_TRADES,
+  onePositionOnly: true,
+  weekendMarketHoursGuard: true,
+  ocoProtection: true
+}));
+
 app.get("/scheduler-status", (c) => c.json({
   schedule: "continuous monitor; evaluate once after each completed 5-minute candle",
   strategy: "4H trend (aggregated from completed 1H candles) + 1H SMA/RSI/ADX + fresh 5M crossover",
@@ -3495,9 +3514,11 @@ try {
   }
 
   const openPositions =
-    Array.isArray(positionData.data)
+    Array.isArray(positionData?.data)
       ? positionData.data
-      : [];
+      : Array.isArray(positionData?.data?.list)
+        ? positionData.data.list
+        : [];
 
   if (openPositions.length > 0) {
     return c.json({
@@ -3553,9 +3574,10 @@ if (
 // 1000通貨固定。SL10pipsなら理論上の最大損失は約100円（手数料等を除く）。
 const maxRiskYen = TARGET_LOSS_PER_TRADE_YEN;
 
-// 現在のATR×1.5を取得するためシグナルAPIを呼ぶ
+// スケジューラと同じ勝率優先シグナルを再確認する。
+// 旧 /gmo-signal を参照すると、新戦略がBUY/SELLでも注文が拒否されるため使わない。
 const signalResponse = await fetch(
-  new URL("/gmo-signal", c.req.url).toString()
+  new URL("/smart-signal", c.req.url).toString()
 );
 
 const signalData: any = await signalResponse.json();
@@ -3564,7 +3586,7 @@ const signalData: any = await signalResponse.json();
 if (!signalResponse.ok) {
   return c.json({
     orderSent: false,
-    error: "SIGNAL_API_ERROR",
+    error: "SMART_SIGNAL_API_ERROR",
   }, 500);
 }
 
@@ -3577,7 +3599,7 @@ if (
 ) {
   return c.json({
     orderSent: false,
-    error: "NO_TRADE_SIGNAL",
+    error: "NO_SMART_TRADE_SIGNAL",
     signal: currentSignal,
   }, 409);
 }
