@@ -1846,7 +1846,7 @@ function recentGmoBusinessDates(count: number, now = new Date()) {
 }
 
 async function fetchCompletedGmoCandles(
-  interval: "5min" | "1hour" | "4hour",
+  interval: "5min" | "1hour",
   businessDays: number
 ) {
   const durationMs =
@@ -1901,12 +1901,46 @@ async function fetchCompletedGmoCandles(
     .filter((x) => x.time + durationMs <= nowMs);
 }
 
+function aggregateOneHourToFourHour(
+  candles: { time: number; open: number; high: number; low: number; close: number }[]
+) {
+  const buckets = new Map<number, any[]>();
+
+  for (const c of candles) {
+    const jst = new Date(c.time + 9 * 60 * 60 * 1000);
+    const y = jst.getUTCFullYear();
+    const m = jst.getUTCMonth();
+    const day = jst.getUTCDate();
+    const hour = jst.getUTCHours();
+    const bucketHour = Math.floor(hour / 4) * 4;
+    const bucketStartUtc =
+      Date.UTC(y, m, day, bucketHour, 0, 0) - 9 * 60 * 60 * 1000;
+
+    if (!buckets.has(bucketStartUtc)) buckets.set(bucketStartUtc, []);
+    buckets.get(bucketStartUtc)!.push(c);
+  }
+
+  return [...buckets.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([time, rows]) => ({
+      time,
+      open: rows[0].open,
+      high: Math.max(...rows.map((x) => x.high)),
+      low: Math.min(...rows.map((x) => x.low)),
+      close: rows[rows.length - 1].close,
+      sourceBars: rows.length,
+    }))
+    .filter((x) => x.sourceBars === 4);
+}
+
 async function buildWinRateFocusedSignal() {
-  const [c5, c1h, c4h] = await Promise.all([
+  const [c5, c1hLong] = await Promise.all([
     fetchCompletedGmoCandles("5min", 2),
-    fetchCompletedGmoCandles("1hour", 4),
-    fetchCompletedGmoCandles("4hour", 8),
+    fetchCompletedGmoCandles("1hour", 10),
   ]);
+
+  const c1h = c1hLong.slice(-120);
+  const c4h = aggregateOneHourToFourHour(c1hLong);
 
   if (c5.length < 20 || c1h.length < 35 || c4h.length < 12) {
     throw new Error(
@@ -1998,7 +2032,7 @@ async function buildWinRateFocusedSignal() {
   return {
     system: "Chagatto-2 WinRate Focus",
     source: "GMO Coin FX",
-    strategy: "4H trend + 1H SMA/RSI/ADX + fresh 5M crossover",
+    strategy: "4H trend (aggregated from completed 1H candles) + 1H SMA/RSI/ADX + fresh 5M crossover",
     signal,
     triggerCandleTime: last5.time,
     triggerCandleIso: new Date(last5.time).toISOString(),
@@ -2350,7 +2384,7 @@ app.get("/scheduler-position-test", async (c) => {
 
 app.get("/scheduler-status", (c) => c.json({
   schedule: "continuous monitor; evaluate once after each completed 5-minute candle",
-  strategy: "4H trend + 1H SMA/RSI/ADX + fresh 5M crossover",
+  strategy: "4H trend (aggregated from completed 1H candles) + 1H SMA/RSI/ADX + fresh 5M crossover",
   liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
   inProgress: schedulerInProgress,
   lastFiveMinKey: lastSchedulerFiveMinKey,
