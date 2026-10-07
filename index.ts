@@ -1983,8 +1983,10 @@ async function buildWinRateFocusedSignal() {
   const adx1h = adx(c1h, 14);
   const adxPass = adx1h !== null && adx1h >= 15;
 
-  // 5-minute entry timing: fresh SMA5/SMA10 crossover + candle direction.
-  // Because crossover must be fresh, the same persistent signal cannot re-enter repeatedly.
+  // 5-minute entry timing (relaxed):
+  // Do not require a brand-new SMA crossover.
+  // If the 5-minute SMA direction already matches the higher-timeframe trend
+  // and the latest completed candle confirms that direction, allow entry.
   const sma5Fast = sma(close5, 5);
   const sma5Slow = sma(close5, 10);
   const sma5FastPrev = smaPrevious(close5, 5);
@@ -1994,19 +1996,13 @@ async function buildWinRateFocusedSignal() {
   const triggerBuy =
     sma5Fast !== null &&
     sma5Slow !== null &&
-    sma5FastPrev !== null &&
-    sma5SlowPrev !== null &&
     sma5Fast > sma5Slow &&
-    sma5FastPrev <= sma5SlowPrev &&
     last5.close > last5.open;
 
   const triggerSell =
     sma5Fast !== null &&
     sma5Slow !== null &&
-    sma5FastPrev !== null &&
-    sma5SlowPrev !== null &&
     sma5Fast < sma5Slow &&
-    sma5FastPrev >= sma5SlowPrev &&
     last5.close < last5.open;
 
   let signal: "BUY" | "SELL" | "WAIT" = "WAIT";
@@ -2032,7 +2028,7 @@ async function buildWinRateFocusedSignal() {
   return {
     system: "Chagatto-2 WinRate Focus",
     source: "GMO Coin FX",
-    strategy: "4H trend (aggregated from completed 1H candles) + 1H SMA/RSI/ADX + fresh 5M crossover",
+    strategy: "4H trend + 1H SMA/RSI/ADX + relaxed 5M direction confirmation",
     signal,
     triggerCandleTime: last5.time,
     triggerCandleIso: new Date(last5.time).toISOString(),
@@ -2062,8 +2058,8 @@ async function buildWinRateFocusedSignal() {
       entry5m: {
         sma5: sma5Fast,
         sma10: sma5Slow,
-        freshBuyCross: triggerBuy,
-        freshSellCross: triggerSell,
+        buyDirectionPass: triggerBuy,
+        sellDirectionPass: triggerSell,
         candleOpen: last5.open,
         candleClose: last5.close,
       },
@@ -2403,7 +2399,7 @@ app.get("/system-audit", (c) => c.json({
 
 app.get("/scheduler-status", (c) => c.json({
   schedule: "continuous monitor; evaluate once after each completed 5-minute candle",
-  strategy: "4H trend (aggregated from completed 1H candles) + 1H SMA/RSI/ADX + fresh 5M crossover",
+  strategy: "4H trend + 1H SMA/RSI/ADX + relaxed 5M direction confirmation",
   liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
   inProgress: schedulerInProgress,
   lastFiveMinKey: lastSchedulerFiveMinKey,
