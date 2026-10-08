@@ -1933,6 +1933,159 @@ function aggregateOneHourToFourHour(
     .filter((x) => x.sourceBars === 4);
 }
 
+
+function oneHourTrendSeries(
+  candles: { time: number; close: number }[]
+) {
+  const out: { time: number; direction: "BUY" | "SELL" | "WAIT" }[] = [];
+
+  for (let i = 0; i < candles.length; i++) {
+    const slice = candles.slice(0, i + 1);
+    const closes = slice.map((x) => x.close);
+    const fast = sma(closes, 7);
+    const slow = sma(closes, 8);
+
+    let direction: "BUY" | "SELL" | "WAIT" = "WAIT";
+    if (fast !== null && slow !== null) {
+      if (fast > slow) direction = "BUY";
+      else if (fast < slow) direction = "SELL";
+    }
+
+    out.push({
+      time: candles[i].time,
+      direction,
+    });
+  }
+
+  return out;
+}
+
+async function getThreeLossDirectionGuard(
+  c1h: { time: number; close: number }[]
+) {
+  const rows = await getLatestUsdJpyExecutions();
+
+  const byPosition = new Map<string, {
+    positionId: string;
+    openSide: "BUY" | "SELL" | null;
+    openTime: number | null;
+    closeTime: number | null;
+    pnl: number;
+    hasClose: boolean;
+  }>();
+
+  for (const x of rows) {
+    const positionId = String(x?.positionId ?? "");
+    if (!positionId) continue;
+
+    if (!byPosition.has(positionId)) {
+      byPosition.set(positionId, {
+        positionId,
+        openSide: null,
+        openTime: null,
+        closeTime: null,
+        pnl: 0,
+        hasClose: false,
+      });
+    }
+
+    const p = byPosition.get(positionId)!;
+    const settleType = String(x?.settleType ?? "").toUpperCase();
+    const side = String(x?.side ?? "").toUpperCase();
+    const ts = executionTimestampMs(x);
+
+    if (settleType === "OPEN") {
+      if (side === "BUY" || side === "SELL") {
+        p.openSide = side;
+      }
+      if (Number.isFinite(ts)) {
+        p.openTime = p.openTime === null ? ts : Math.min(p.openTime, ts);
+      }
+    }
+
+    if (settleType === "CLOSE") {
+      const lossGain = Number(x?.lossGain);
+      const fee = Number(x?.fee ?? 0);
+      const settledSwap = Number(x?.settledSwap ?? 0);
+
+      if (Number.isFinite(lossGain)) {
+        p.pnl +=
+          lossGain +
+          (Number.isFinite(fee) ? fee : 0) +
+          (Number.isFinite(settledSwap) ? settledSwap : 0);
+      }
+
+      p.hasClose = true;
+      if (Number.isFinite(ts)) {
+        p.closeTime = p.closeTime === null ? ts : Math.max(p.closeTime, ts);
+      }
+    }
+  }
+
+  const completed = [...byPosition.values()]
+    .filter(
+      (p) =>
+        p.hasClose &&
+        p.openSide !== null &&
+        p.closeTime !== null
+    )
+    .sort((a, b) => (a.closeTime ?? 0) - (b.closeTime ?? 0));
+
+  const last3 = completed.slice(-3);
+
+  if (
+    last3.length < 3 ||
+    last3.some((t) => t.pnl >= 0) ||
+    !last3.every((t) => t.openSide === last3[0].openSide)
+  ) {
+    return {
+      active: false,
+      blockedSide: null,
+      reason: "NO_THREE_CONSECUTIVE_SAME_DIRECTION_LOSSES",
+      last3: last3.map((t) => ({
+        positionId: t.positionId,
+        side: t.openSide,
+        pnl: t.pnl,
+        closeTime: t.closeTime,
+        closeIso: t.closeTime ? new Date(t.closeTime).toISOString() : null,
+      })),
+    };
+  }
+
+  const blockedSide = last3[0].openSide as "BUY" | "SELL";
+  const thirdLossTime = last3[2].closeTime as number;
+
+  // 再開条件:
+  // 3連敗後に、確定1時間足の方向が一度でも WAIT または反対方向へ変化したら解除。
+  // その後また同じ方向に戻った場合は、新しい相場状態として取引可能。
+  const trendSeries = oneHourTrendSeries(c1h);
+  const afterLoss = trendSeries.filter(
+    (x) => x.time + 60 * 60 * 1000 > thirdLossTime
+  );
+
+  const resetSeen = afterLoss.some(
+    (x) => x.direction !== blockedSide
+  );
+
+  return {
+    active: !resetSeen,
+    blockedSide,
+    reason: resetSeen
+      ? "ONE_HOUR_DIRECTION_CHANGED_AFTER_THREE_LOSSES"
+      : "THREE_CONSECUTIVE_SAME_DIRECTION_LOSSES",
+    thirdLossTime,
+    thirdLossIso: new Date(thirdLossTime).toISOString(),
+    resetSeen,
+    last3: last3.map((t) => ({
+      positionId: t.positionId,
+      side: t.openSide,
+      pnl: t.pnl,
+      closeTime: t.closeTime,
+      closeIso: t.closeTime ? new Date(t.closeTime).toISOString() : null,
+    })),
+  };
+}
+
 async function buildWinRateFocusedSignal() {
   const [c5, c1hLong] = await Promise.all([
     fetchCompletedGmoCandles("5min", 2),
@@ -2025,6 +2178,17 @@ async function buildWinRateFocusedSignal() {
     signal = "SELL";
   }
 
+  // 同方向3連敗ガード。
+  // 固定時間のクールダウンは使わず、1時間足の方向変化を解除条件にする。
+  const threeLossGuard = await getThreeLossDirectionGuard(c1h);
+
+  if (
+    threeLossGuard.active &&
+    threeLossGuard.blockedSide === signal
+  ) {
+    signal = "WAIT";
+  }
+
   return {
     system: "Chagatto-2 WinRate Focus",
     source: "GMO Coin FX",
@@ -2063,6 +2227,7 @@ async function buildWinRateFocusedSignal() {
         candleOpen: last5.open,
         candleClose: last5.close,
       },
+      threeLossDirectionGuard: threeLossGuard,
     },
     fixedTrade: {
       orderSize: FIXED_ORDER_SIZE,
@@ -2456,8 +2621,46 @@ app.get("/system-audit", (c) => c.json({
   maxDailyTrades: MAX_DAILY_TRADES,
   onePositionOnly: true,
   weekendMarketHoursGuard: true,
-  ocoProtection: true
+  ocoProtection: true,
+  threeLossDirectionGuard: {
+    enabled: true,
+    consecutiveLosses: 3,
+    cooldownMinutes: null,
+    resetRule: "block same direction until completed 1H direction changes"
+  }
 }));
+
+app.get("/three-loss-guard-status", async (c) => {
+  try {
+    const c1hLong = await fetchCompletedGmoCandles("1hour", 10);
+    const c1h = c1hLong.slice(-120);
+    const guard = await getThreeLossDirectionGuard(c1h);
+
+    const closes = c1h.map((x) => x.close);
+    const sma7 = sma(closes, 7);
+    const sma8 = sma(closes, 8);
+    let current1hDirection: "BUY" | "SELL" | "WAIT" = "WAIT";
+    if (sma7 !== null && sma8 !== null) {
+      if (sma7 > sma8) current1hDirection = "BUY";
+      else if (sma7 < sma8) current1hDirection = "SELL";
+    }
+
+    return c.json({
+      system: "Chagatto-2",
+      rule: "After 3 consecutive losses in the same direction, block that direction until completed 1H direction changes.",
+      cooldownMinutes: null,
+      current1hDirection,
+      guard,
+      orderSent: false
+    });
+  } catch (error: any) {
+    return c.json({
+      system: "Chagatto-2",
+      error: String(error?.message ?? error),
+      orderSent: false
+    }, 500);
+  }
+});
 
 app.get("/order-safety-audit", async (c) => {
   try {
