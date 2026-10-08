@@ -1969,15 +1969,15 @@ async function buildWinRateFocusedSignal() {
   const sma1FastPrev = smaPrevious(close1h, 7);
 
   let trend1h: "BUY" | "SELL" | "WAIT" = "WAIT";
-  if (sma1Fast !== null && sma1Slow !== null && sma1FastPrev !== null) {
-    if (sma1Fast > sma1Slow && sma1Fast > sma1FastPrev) trend1h = "BUY";
-    if (sma1Fast < sma1Slow && sma1Fast < sma1FastPrev) trend1h = "SELL";
+  if (sma1Fast !== null && sma1Slow !== null) {
+    if (sma1Fast > sma1Slow) trend1h = "BUY";
+    if (sma1Fast < sma1Slow) trend1h = "SELL";
   }
 
   // Condition 3: RSI confirmation. Neutral zone is intentionally WAIT.
   const rsi1h = rsi(close1h, 14);
-  const rsiBuy = rsi1h !== null && rsi1h >= 55 && rsi1h <= 70;
-  const rsiSell = rsi1h !== null && rsi1h >= 30 && rsi1h <= 45;
+  const rsiBuy = rsi1h !== null && rsi1h >= 52 && rsi1h <= 72;
+  const rsiSell = rsi1h !== null && rsi1h >= 28 && rsi1h <= 48;
 
   // Condition 4: ADX trend-strength filter
   const adx1h = adx(c1h, 14);
@@ -2008,7 +2008,7 @@ async function buildWinRateFocusedSignal() {
   let signal: "BUY" | "SELL" | "WAIT" = "WAIT";
 
   if (
-    trend4h === "BUY" &&
+    trend4h !== "SELL" &&
     trend1h === "BUY" &&
     rsiBuy &&
     adxPass &&
@@ -2016,7 +2016,7 @@ async function buildWinRateFocusedSignal() {
   ) {
     signal = "BUY";
   } else if (
-    trend4h === "SELL" &&
+    trend4h !== "BUY" &&
     trend1h === "SELL" &&
     rsiSell &&
     adxPass &&
@@ -2028,7 +2028,7 @@ async function buildWinRateFocusedSignal() {
   return {
     system: "Chagatto-2 WinRate Focus",
     source: "GMO Coin FX",
-    strategy: "4H trend + 1H SMA/RSI/ADX + relaxed 5M direction confirmation",
+    strategy: "4H veto + 1H SMA/RSI/ADX + relaxed 5M direction confirmation",
     signal,
     triggerCandleTime: last5.time,
     triggerCandleIso: new Date(last5.time).toISOString(),
@@ -2380,7 +2380,7 @@ app.get("/scheduler-position-test", async (c) => {
 
 app.get("/system-audit", (c) => c.json({
   system: "Chagatto-2",
-  strategy: "WINRATE_FOCUS_4H_1H_5M",
+  strategy: "BALANCED_FREQUENCY_4H_VETO_1H_5M",
   liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
   schedulerSignalEndpoint: "/smart-signal",
   orderRecheckSignalEndpoint: "/smart-signal",
@@ -2399,7 +2399,7 @@ app.get("/system-audit", (c) => c.json({
 
 app.get("/scheduler-status", (c) => c.json({
   schedule: "continuous monitor; evaluate once after each completed 5-minute candle",
-  strategy: "4H trend + 1H SMA/RSI/ADX + relaxed 5M direction confirmation",
+  strategy: "4H veto + 1H SMA/RSI/ADX + relaxed 5M direction confirmation",
   liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
   inProgress: schedulerInProgress,
   lastFiveMinKey: lastSchedulerFiveMinKey,
