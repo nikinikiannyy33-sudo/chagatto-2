@@ -2172,22 +2172,36 @@ async function gmoPrivateGet(path: string, query = "") {
   return data;
 }
 
-async function getTodayRealizedPnlJst() {
-  const todayJst = jstParts().date;
+async function getLatestUsdJpyExecutions() {
   const data = await gmoPrivateGet("/v1/latestExecutions", "?symbol=USD_JPY&count=100");
-  const rows = Array.isArray(data?.data)
+  return Array.isArray(data?.data)
     ? data.data
     : Array.isArray(data?.data?.list)
       ? data.data.list
       : [];
+}
 
+async function getTodayRealizedPnlJst() {
+  const todayJst = jstParts().date;
+  const rows = await getLatestUsdJpyExecutions();
   const todayRows = rows.filter((x: any) => toJstDateString(x?.timestamp) === todayJst);
+
   let pnl = 0;
   let closeCount = 0;
+  const openOrderIds = new Set<string>();
 
   for (const x of todayRows) {
+    const settleType = String(x?.settleType ?? "").toUpperCase();
+
+    if (settleType === "OPEN") {
+      const orderId = String(x?.orderId ?? "");
+      if (orderId) openOrderIds.add(orderId);
+      continue;
+    }
+
+    if (settleType !== "CLOSE") continue;
+
     const lossGain = Number(x?.lossGain);
-    // lossGain が返る決済約定だけを日次確定損益へ加算する。
     if (!Number.isFinite(lossGain)) continue;
     const fee = Number(x?.fee ?? 0);
     const settledSwap = Number(x?.settledSwap ?? 0);
@@ -2195,7 +2209,51 @@ async function getTodayRealizedPnlJst() {
     closeCount += 1;
   }
 
-  return { dateJst: todayJst, pnl, closeCount, fetchedCount: rows.length };
+  return {
+    dateJst: todayJst,
+    pnl,
+    closeCount,
+    entryCount: openOrderIds.size,
+    fetchedCount: rows.length
+  };
+}
+
+function executionTimestampMs(x: any) {
+  const ms = Date.parse(String(x?.timestamp ?? ""));
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
+async function hasEntryExecutionForDecisionWindow(triggerCandleTime: number, side: string) {
+  const rows = await getLatestUsdJpyExecutions();
+
+  // triggerCandleTime は確定5分足の始値時刻。
+  // その足が確定した直後の5分間が、このシグナルの発注ウィンドウ。
+  const start = triggerCandleTime + 5 * 60 * 1000;
+  const end = start + 5 * 60 * 1000;
+
+  const matches = rows.filter((x: any) => {
+    const ts = executionTimestampMs(x);
+    return (
+      String(x?.settleType ?? "").toUpperCase() === "OPEN" &&
+      String(x?.side ?? "").toUpperCase() === side &&
+      ts >= start &&
+      ts < end
+    );
+  });
+
+  return {
+    duplicateFound: matches.length > 0,
+    decisionWindowStart: new Date(start).toISOString(),
+    decisionWindowEnd: new Date(end).toISOString(),
+    matches: matches.map((x: any) => ({
+      executionId: x?.executionId,
+      orderId: x?.orderId,
+      positionId: x?.positionId,
+      side: x?.side,
+      size: x?.size,
+      timestamp: x?.timestamp,
+    })),
+  };
 }
 
 async function getUsdJpyOpenPositionCount() {
@@ -2240,7 +2298,7 @@ async function runWinRateSafetyCycle() {
       console.log("[scheduler] daily loss stop", lastSchedulerResult);
       return;
     }
-if (daily.closeCount >= MAX_DAILY_TRADES) {
+if (daily.entryCount >= MAX_DAILY_TRADES) {
       lastSchedulerResult = { startedAt, action: "STOP_DAILY_TRADE_COUNT", daily };
       console.log("[scheduler] daily trade-count stop", lastSchedulerResult);
       return;
@@ -2285,7 +2343,10 @@ if (daily.closeCount >= MAX_DAILY_TRADES) {
     const orderResponse = await fetch(`${baseUrl}/gmo-order`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-ADMIN-TOKEN": adminToken },
-      body: JSON.stringify({ side: signal }),
+      body: JSON.stringify({
+        side: signal,
+        triggerCandleTime: Number(signalData?.triggerCandleTime),
+      }),
     });
     const orderData: any = await orderResponse.json();
     lastSchedulerResult = {
@@ -2311,9 +2372,10 @@ app.get("/gmo-daily-pnl", async (c) => {
       ...daily,
       dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
       maxDailyTrades: MAX_DAILY_TRADES,
+  dailyTradeCountBasis: "distinct OPEN orderId from GMO latestExecutions",
       tradingAllowed:
         daily.pnl > DAILY_LOSS_LIMIT_YEN &&
-        daily.closeCount < MAX_DAILY_TRADES
+        daily.entryCount < MAX_DAILY_TRADES
     });
   } catch (error: any) {
     return c.json({ error: String(error?.message ?? error) }, 500);
@@ -2396,6 +2458,43 @@ app.get("/system-audit", (c) => c.json({
   weekendMarketHoursGuard: true,
   ocoProtection: true
 }));
+
+app.get("/order-safety-audit", async (c) => {
+  try {
+    const daily = await getTodayRealizedPnlJst();
+    return c.json({
+      system: "Chagatto-2",
+      duplicateProtection: {
+        processMemoryGuard: true,
+        exchangeExecutionHistoryGuard: true,
+        survivesProcessRestart: true,
+        basis: "GMO latestExecutions OPEN executions in the same decision window",
+      },
+      signalConsistency: {
+        schedulerEndpoint: "/smart-signal",
+        orderRecheckEndpoint: "/smart-signal",
+        exactTriggerCandleRequired: true,
+      },
+      activeOrderGuard: true,
+      openPositionGuard: true,
+      dailyTradeCountBasis: "distinct OPEN orderId",
+      daily,
+      maxDailyTrades: MAX_DAILY_TRADES,
+      dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
+      fixedOrderSize: FIXED_ORDER_SIZE,
+      takeProfitPips: 20,
+      stopLossPips: 10,
+      weekendMarketHoursGuard: true,
+      note: "No order is sent by this endpoint."
+    });
+  } catch (error: any) {
+    return c.json({
+      system: "Chagatto-2",
+      error: String(error?.message ?? error),
+      orderSent: false
+    }, 500);
+  }
+});
 
 app.get("/scheduler-status", (c) => c.json({
   schedule: "continuous monitor; evaluate once after each completed 5-minute candle",
@@ -2811,6 +2910,19 @@ async function gmoPrivatePost(path: string, bodyObject: Record<string, unknown>)
   const apiKey = process.env.GMO_API_KEY;
   const apiSecret = process.env.GMO_API_SECRET;
   if (!apiKey || !apiSecret) throw new Error("GMO API keys are not set");
+  const decisionId = `USD_JPY:${side}:${requestedTriggerCandleTime}`;
+  console.log("[trade-audit] ENTRY_ATTEMPT", {
+    decisionId,
+    side,
+    triggerCandleTime: requestedTriggerCandleTime,
+    triggerCandleIso: new Date(requestedTriggerCandleTime).toISOString(),
+    orderSize,
+    takeProfitPips: 20,
+    stopLossPips: 10,
+    dailyEntryCount: orderDailyPnl.entryCount,
+    dailyPnl: orderDailyPnl.pnl,
+  });
+
   const timestamp = Date.now().toString();
   const method = "POST";
   const body = JSON.stringify(bodyObject);
@@ -3421,7 +3533,7 @@ app.post("/gmo-order", async (c) => {
       dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
     }, 409);
   }
-if (orderDailyPnl.closeCount >= MAX_DAILY_TRADES) {
+if (orderDailyPnl.entryCount >= MAX_DAILY_TRADES) {
     return c.json({
       orderSent: false,
       error: "MAX_DAILY_TRADES_REACHED",
@@ -3461,6 +3573,7 @@ try {
 
   const body = await c.req.json();
   const side = body.side;
+  const requestedTriggerCandleTime = Number(body?.triggerCandleTime);
 
   if (side !== "BUY" && side !== "SELL") {
     return c.json({
@@ -3468,7 +3581,38 @@ try {
       error: "side must be BUY or SELL",
     }, 400);
   }
-    // 安全装置4：すでに建玉がある場合は新規注文しない
+
+  if (!Number.isFinite(requestedTriggerCandleTime)) {
+    return c.json({
+      orderSent: false,
+      error: "TRIGGER_CANDLE_TIME_REQUIRED",
+    }, 400);
+  }
+  // 安全装置4：再起動後も有効な重複発注防止。
+  // メモリではなくGMOの実約定履歴を照合し、同じ5分足の発注を拒否する。
+  let duplicateGuard;
+  try {
+    duplicateGuard = await hasEntryExecutionForDecisionWindow(
+      requestedTriggerCandleTime,
+      side
+    );
+  } catch (error) {
+    return c.json({
+      orderSent: false,
+      error: "DUPLICATE_GUARD_CHECK_FAILED",
+      message: error instanceof Error ? error.message : String(error),
+    }, 503);
+  }
+
+  if (duplicateGuard.duplicateFound) {
+    return c.json({
+      orderSent: false,
+      error: "DUPLICATE_ENTRY_BLOCKED",
+      duplicateGuard,
+    }, 409);
+  }
+
+    // 安全装置5：すでに建玉がある場合は新規注文しない
   const positionTimestamp = Date.now().toString();
   const positionMethod = "GET";
   const positionPath = "/v1/openPositions";
@@ -3523,6 +3667,40 @@ try {
       positionCount: openPositions.length,
     }, 409);
   }
+// 安全装置6：通信不明・処理途中の注文が残っている場合は新規発注しない。
+// MARKET注文の結果が不明でも、アクティブ注文が残っている間は安全側に停止する。
+let activeOrderData: any;
+try {
+  activeOrderData = await gmoPrivateGet(
+    "/v1/activeOrders",
+    "?symbol=USD_JPY&count=100"
+  );
+} catch (error) {
+  return c.json({
+    orderSent: false,
+    error: "ACTIVE_ORDER_CHECK_FAILED",
+    message: error instanceof Error ? error.message : String(error),
+  }, 503);
+}
+
+const activeOrders = Array.isArray(activeOrderData?.data)
+  ? activeOrderData.data
+  : Array.isArray(activeOrderData?.data?.list)
+    ? activeOrderData.data.list
+    : [];
+
+const openActiveOrders = activeOrders.filter(
+  (x: any) => String(x?.settleType ?? "").toUpperCase() === "OPEN"
+);
+
+if (openActiveOrders.length > 0) {
+  return c.json({
+    orderSent: false,
+    error: "OPEN_ORDER_ALREADY_ACTIVE",
+    activeOrderCount: openActiveOrders.length,
+  }, 409);
+}
+
 // GMO FX口座の実際の取引余力を取得
 const assetTimestamp = Date.now().toString();
 const assetMethod = "GET";
@@ -3597,6 +3775,20 @@ if (
     orderSent: false,
     error: "NO_SMART_TRADE_SIGNAL",
     signal: currentSignal,
+  }, 409);
+}
+
+const currentTriggerCandleTime = Number(signalData?.triggerCandleTime);
+
+if (
+  !Number.isFinite(currentTriggerCandleTime) ||
+  currentTriggerCandleTime !== requestedTriggerCandleTime
+) {
+  return c.json({
+    orderSent: false,
+    error: "SIGNAL_CANDLE_CHANGED",
+    requestedTriggerCandleTime,
+    currentTriggerCandleTime,
   }, 409);
 }
 
