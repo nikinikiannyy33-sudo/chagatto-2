@@ -5066,6 +5066,117 @@ return c.json({
   action: "CHECK_ONLY",
 });
 });
+
+// Public market-data-only research. Never connects to GMO private/order endpoints.
+// The results are counterfactual and are NOT verified historical executions.
+app.get("/entry-quality-research", async (c) => {
+  try {
+    const [five, one] = await Promise.all([
+      fetchCompletedGmoCandles("5min", 3),
+      fetchCompletedGmoCandles("1hour", 10),
+    ]);
+    const pip = 0.01; // USD/JPY: one pip = 0.01 JPY
+    const duration = 5 * 60 * 1000;
+    const horizonBars = 12; // one hour; exits after horizon are not interpreted as wins/losses
+    const roundTripCostPips = 0.5; // research assumption, NOT the actual GMO spread
+    const results: any[] = [];
+    for (const adxMin of [10, 15, 20]) {
+      for (const requireCandleDirection of [true, false]) {
+        let signalCount = 0, wins = 0, losses = 0, unresolved = 0, ambiguous = 0;
+        let mfeSum = 0, maeSum = 0, evaluated = 0, netPips = 0;
+        let nextEligibleIndex = 20;
+        let blockedByAdx = 0, blockedByCandle = 0;
+        for (let i = 20; i + horizonBars + 1 < five.length; i++) {
+          if (i < nextEligibleIndex) continue;
+          const bar = five[i];
+          const closeAt = bar.time + duration;
+          // Avoid 1H lookahead: only fully completed 1H candles as of the 5M close.
+          const hour = one.filter((x) => x.time + 60 * 60 * 1000 <= closeAt);
+          if (hour.length < 35) continue;
+          const hClose = hour.map((x) => x.close);
+          const fast = sma(hClose, 7), slow = sma(hClose, 8);
+          const r = rsi(hClose, 14), a = adx(hour, 14);
+          if (fast === null || slow === null || r === null || a === null) continue;
+          const fClose = five.slice(0, i + 1).map((x) => x.close);
+          const f5 = sma(fClose, 5), f10 = sma(fClose, 10);
+          if (f5 === null || f10 === null) continue;
+          const buy = fast > slow && r >= 52 && r <= 72 && f5 > f10;
+          const sell = fast < slow && r >= 28 && r <= 48 && f5 < f10;
+          if (!buy && !sell) continue;
+          const side = buy ? "BUY" : "SELL";
+          if (a < adxMin) { blockedByAdx++; continue; }
+          if (requireCandleDirection && !(buy ? bar.close > bar.open : bar.close < bar.open)) {
+            blockedByCandle++; continue;
+          }
+          // Enter at the NEXT 5m candle open. BID prices only; spread not reconstructed.
+          const entry = five[i + 1].open;
+          signalCount++;
+          let maxFavorable = 0, maxAdverse = 0, exitIndex = i + horizonBars;
+          let outcome: "WIN" | "LOSS" | "AMBIGUOUS" | "UNRESOLVED" = "UNRESOLVED";
+          for (let j = i + 1; j <= i + horizonBars; j++) {
+            const x = five[j];
+            const favourable = buy ? (x.high - entry) / pip : (entry - x.low) / pip;
+            const adverse = buy ? (entry - x.low) / pip : (x.high - entry) / pip;
+            maxFavorable = Math.max(maxFavorable, favourable);
+            maxAdverse = Math.max(maxAdverse, adverse);
+            // Stop/TP using conservative roundtrip cost assumption and same-bar conflict policy.
+            const tp = favourable >= 20 + roundTripCostPips;
+            const sl = adverse >= 10 - roundTripCostPips;
+            if (tp || sl) {
+              outcome = tp && sl ? "AMBIGUOUS" : sl ? "LOSS" : "WIN";
+              exitIndex = j;
+              break;
+            }
+          }
+          evaluated++;
+          mfeSum += maxFavorable;
+          maeSum += maxAdverse;
+          if (outcome === "WIN") { wins++; netPips += 20; }
+          else if (outcome === "LOSS") { losses++; netPips -= 10; }
+          else if (outcome === "AMBIGUOUS") { ambiguous++; netPips -= 10; }
+          else { unresolved++; }
+          // one position at a time; no repeated signals while simulated position is active
+          nextEligibleIndex = exitIndex + 1;
+        }
+        const decided = wins + losses + ambiguous;
+        results.push({
+          adxMinimum: adxMin, require5mCandleDirection: requireCandleDirection,
+          signalCount, wins, losses, ambiguousTreatedAsLoss: ambiguous, unresolved,
+          decided, decidedWinRatePct: decided ? Number((100 * wins / decided).toFixed(2)) : null,
+          illustrativeNetPipsExcludingUnresolved: Number(netPips.toFixed(2)),
+          averageMfePips: evaluated ? Number((mfeSum / evaluated).toFixed(2)) : null,
+          averageMaePips: evaluated ? Number((maeSum / evaluated).toFixed(2)) : null,
+          blockedByAdx, blockedByCandle,
+        });
+      }
+    }
+    return c.json({
+      system: "Chagatto-2", researchOnly: true, orderSent: false,
+      gmoPrivateApiCalled: false, liveTradingParametersChanged: false,
+      source: "GMO Coin FX public BID candles",
+      candles5m: five.length, candles1h: one.length,
+      first5m: five.length ? new Date(five[0].time).toISOString() : null,
+      last5m: five.length ? new Date(five[five.length - 1].time).toISOString() : null,
+      assumptions: {
+        entry: "next 5m candle OPEN after confirmed signal; no lookahead",
+        tpPips: 20, slPips: 10, holdingWindow: "12 five-minute bars (1 hour)",
+        roundTripCostPips,
+        roundTripCostNote: "Assumed research cost, NOT a live spread measurement",
+        sameCandleTpSl: "counted as LOSS, intrabar sequence unknown",
+        unresolved: "reported separately, excluded from illustrative net pips",
+        protectiveOrders: "simulated, NOT evidence of live OCO functionality",
+        directionalLossGuard: "not simulated; counterfactual signal quality only",
+        marketHours: "public historical candles only; not a complete broker schedule simulation",
+        executionData: "no actual trades or account history used",
+        limitation: "Short sample, BID-only OHLC, no ASK prices, no real fills, no gaps/slippage modelling; do not use as proof of profitability",
+      },
+      comparisons: results,
+    });
+  } catch (e: any) {
+    return c.json({ researchOnly: true, orderSent: false, error: String(e?.message ?? e) }, 500);
+  }
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
