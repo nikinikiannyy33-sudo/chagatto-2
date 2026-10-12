@@ -2134,7 +2134,7 @@ async function buildWinRateFocusedSignal() {
 
   // Condition 4: ADX trend-strength filter
   const adx1h = adx(c1h, 14);
-  const adxPass = adx1h !== null && adx1h >= 15;
+  const adxPass = adx1h !== null && adx1h >= 10;
 
   // 5-minute entry timing (relaxed):
   // Do not require a brand-new SMA crossover.
@@ -2215,7 +2215,7 @@ async function buildWinRateFocusedSignal() {
       condition4_adx: {
         adx14: adx1h,
         pass: adxPass,
-        minimum: 15,
+        minimum: 10,
       },
       entry5m: {
         sma5: sma5Fast,
