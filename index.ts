@@ -5705,7 +5705,7 @@ async function readResearchArchive(interval:ArchiveInterval):Promise<ArchiveCand
   try {return validateArchive(JSON.parse(await researchFs.readFile(archiveFile(interval),"utf8")));}
   catch(err:any){if(err?.code==="ENOENT")return [];throw err;}
 }
-async function syncResearchArchive() {
+async function syncResearchArchive(onlyFiveMinute=false) {
   if (!archiveEnabled || researchArchiveBusy) return;
   researchArchiveBusy=true;
   researchArchiveLastAttempt=new Date().toISOString();
@@ -5713,7 +5713,7 @@ async function syncResearchArchive() {
     await researchFs.mkdir(archiveRoot,{recursive:true});
     // A volume must be attached to RESEARCH_ARCHIVE_DIR. A writable container
     // filesystem alone is NOT proof that data survives redeployment.
-    for(const interval of archiveIntervals){
+    for(const interval of (onlyFiveMinute ? ["5min"] as ArchiveInterval[] : archiveIntervals)){
       const old=await readResearchArchive(interval);
       const fetched=await fetchCompletedGmoCandles(interval,old.length===0?(interval==="5min"?15:30):(interval==="5min"?2:3));
       const merged=new Map<number,ArchiveCandle>();
@@ -5758,6 +5758,7 @@ if(archiveEnabled){
   // A single instance and persistent volume are required. Multiple replicas
   // need a DB or distributed lock before safe shared-file concurrent writes.
   void syncResearchArchive();
+  setInterval(()=>{void syncResearchArchive(true);},5*60*1000);
   setInterval(()=>{void syncResearchArchive();},6*60*60*1000);
 }
 
@@ -5805,8 +5806,8 @@ async function updateResearchOutcomes(){
     let changed=false;
     for(const row of rows){
       if(row.futureClose5m!==null||row.price===null)continue;
-      const target=Number(row.key)*300000+600000; // at least one complete 5m candle after recorded bucket
-      const candle=candles.find(x=>x.time>=target);
+      const target=Number(row.key)*300000+300000; // first full 5m candle opening after the signal bucket
+      const candle=candles.find(x=>x.time===target); // never skip missing intervals or use a much later bar
       if(!candle)continue;
       row.futureClose5m=candle.close;
       row.futureMovePips=row.side==="WAIT"?null:Number((((candle.close-row.price)*100)*(row.side==="SELL"?-1:1)).toFixed(3));
@@ -5826,9 +5827,11 @@ app.get("/research-signal-journal",async c=>{
       hypotheticalOnly:true,configured:true,signalCount:rows.length,
       buyCount:rows.filter(r=>r.side==="BUY").length,sellCount:rows.filter(r=>r.side==="SELL").length,
       waitCount:rows.filter(r=>r.side==="WAIT").length,evaluatedCount:evaluated.length,
+      pendingDirectionalCount:rows.filter(r=>r.side!=="WAIT"&&r.futureMovePips===null).length,
+      archiveLastSuccess:researchArchiveLastSuccess,archiveLastError:researchArchiveLastError,
       directionalAccuracyPct:evaluated.length?Number((100*wins/evaluated.length).toFixed(2)):null,
       sumHypotheticalPips:Number(evaluated.reduce((a,r)=>a+(r.futureMovePips??0),0).toFixed(3)),
-      lastSignals:rows.slice(-10).reverse(),note:"5-minute directional markout only, not trades, execution prices, realized P/L, spread-adjusted returns or validated win rate. Recorded signals only when scheduler reaches smart-signal."});
+      lastSignals:rows.slice(-10).reverse(),note:"Evaluates the next complete five-minute candle AFTER the signal bucket, once public BID-only archive has updated. WAIT has no directional score. Directional markout is not actual trading P/L, nor spread-adjusted returns or validated win rate."});
   }catch(e:any){return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
 });
 
