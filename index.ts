@@ -2136,6 +2136,7 @@ async function buildWinRateFocusedSignal() {
 
   // Condition 4: ADX trend-strength filter
   const adx1h = adx(c1h, 14);
+  const atr1hSnapshot = atr(c1h, 14);
   const adxPass = adx1h !== null && adx1h >= 10;
 
   // 5-minute entry timing (relaxed):
@@ -2214,6 +2215,7 @@ async function buildWinRateFocusedSignal() {
         buyPass: rsiBuy,
         sellPass: rsiSell,
       },
+      condition4_atr: { atr14: atr1hSnapshot },
       condition4_adx: {
         adx14: adx1h,
         pass: adxPass,
@@ -5764,7 +5766,7 @@ if(archiveEnabled){
 
 
 // Research-only prospective signal journal. No private trading or order calls.
-type SignalJournalRow = {key:string;recordedAt:string;side:"BUY"|"SELL"|"WAIT";price:number|null;action:string;futureClose5m:number|null;futureMovePips:number|null};
+type SignalJournalRow = {key:string;recordedAt:string;side:"BUY"|"SELL"|"WAIT";price:number|null;action:string;futureClose5m:number|null;futureMovePips:number|null;snapshot?:{rsi14:number|null;sma7:number|null;sma8:number|null;atr14:number|null;adx14:number|null;trend1h:string|null;triggerCandleIso:string|null}};
 const signalJournalFile=archiveEnabled?researchPath.join(archiveRoot,"signal-journal.json"):"";
 let signalJournalQueue:Promise<void>=Promise.resolve();
 async function readSignalJournal():Promise<SignalJournalRow[]>{
@@ -5781,6 +5783,7 @@ function journalEnqueue(task:()=>Promise<void>):Promise<void>{
   signalJournalQueue=result.catch(e=>{console.error("[signal-journal]",String(e));});
   return result;
 }
+function finiteSnapshot(value:any):number|null{if(value===null||value===undefined)return null;const n=Number(value);return Number.isFinite(n)?n:null;}
 async function recordResearchSignal(data:any,action:string){
   if(!archiveEnabled)return;
   await journalEnqueue(async()=>{
@@ -5794,7 +5797,14 @@ async function recordResearchSignal(data:any,action:string){
     const priceCandidate=Number(data?.price);
     rows.push({key,recordedAt:now.toISOString(),side:side as "BUY"|"SELL"|"WAIT",
       price:Number.isFinite(priceCandidate)&&priceCandidate>0?priceCandidate:null,
-      action,futureClose5m:null,futureMovePips:null});
+      action,futureClose5m:null,futureMovePips:null,
+      snapshot:{rsi14:finiteSnapshot(data?.filters?.condition3_rsi?.rsi14),
+        sma7:finiteSnapshot(data?.filters?.condition2_1hSma?.sma7),
+        sma8:finiteSnapshot(data?.filters?.condition2_1hSma?.sma8),
+        atr14:finiteSnapshot(data?.filters?.condition4_atr?.atr14),
+        adx14:finiteSnapshot(data?.filters?.condition4_adx?.adx14),
+        trend1h:typeof data?.filters?.condition2_1hSma?.direction==="string"?data.filters.condition2_1hSma.direction:null,
+        triggerCandleIso:typeof data?.triggerCandleIso==="string"?data.triggerCandleIso:null}});
     await writeSignalJournal(rows.slice(-20000));
   });
 }
@@ -5952,6 +5962,32 @@ app.get("/research-volume-verify", async (c) => {
   }catch(err:any){return c.json({researchOnly:true,orderSent:false,verified:false,status:"ERROR",error:String(err?.message??err)},500);}
 });
 
+// Diagnostic-only: captures indicator snapshots at signal time. No retroactive inference.
+app.get("/research-signal-indicators",async c=>{
+  if(!archiveEnabled)return c.json({researchOnly:true,orderSent:false,configured:false,status:"DISABLED"});
+  try{
+    await signalJournalQueue;
+    const rows=await readSignalJournal();
+    const captured=rows.filter(r=>r.snapshot && r.snapshot.rsi14!==null && r.snapshot.atr14!==null);
+    const bySide=(side:"BUY"|"SELL"|"WAIT")=>{
+      const subset=rows.filter(r=>r.side===side);
+      const withSnapshot=subset.filter(r=>r.snapshot && r.snapshot.rsi14!==null && r.snapshot.atr14!==null);
+      const evaluated=withSnapshot.filter(r=>r.futureMovePips!==null && side!=="WAIT");
+      return {signals:subset.length,withSnapshot:withSnapshot.length,evaluatedWithSnapshot:evaluated.length,
+        wins:evaluated.filter(r=>(r.futureMovePips??0)>0).length,
+        hypotheticalPips:Number(evaluated.reduce((a,r)=>a+(r.futureMovePips??0),0).toFixed(3))};
+    };
+    return c.json({system:"Chagatto-2 Prospective Indicator Snapshots",researchOnly:true,orderSent:false,
+      liveParametersChanged:false,privateTradingApiCalled:false,totalSignals:rows.length,snapshotsCaptured:captured.length,
+      historicalWithoutSnapshot:rows.length-rows.filter(r=>r.snapshot).length,
+      buy:bySide("BUY"),sell:bySide("SELL"),wait:bySide("WAIT"),
+      latestSnapshots:rows.filter(r=>r.snapshot).slice(-12).reverse().map(r=>({key:r.key,
+        recordedAt:r.recordedAt,side:r.side,price:r.price,snapshot:r.snapshot,
+        evaluated:r.futureMovePips!==null,futureMovePips:r.futureMovePips})),
+      note:"Frozen-at-signal 1H RSI14/SMA7/SMA8/ATR14/ADX14; no backfilling old rows. Research-only public candle BID markout; not actual trade P/L. New snapshots begin only after deployment and scheduler runs."});
+  }catch(e:any){return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
@@ -5960,3 +5996,5 @@ serve({
   port,
   hostname: "0.0.0.0",
 });
+
+
