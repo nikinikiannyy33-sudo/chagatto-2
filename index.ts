@@ -2490,6 +2490,7 @@ if (daily.entryCount >= MAX_DAILY_TRADES) {
     if (!signalResponse.ok) throw new Error(`smart-signal failed: ${JSON.stringify(signalData)}`);
 
     const signal = String(signalData?.signal ?? "WAIT");
+    await recordResearchSignal(signalData, "SCHEDULER_SIGNAL");
     if (signal !== "BUY" && signal !== "SELL") {
       lastSchedulerResult = { startedAt, action: "WAIT", daily, signalData };
       console.log("[scheduler] WAIT", lastSchedulerResult);
@@ -5725,6 +5726,7 @@ async function syncResearchArchive() {
         await researchFs.rename(temp,archiveFile(interval));
       }catch(err){await researchFs.rm(temp,{force:true}).catch(()=>{});throw err;}
     }
+    await updateResearchOutcomes();
     researchArchiveLastSuccess=new Date().toISOString();
     researchArchiveLastError=null;
   }catch(err:any){researchArchiveLastError=String(err?.message??err).slice(0,500);}
@@ -5758,6 +5760,77 @@ if(archiveEnabled){
   void syncResearchArchive();
   setInterval(()=>{void syncResearchArchive();},6*60*60*1000);
 }
+
+
+// Research-only prospective signal journal. No private trading or order calls.
+type SignalJournalRow = {key:string;recordedAt:string;side:"BUY"|"SELL"|"WAIT";price:number|null;action:string;futureClose5m:number|null;futureMovePips:number|null};
+const signalJournalFile=archiveEnabled?researchPath.join(archiveRoot,"signal-journal.json"):"";
+let signalJournalQueue:Promise<void>=Promise.resolve();
+async function readSignalJournal():Promise<SignalJournalRow[]>{
+  try {const rows=JSON.parse(await researchFs.readFile(signalJournalFile,"utf8"));if(!Array.isArray(rows))throw new Error("Invalid journal");return rows;}
+  catch(e:any){if(e?.code==="ENOENT")return [];throw e;}
+}
+async function writeSignalJournal(rows:SignalJournalRow[]){
+  const temp=signalJournalFile+"."+crypto.randomUUID()+".tmp";
+  try{await researchFs.writeFile(temp,JSON.stringify(rows),{mode:0o600});await researchFs.rename(temp,signalJournalFile);}
+  finally{await researchFs.rm(temp,{force:true}).catch(()=>{});}
+}
+function journalEnqueue(task:()=>Promise<void>):Promise<void>{
+  const result=signalJournalQueue.then(task);
+  signalJournalQueue=result.catch(e=>{console.error("[signal-journal]",String(e));});
+  return result;
+}
+async function recordResearchSignal(data:any,action:string){
+  if(!archiveEnabled)return;
+  await journalEnqueue(async()=>{
+    await researchFs.mkdir(archiveRoot,{recursive:true});
+    const side=String(data?.signal??"WAIT");
+    if(!["BUY","SELL","WAIT"].includes(side))return;
+    const now=new Date();
+    const key=String(Math.floor(now.getTime()/300000));
+    const rows=await readSignalJournal();
+    if(rows.some(r=>r.key===key))return;
+    const priceCandidate=Number(data?.price);
+    rows.push({key,recordedAt:now.toISOString(),side:side as "BUY"|"SELL"|"WAIT",
+      price:Number.isFinite(priceCandidate)&&priceCandidate>0?priceCandidate:null,
+      action,futureClose5m:null,futureMovePips:null});
+    await writeSignalJournal(rows.slice(-20000));
+  });
+}
+async function updateResearchOutcomes(){
+  if(!archiveEnabled)return;
+  await journalEnqueue(async()=>{
+    const rows=await readSignalJournal();
+    const candles=await readResearchArchive("5min");
+    let changed=false;
+    for(const row of rows){
+      if(row.futureClose5m!==null||row.price===null)continue;
+      const target=Number(row.key)*300000+600000; // at least one complete 5m candle after recorded bucket
+      const candle=candles.find(x=>x.time>=target);
+      if(!candle)continue;
+      row.futureClose5m=candle.close;
+      row.futureMovePips=row.side==="WAIT"?null:Number((((candle.close-row.price)*100)*(row.side==="SELL"?-1:1)).toFixed(3));
+      changed=true;
+    }
+    if(changed)await writeSignalJournal(rows);
+  });
+}
+app.get("/research-signal-journal",async c=>{
+  if(!archiveEnabled)return c.json({researchOnly:true,orderSent:false,configured:false,status:"DISABLED"});
+  try{
+    await signalJournalQueue;
+    const rows=await readSignalJournal();
+    const evaluated=rows.filter(r=>r.side!=="WAIT"&&r.futureMovePips!==null);
+    const wins=evaluated.filter(r=>(r.futureMovePips??0)>0).length;
+    return c.json({system:"Chagatto-2 Prospective Signal Journal",researchOnly:true,orderSent:false,
+      hypotheticalOnly:true,configured:true,signalCount:rows.length,
+      buyCount:rows.filter(r=>r.side==="BUY").length,sellCount:rows.filter(r=>r.side==="SELL").length,
+      waitCount:rows.filter(r=>r.side==="WAIT").length,evaluatedCount:evaluated.length,
+      directionalAccuracyPct:evaluated.length?Number((100*wins/evaluated.length).toFixed(2)):null,
+      sumHypotheticalPips:Number(evaluated.reduce((a,r)=>a+(r.futureMovePips??0),0).toFixed(3)),
+      lastSignals:rows.slice(-10).reverse(),note:"5-minute directional markout only, not trades, execution prices, realized P/L, spread-adjusted returns or validated win rate. Recorded signals only when scheduler reaches smart-signal."});
+  }catch(e:any){return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
+});
 
 const archiveProcessBootId = crypto.randomUUID();
 
