@@ -5835,6 +5835,42 @@ app.get("/research-signal-journal",async c=>{
   }catch(e:any){return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
 });
 
+// Read-only diagnostic of the prospective record. Does not place or modify orders.
+app.get("/research-signal-diagnostic",async c=>{
+  if(!archiveEnabled)return c.json({researchOnly:true,orderSent:false,configured:false,status:"DISABLED"});
+  try{
+    await signalJournalQueue;
+    const rows=await readSignalJournal();
+    const summarizeSide=(side:"BUY"|"SELL")=>{
+      const subset=rows.filter(r=>r.side===side);
+      const evaluated=subset.filter(r=>r.futureMovePips!==null);
+      const wins=evaluated.filter(r=>(r.futureMovePips??0)>0).length;
+      const losses=evaluated.filter(r=>(r.futureMovePips??0)<0).length;
+      const flat=evaluated.length-wins-losses;
+      const total=evaluated.reduce((sum,r)=>sum+(r.futureMovePips??0),0);
+      return {signals:subset.length,evaluated:evaluated.length,pending:subset.length-evaluated.length,
+        wins,losses,flat,directionalAccuracyPct:evaluated.length?Number((wins/evaluated.length*100).toFixed(2)):null,
+        sumHypotheticalPips:Number(total.toFixed(3)),averageHypotheticalPips:evaluated.length?Number((total/evaluated.length).toFixed(3)):null};
+    };
+    const buy=summarizeSide("BUY"),sell=summarizeSide("SELL");
+    const outcomes=rows.filter(r=>r.side!=="WAIT"&&r.futureMovePips!==null);
+    const archive=await readResearchArchive("5min");
+    const pending=rows.filter(r=>r.side!=="WAIT"&&r.futureMovePips===null);
+    const latestArchiveCandle=archive.length?archive[archive.length-1]:null;
+    return c.json({system:"Chagatto-2 Prospective Direction Diagnostic",researchOnly:true,orderSent:false,
+      liveParametersChanged:false,privateTradingApiCalled:false,source:"GMO public BID-only completed 5min OHLC",
+      totalSignals:rows.length,waitSignals:rows.filter(r=>r.side==="WAIT").length,
+      buy,sell,combined:{evaluated:outcomes.length,pending:pending.length,
+        directionalAccuracyPct:outcomes.length?Number((outcomes.filter(r=>(r.futureMovePips??0)>0).length/outcomes.length*100).toFixed(2)):null,
+        sumHypotheticalPips:Number(outcomes.reduce((a,r)=>a+(r.futureMovePips??0),0).toFixed(3))},
+      archive:{candleCount:archive.length,latestCompleted5mCandle:latestArchiveCandle?new Date(latestArchiveCandle.time).toISOString():null,
+        lastSyncSuccess:researchArchiveLastSuccess,lastSyncError:researchArchiveLastError},
+      pendingSamples:pending.slice(-5).map(r=>({key:r.key,side:r.side,recordedAt:r.recordedAt,
+        targetCandleOpening:new Date(Number(r.key)*300000+300000).toISOString()})),
+      note:"Research-only 5-minute directional markout, not executed trades or net return. BUY/SELL may overlap; no spread, ASK, slippage, fees, or stop fills. A small sample and repeated observations do not establish strategy profitability."});
+  }catch(e:any){return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
+});
+
 const archiveProcessBootId = crypto.randomUUID();
 
 // Research-only persistent-volume probe. Does not expose archive contents or secrets.
