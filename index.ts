@@ -5288,6 +5288,115 @@ app.get("/winrate-candidate-validation", async (c) => {
   } catch(e:any) {return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
 });
 
+
+// READ-ONLY: identical entry cohort, different exit policies.
+// Important: this compares counterfactual exit rules only, not historical execution.
+app.get("/historical-exit-comparison", async (c) => {
+  try {
+    const [five, hours] = await Promise.all([
+      fetchCompletedGmoCandles("5min", 15),
+      fetchCompletedGmoCandles("1hour", 30),
+    ]);
+    const fiveMs = 300000, oneMs = 3600000, pip = 0.01;
+    const cost = 0.5; // assumption, not actual GMO spread
+    const maxBars = 288; // 24 hours; do not label insufficient forward bars as losers
+    type Entry = {index:number;time:number;side:"BUY"|"SELL";price:number;atrPips:number};
+    const entries: Entry[] = [];
+    let completedHours = 0;
+    for (let i=34; i+1<five.length; i++) {
+      const bar=five[i]; const decisionTime=bar.time+fiveMs;
+      while(completedHours<hours.length && hours[completedHours].time+oneMs<=decisionTime) completedHours++;
+      if (completedHours<40) continue;
+      const h=hours.slice(0,completedHours), hc=h.map(x=>x.close);
+      const fc=five.slice(i-34,i+1).map(x=>x.close);
+      const f=sma(hc,7), sl=sma(hc,8), rr=rsi(hc,14), aa=adx(h,14);
+      const m5=sma(fc,5), m10=sma(fc,10), at=atr(h,14);
+      if ([f,sl,rr,aa,m5,m10,at].some(x=>x===null)) continue;
+      const buy=f!>sl! && rr!>=52 && rr!<=72 && aa!>=10 && m5!>m10! && bar.close>bar.open;
+      const sell=f!<sl! && rr!>=28 && rr!<=48 && aa!>=10 && m5!<m10! && bar.close<bar.open;
+      if (!buy&&!sell) continue;
+      entries.push({index:i+1,time:five[i+1].time,side:buy?"BUY":"SELL",
+        price:five[i+1].open,atrPips:at!/pip});
+    }
+    const schemes=[
+      {id:"FIXED_TP20_SL10",tp:20,sl:10},
+      {id:"FIXED_TP10_SL10",tp:10,sl:10},
+      {id:"ATR_1R_TP_2R",tp:0,sl:0},
+      {id:"NEXT_COMPLETED_1H_CLOSE",tp:0,sl:0},
+    ];
+    type Outcome = {entryTime:number;side:string;result:"WIN"|"LOSS"|"AMBIGUOUS"|"INSUFFICIENT_DATA";
+      netPips:number|null;exitTime:number|null;holdingBars:number|null;};
+    function evaluate(e:Entry, scheme:typeof schemes[number]):Outcome {
+      const base={entryTime:e.time,side:e.side};
+      if (scheme.id==="NEXT_COMPLETED_1H_CLOSE") {
+        const hour=hours.find(x=>x.time+oneMs>e.time && x.time+oneMs<=five[five.length-1].time+fiveMs);
+        if (!hour) return {...base,result:"INSUFFICIENT_DATA",netPips:null,exitTime:null,holdingBars:null};
+        const diff=(e.side==="BUY"?hour.close-e.price:e.price-hour.close)/pip-cost;
+        return {...base,result:diff>0?"WIN":"LOSS",netPips:diff,exitTime:hour.time+oneMs,holdingBars:Math.ceil((hour.time+oneMs-e.time)/fiveMs)};
+      }
+      const sl=scheme.id==="ATR_1R_TP_2R"?Math.max(5,e.atrPips):scheme.sl;
+      const tp=scheme.id==="ATR_1R_TP_2R"?2*sl:scheme.tp;
+      const end=e.index+maxBars-1;
+      if(end>=five.length) return {...base,result:"INSUFFICIENT_DATA",netPips:null,exitTime:null,holdingBars:null};
+      for(let j=e.index;j<=end;j++) {
+        const x=five[j];
+        const favorable=(e.side==="BUY"?x.high-e.price:e.price-x.low)/pip;
+        const adverse=(e.side==="BUY"?e.price-x.low:x.high-e.price)/pip;
+        const hitTP=favorable>=tp+cost/2,hitSL=adverse>=sl-cost/2;
+        if(hitTP||hitSL) {
+          const collision=hitTP&&hitSL;
+          return {...base,result:collision?"AMBIGUOUS":hitSL?"LOSS":"WIN",
+            netPips:collision||hitSL?-sl-cost:tp-cost,exitTime:x.time+fiveMs,holdingBars:j-e.index+1};
+        }
+      }
+      // Fully observed horizon, forced market-price exit (not an unresolved win/loss).
+      const last=five[end];
+      const diff=(e.side==="BUY"?last.close-e.price:e.price-last.close)/pip-cost;
+      return {...base,result:diff>0?"WIN":"LOSS",netPips:diff,exitTime:last.time+fiveMs,holdingBars:maxBars};
+    }
+    const cutoff=five.length?five[Math.floor(five.length*0.7)].time:0;
+    const stats=(list:Outcome[])=>{
+      const known=list.filter(x=>x.netPips!==null);
+      const wins=known.filter(x=>x.netPips!>0).length;
+      const losses=known.filter(x=>x.netPips!<=0).length;
+      const ambiguous=known.filter(x=>x.result==="AMBIGUOUS").length;
+      const net=known.reduce((v,x)=>v+x.netPips!,0);
+      return {signals:list.length,evaluable:known.length,insufficientData:list.length-known.length,
+        wins,losses,ambiguousConservativelyScoredAsLoss:ambiguous,
+        winRatePct:known.length?Number((100*wins/known.length).toFixed(2)):null,
+        totalNetPips:known.length?Number(net.toFixed(2)):null,
+        averageNetPips:known.length?Number((net/known.length).toFixed(3)):null};
+    };
+    const comparisons=schemes.map(scheme=>{
+      const outcomes=entries.map(e=>evaluate(e,scheme));
+      return {scheme:scheme.id,overall:stats(outcomes),
+        buy:stats(outcomes.filter(x=>x.side==="BUY")),
+        sell:stats(outcomes.filter(x=>x.side==="SELL")),
+        earlier70pct:stats(outcomes.filter(x=>x.entryTime<cutoff)),
+        later30pct:stats(outcomes.filter(x=>x.entryTime>=cutoff))};
+    });
+    return c.json({system:"Chagatto-2",researchOnly:true,orderSent:false,
+      gmoPrivateApiCalled:false,liveParametersChanged:false,
+      source:"GMO public BID-only 5m/1h OHLC",candles5m:five.length,candles1h:hours.length,
+      first5m:five.length?new Date(five[0].time).toISOString():null,
+      last5m:five.length?new Date(five[five.length-1].time).toISOString():null,
+      entryCount:entries.length,assumptions:{
+        entry:"SAME base entry candidates across all exit policies; next confirmed 5m bar opening",
+        baseSignal:"1H SMA7/8, RSI52-72/28-48, ADX>=10, 5m SMA5/10 and candle direction",
+        roundTripCostPips:cost,costIsAssumption:true,
+        stopAndTarget:"Same-bar target/stop collision counted as LOSS",
+        fixedExits:"TP/SL exits within 24h; otherwise exit on 24h close",
+        atrExit:"1H ATR14 as known at signal; stop=max(5pips, ATR in pips), TP=2x stop",
+        nextHour:"Close of next completed 1h bar strictly after entry",
+        comparisonMethod:"Overlapping entry signals are evaluated independently: NOT a one-position-only portfolio backtest",
+        sampleAndFills:"Limited historical BID-only candles; no ASK, true spread, live executions, stop gaps, 3-loss guard or full market-hours rules",
+        earlierHighWinRate:"Cannot establish which prior 50-70% strategy produced that number without original strategy report",
+      },comparisons});
+  } catch(e:any) {
+    return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);
+  }
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
