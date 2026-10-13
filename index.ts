@@ -5759,6 +5759,43 @@ if(archiveEnabled){
   setInterval(()=>{void syncResearchArchive();},6*60*60*1000);
 }
 
+const archiveProcessBootId = crypto.randomUUID();
+
+// Research-only persistent-volume probe. Does not expose archive contents or secrets.
+const archiveProbeFile = archiveEnabled ? researchPath.join(archiveRoot, ".volume-persistence-probe.json") : "";
+app.get("/research-volume-verify", async (c) => {
+  if (!archiveEnabled) return c.json({researchOnly:true,orderSent:false,configured:false,verified:false,status:"DISABLED"});
+  try {
+    await researchFs.mkdir(archiveRoot,{recursive:true});
+    const mountInfo = await researchFs.readFile("/proc/self/mountinfo","utf8").catch(()=>"");
+    const hasDataMount = mountInfo.split("\n").some(line => {
+      const fields=line.split(" ");
+      const at=fields.indexOf("-");
+      const mountPoint=fields[4]?.replace(/\\040/g," ");
+      return at>0 && (mountPoint==="/data" || mountPoint===archiveRoot);
+    });
+    let marker:{id:string;createdAt:string;firstBootId:string};
+    let existed=true;
+    try {
+      const raw=JSON.parse(await researchFs.readFile(archiveProbeFile,"utf8"));
+      if(typeof raw?.id!=="string" || typeof raw?.createdAt!=="string" || typeof raw?.firstBootId!=="string") throw new Error("Invalid probe");
+      marker=raw;
+    } catch(err:any) {
+      if(err?.code!=="ENOENT") throw err;
+      existed=false;
+      marker={id:crypto.randomUUID(),createdAt:new Date().toISOString(),firstBootId:archiveProcessBootId};
+      await researchFs.writeFile(archiveProbeFile,JSON.stringify(marker),{flag:"wx",mode:0o600});
+    }
+    const survivesProcessRestart=existed && marker.firstBootId!==archiveProcessBootId;
+    return c.json({system:"Chagatto-2 Volume Persistence Probe",researchOnly:true,orderSent:false,
+      configured:true,volumeMountDetected:hasDataMount,markerExists:existed,
+      survivesProcessRestart,verified:hasDataMount && survivesProcessRestart,
+      status:!hasDataMount?"MOUNT_NOT_DETECTED":survivesProcessRestart?"VERIFIED_AFTER_RESTART":"AWAITING_RESTART",
+      markerCreatedAt:marker.createdAt,
+      note:"Call once, redeploy without wiping volume, then call again. Do not use Wipe/Delete Volume."});
+  }catch(err:any){return c.json({researchOnly:true,orderSent:false,verified:false,status:"ERROR",error:String(err?.message??err)},500);}
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
