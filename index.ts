@@ -5177,6 +5177,117 @@ app.get("/entry-quality-research", async (c) => {
   }
 });
 
+
+// Research-only comparison. It never calls private order APIs and cannot place orders.
+app.get("/winrate-candidate-validation", async (c) => {
+  try {
+    const [five, hours] = await Promise.all([
+      fetchCompletedGmoCandles("5min", 15),
+      fetchCompletedGmoCandles("1hour", 30),
+    ]);
+    const pip = 0.01, barMs = 300000, hourMs = 3600000;
+    type Side = "BUY" | "SELL";
+    const modes = ["CURRENT", "SELECTIVE_PULLBACK"] as const;
+    const horizons = [12, 36, 72, 144, 288];
+    const costPips = 0.5; // illustration only: BID-only candles cannot reproduce real fills
+    const result: any[] = [];
+    // Closed bar only. Both strategies enter on the next 5-minute opening.
+    for (const mode of modes) {
+      for (const horizon of horizons) {
+        let nextEligible = 0;
+        const trades: any[] = [];
+        let candidates = 0;
+        let prevHourIndex = 0;
+        for (let i = 35; i + horizon + 1 < five.length; i++) {
+          if (i < nextEligible) continue;
+          const signalBar = five[i];
+          const decisionTime = signalBar.time + barMs;
+          while (prevHourIndex < hours.length && hours[prevHourIndex].time + hourMs <= decisionTime) prevHourIndex++;
+          const h = hours.slice(0, prevHourIndex);
+          if (h.length < 40) continue;
+          const closesH = h.map((x) => x.close);
+          const closes5 = five.slice(i - 34, i + 1).map((x) => x.close);
+          const fast7 = sma(closesH, 7), slow8 = sma(closesH, 8);
+          const slow21 = sma(closesH, 21);
+          const sma5 = sma(closes5, 5), sma10 = sma(closes5, 10);
+          const r = rsi(closesH, 14), a = adx(h, 14);
+          if ([fast7,slow8,slow21,sma5,sma10,r,a].some(x => x === null)) continue;
+          const buyBase = fast7! > slow8! && r! >= 52 && r! <= 72 && a! >= 10 && sma5! > sma10! && signalBar.close > signalBar.open;
+          const sellBase = fast7! < slow8! && r! >= 28 && r! <= 48 && a! >= 10 && sma5! < sma10! && signalBar.close < signalBar.open;
+          const hPrev = h.slice(0,-1).map((x)=>x.close);
+          const prev21 = sma(hPrev,21);
+          const prev5 = five[i-1];
+          // Hypothesis: avoid chasing an extension; require a pullback in prior candle
+          // followed by a directional 5m recovery; more separated and sloped 1H averages.
+          const buySelective =
+             fast7! > slow21! && slow21! > (prev21 ?? Infinity) &&
+             a! >= 15 && r! >= 52 && r! <= 68 &&
+             sma5! > sma10! && prev5.close <= prev5.open &&
+             signalBar.close > signalBar.open && signalBar.close > prev5.high;
+          const sellSelective =
+             fast7! < slow21! && slow21! < (prev21 ?? -Infinity) &&
+             a! >= 15 && r! >= 32 && r! <= 48 &&
+             sma5! < sma10! && prev5.close >= prev5.open &&
+             signalBar.close < signalBar.open && signalBar.close < prev5.low;
+          const buy = mode === "CURRENT" ? buyBase : buySelective;
+          const sell = mode === "CURRENT" ? sellBase : sellSelective;
+          if (!buy && !sell) continue;
+          candidates++;
+          const side: Side = buy ? "BUY" : "SELL";
+          const entry = five[i+1].open;
+          let mfe = 0, mae = 0, outcome = "UNRESOLVED", exitIndex = i + horizon;
+          for (let j = i+1; j <= i+horizon; j++) {
+            const x = five[j];
+            const favorable = buy ? (x.high-entry)/pip : (entry-x.low)/pip;
+            const adverse = buy ? (entry-x.low)/pip : (x.high-entry)/pip;
+            mfe = Math.max(mfe,favorable); mae = Math.max(mae,adverse);
+            const tp = favorable >= 20 + costPips;
+            const sl = adverse >= 10 - costPips;
+            if (tp || sl) {
+              outcome = tp && sl ? "AMBIGUOUS" : sl ? "LOSS" : "WIN";
+              exitIndex = j; break;
+            }
+          }
+          // Exclude overlapping simulated positions. Unresolved is NOT a loss.
+          nextEligible = exitIndex + 1;
+          trades.push({side,outcome,mfe,mae,signalTime:signalBar.time});
+        }
+        const partition = (list: any[]) => {
+          const wins = list.filter(t=>t.outcome==="WIN").length;
+          const losses = list.filter(t=>t.outcome==="LOSS").length;
+          const ambiguous = list.filter(t=>t.outcome==="AMBIGUOUS").length;
+          const unresolved = list.filter(t=>t.outcome==="UNRESOLVED").length;
+          const decided = wins+losses+ambiguous;
+          return {trades:list.length,wins,losses,ambiguous,unresolved,
+            decided,decidedWinRatePct:decided?Number((100*wins/decided).toFixed(2)):null,
+            mfePips:list.length?Number((list.reduce((a,t)=>a+t.mfe,0)/list.length).toFixed(2)):null,
+            maePips:list.length?Number((list.reduce((a,t)=>a+t.mae,0)/list.length).toFixed(2)):null};
+        };
+        const cut = five.length ? five[Math.floor(five.length*0.7)].time : Infinity;
+        result.push({mode,horizonHours:horizon/12,candidates,
+          overall:partition(trades),
+          buy:partition(trades.filter(t=>t.side==="BUY")),
+          sell:partition(trades.filter(t=>t.side==="SELL")),
+          earlier70pct:partition(trades.filter(t=>t.signalTime<cut)),
+          later30pct:partition(trades.filter(t=>t.signalTime>=cut))});
+      }
+    }
+    return c.json({system:"Chagatto-2",researchOnly:true,liveParametersChanged:false,
+      orderSent:false,gmoPrivateApiCalled:false,
+      source:"GMO public BID-only OHLC",candles5m:five.length,candles1h:hours.length,
+      first5m:five.length?new Date(five[0].time).toISOString():null,
+      last5m:five.length?new Date(five[five.length-1].time).toISOString():null,
+      assumptions:{entry:"next completed 5m bar opening",tpPips:20,slPips:10,
+        estimatedRoundTripCostPips:costPips,
+        note:"Not actual GMO spread or slippage; no ASK; not a live-order simulation.",
+        collision:"same bar TP and SL = AMBIGUOUS, conservatively counted against wins",
+        unresolved:"not counted as win or loss; timed exit not included",
+        experimental:"SELECTIVE_PULLBACK is an unvalidated hypothesis, NOT a recommended live setting",
+        limits:"Historical candles only; no actual order history, weekend handling, directional three-loss guard, or broker fills."},
+      comparisons:result});
+  } catch(e:any) {return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
