@@ -1,6 +1,8 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import crypto from "node:crypto";
+import * as researchFs from "node:fs/promises";
+import * as researchPath from "node:path";
 const app = new Hono();
 
 function sma(values: number[], period: number) {
@@ -5676,6 +5678,86 @@ app.get("/direction-regime-diagnostic", async (c) => {
     return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);
   }
 });
+
+
+
+// Research-only archival feed. Requires an explicitly mounted persistent Railway Volume.
+// No private trading API or order functions are called in this module.
+const archiveRoot = (process.env.RESEARCH_ARCHIVE_DIR || "").trim();
+const archiveEnabled = archiveRoot.startsWith("/") && archiveRoot !== "/";
+const archiveIntervals = ["5min", "1hour"] as const;
+type ArchiveInterval = typeof archiveIntervals[number];
+type ArchiveCandle = {time:number;open:number;high:number;low:number;close:number};
+let researchArchiveBusy = false;
+let researchArchiveLastAttempt: string | null = null;
+let researchArchiveLastSuccess: string | null = null;
+let researchArchiveLastError: string | null = null;
+const archiveFile=(interval: ArchiveInterval)=>researchPath.join(archiveRoot,`USD_JPY_BID_${interval}.json`);
+const validateArchive=(records:unknown): ArchiveCandle[] => {
+  if (!Array.isArray(records)) throw new Error("Archive format is not an array");
+  return records.filter((v:any)=>v && Number.isFinite(v.time) &&
+    Number.isFinite(v.open) && Number.isFinite(v.high) &&
+    Number.isFinite(v.low) && Number.isFinite(v.close) &&
+    v.time >= Date.parse("2026-10-01T00:00:00Z"));
+};
+async function readResearchArchive(interval:ArchiveInterval):Promise<ArchiveCandle[]> {
+  try {return validateArchive(JSON.parse(await researchFs.readFile(archiveFile(interval),"utf8")));}
+  catch(err:any){if(err?.code==="ENOENT")return [];throw err;}
+}
+async function syncResearchArchive() {
+  if (!archiveEnabled || researchArchiveBusy) return;
+  researchArchiveBusy=true;
+  researchArchiveLastAttempt=new Date().toISOString();
+  try {
+    await researchFs.mkdir(archiveRoot,{recursive:true});
+    // A volume must be attached to RESEARCH_ARCHIVE_DIR. A writable container
+    // filesystem alone is NOT proof that data survives redeployment.
+    for(const interval of archiveIntervals){
+      const old=await readResearchArchive(interval);
+      const fetched=await fetchCompletedGmoCandles(interval,old.length===0?(interval==="5min"?15:30):(interval==="5min"?2:3));
+      const merged=new Map<number,ArchiveCandle>();
+      for(const x of old)merged.set(x.time,x);
+      for(const x of fetched)merged.set(x.time,x);
+      const out=Array.from(merged.values()).sort((a,b)=>a.time-b.time);
+      const temp=`${archiveFile(interval)}.${process.pid}.tmp`;
+      try{
+        await researchFs.writeFile(temp,JSON.stringify(out),{encoding:"utf8",flag:"w"});
+        await researchFs.rename(temp,archiveFile(interval));
+      }catch(err){await researchFs.rm(temp,{force:true}).catch(()=>{});throw err;}
+    }
+    researchArchiveLastSuccess=new Date().toISOString();
+    researchArchiveLastError=null;
+  }catch(err:any){researchArchiveLastError=String(err?.message??err).slice(0,500);}
+  finally{researchArchiveBusy=false;}
+}
+app.get("/research-archive-status",async (c)=>{
+  if(!archiveEnabled)return c.json({system:"Chagatto-2 Research Archive",researchOnly:true,
+    orderSent:false,configured:false,persistentStorageVerified:false,
+    status:"DISABLED",nextStep:"Mount Railway Volume at /data and set RESEARCH_ARCHIVE_DIR=/data/research"});
+  try{
+    const details=[];
+    for(const interval of archiveIntervals){
+      const a=await readResearchArchive(interval);
+      details.push({interval,candleCount:a.length,first:a.length?new Date(a[0].time).toISOString():null,
+        last:a.length?new Date(a[a.length-1].time).toISOString():null});
+    }
+    return c.json({system:"Chagatto-2 Research Archive",researchOnly:true,orderSent:false,
+      configured:true,persistentStorageVerified:false,
+      note:"A writable filesystem cannot prove a Railway Volume is attached; confirm /data volume in Railway settings and confirm data after redeploy",
+      status:researchArchiveLastError?"ERROR":researchArchiveBusy?"SYNCING":researchArchiveLastSuccess?"COLLECTING":"NOT_YET_SYNCED",
+      lastAttempt:researchArchiveLastAttempt,lastSuccess:researchArchiveLastSuccess,
+      lastError:researchArchiveLastError,collectionIntervalHours:6,
+      rawCandlesArchived:true,tradeMetricsAccumulated:false,
+      note2:"Archiving completed public OHLC candles, NOT actual trades; current prospective-filter-check still uses the rolling source and is not cumulative",
+      intervals:details});
+  }catch(err:any){return c.json({researchOnly:true,orderSent:false,status:"READ_ERROR",error:String(err?.message??err)},500);}
+});
+if(archiveEnabled){
+  // A single instance and persistent volume are required. Multiple replicas
+  // need a DB or distributed lock before safe shared-file concurrent writes.
+  void syncResearchArchive();
+  setInterval(()=>{void syncResearchArchive();},6*60*60*1000);
+}
 
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
