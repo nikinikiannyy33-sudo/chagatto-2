@@ -6045,6 +6045,35 @@ app.get("/research-indicator-dashboard",async c=>{
   }catch(e:any){return c.html(`<h1>診断表示エラー</h1><pre>${String(e?.message??e).replace(/[&<>]/g,"")}</pre>`,500);}
 });
 
+// Read-only pre-live status. This is a static code audit, NOT a live broker validation.
+app.get("/prelive-safety-audit", (c) => c.json({
+  system: "Chagatto-2 Pre-Live Safety Audit",
+  auditType: "SOURCE_INSPECTION_ONLY",
+  liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+  researchOnly: true,
+  orderSent: false,
+  checks: {
+    liveGatePresent: true,
+    dailyLossGatePresent: true,
+    maxDailyTradesGatePresent: true,
+    duplicateExecutionGuardPresent: true,
+    openPositionGuardPresent: true,
+    openOrderGuardPresent: true,
+    executionUnknownSafetyHaltPresent: true,
+    partialFillRemainderGuardPresent: true,
+    stopReconciliationPresent: true,
+    emergencyCloseAttemptPresent: true
+  },
+  blockers: [
+    "SAFETY_HALT_IN_PROCESS_MEMORY_NOT_DURABLE_ON_RESTART",
+    "UNKNOWN_MARKET_ORDER_RESULT_REQUIRES_RECOVERY_AND_PROTECTION_AUDIT",
+    "STOP_AND_EMERGENCY_CLOSE_NOT_END_TO_END_TESTED_WITH_BROKER",
+    "BROKER_SPREAD_SLIPPAGE_COSTS_AND_STRATEGY_EDGE_NOT_VALIDATED"
+  ],
+  outcome: "NOT_APPROVED_FOR_LIVE_TRADING",
+  note: "Read-only status. Do not enable LIVE_TRADING_ENABLED based on this endpoint."
+}));
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
