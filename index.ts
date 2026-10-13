@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import crypto from "node:crypto";
 import * as researchFs from "node:fs/promises";
+import * as durableFs from "node:fs";
 import * as researchPath from "node:path";
 const app = new Hono();
 
@@ -2255,8 +2256,80 @@ app.get("/smart-signal", async (c) => {
 });
 
 let gmoOrderInProgress = false;
-let gmoSafetyHalt = false;
-let gmoSafetyHaltReason: string | null = null;
+// Halt state is durable, and *any* storage fault blocks new live entries.
+const safetyStateDir = (process.env.SAFETY_STATE_DIR || "/data/safety").trim();
+const safetyStateFile = researchPath.join(safetyStateDir, "new-entry-halt.json");
+let safetyStorageHealthy = false;
+let safetyStorageError: string | null = null;
+let gmoSafetyHalt = true;
+let gmoSafetyHaltReason: string | null = "SAFETY_STORAGE_UNVERIFIED";
+function initializeDurableSafetyState(): void {
+  try {
+    // Require a mounted Railway Volume; a writable container layer is not durable.
+    const mounted = durableFs.readFileSync("/proc/self/mountinfo", "utf8").split("\n")
+      .some(line => line.split(" ")[4] === "/data");
+    if (!mounted || !safetyStateDir.startsWith("/data/")) throw new Error("RAILWAY_VOLUME_AT_DATA_NOT_VERIFIED");
+    durableFs.mkdirSync(safetyStateDir, { recursive: true });
+    const state = durableFs.existsSync(safetyStateFile)
+      ? JSON.parse(durableFs.readFileSync(safetyStateFile, "utf8"))
+      : null;
+    // No existing file implies no historical halt *only if the volume is writable*.
+    const testFile = researchPath.join(safetyStateDir, `.probe-${process.pid}`);
+    durableFs.writeFileSync(testFile, "probe", { flag: "wx" });
+    durableFs.unlinkSync(testFile);
+    if (state && (state.version !== 1 || state.halted !== true || typeof state.reason !== "string")) {
+      throw new Error("INVALID_SAFETY_STATE_FILE");
+    }
+    safetyStorageHealthy = true;
+    gmoSafetyHalt = !!state;
+    gmoSafetyHaltReason = state?.reason ?? null;
+  } catch (error) {
+    safetyStorageHealthy = false;
+    safetyStorageError = String(error);
+    gmoSafetyHalt = true;
+    gmoSafetyHaltReason = "SAFETY_STORAGE_UNAVAILABLE";
+  }
+}
+function persistSafetyHalt(reason: string): void {
+  // Set in-memory latch first: persistence failure is never a permit to trade.
+  gmoSafetyHalt = true;
+  gmoSafetyHaltReason = reason;
+  try {
+    if (!safetyStorageHealthy) throw new Error("SAFETY_STORAGE_UNAVAILABLE");
+    const tmp = safetyStateFile + `.tmp-${process.pid}`;
+    durableFs.writeFileSync(tmp, JSON.stringify({ version: 1, halted: true, reason, recordedAt: new Date().toISOString() }), { flag: "w" });
+    durableFs.renameSync(tmp, safetyStateFile);
+    const fd = durableFs.openSync(safetyStateFile, "r");
+    try { durableFs.fsyncSync(fd); } finally { durableFs.closeSync(fd); }
+  } catch (error) {
+    safetyStorageHealthy = false;
+    safetyStorageError = String(error);
+    gmoSafetyHaltReason = "SAFETY_HALT_PERSISTENCE_FAILED:" + reason;
+  }
+}
+function newEntriesSafelyBlocked(): boolean {
+  if (!safetyStorageHealthy || gmoSafetyHalt) return true;
+  try {
+    // Recheck the marker on every entry; absent/unreadable volume is fail-closed.
+    const marker = durableFs.existsSync(safetyStateFile);
+    if (marker) {
+      const state = JSON.parse(durableFs.readFileSync(safetyStateFile, "utf8"));
+      if (state?.version !== 1 || state?.halted !== true) throw new Error("INVALID_SAFETY_STATE_FILE");
+      gmoSafetyHalt = true;
+      gmoSafetyHaltReason = state.reason;
+      return true;
+    }
+    durableFs.accessSync(safetyStateDir, durableFs.constants.R_OK | durableFs.constants.W_OK);
+    return false;
+  } catch (error) {
+    safetyStorageHealthy = false;
+    safetyStorageError = String(error);
+    gmoSafetyHalt = true;
+    gmoSafetyHaltReason = "SAFETY_STORAGE_CHECK_FAILED";
+    return true;
+  }
+}
+initializeDurableSafetyState();
 
 // ===== Chagatto-1 safety scheduler patch =====
 // 検証中は Railway の LIVE_TRADING_ENABLED=false のままにする。
@@ -2506,6 +2579,10 @@ if (daily.entryCount >= MAX_DAILY_TRADES) {
       return;
     }
 
+    if (newEntriesSafelyBlocked()) {
+      lastSchedulerResult = { startedAt, action: "SAFETY_HALT", reason: gmoSafetyHaltReason, newEntryBlocked: true };
+      return;
+    }
     const adminToken = process.env.ADMIN_TOKEN;
     if (!adminToken) throw new Error("ADMIN_TOKEN is not set");
     const orderResponse = await fetch(`${baseUrl}/gmo-order`, {
@@ -3750,7 +3827,7 @@ if (orderDailyPnl.entryCount >= MAX_DAILY_TRADES) {
     }, 409);
   }
 
-  if (gmoSafetyHalt) {
+  if (newEntriesSafelyBlocked()) {
     return c.json({
       orderSent: false,
       error: "SAFETY_HALT",
@@ -4214,8 +4291,7 @@ if (executions.length === 0) {
 if (executions.length === 0) {
   // 注文送信後に約定状態を確定できない場合は、以後の自動新規注文を停止する。
   // 「約定していない」と推測して運転を続けない。
-  gmoSafetyHalt = true;
-  gmoSafetyHaltReason = "EXECUTION_STATE_UNKNOWN_AFTER_RECONCILIATION";
+  persistSafetyHalt("EXECUTION_STATE_UNKNOWN_AFTER_RECONCILIATION");
   return c.json({
     orderSent: true,
     stopOrderSent: false,
@@ -4341,8 +4417,7 @@ if (
   // 無保護になる可能性があるため、ここでは自動運転を継続しない。
   if (!remainderCancelSucceeded) {
     // 残注文の状態が不明なまま次の自動注文を許可しない。
-    gmoSafetyHalt = true;
-    gmoSafetyHaltReason = "PARTIAL_FILL_REMAINDER_CANCEL_FAILED";
+    persistSafetyHalt("PARTIAL_FILL_REMAINDER_CANCEL_FAILED");
     return c.json({
       orderSent: true,
       stopOrderSent: false,
@@ -4384,8 +4459,7 @@ for (const x of executions) {
     !Number.isFinite(size) ||
     size <= 0
   ) {
-    gmoSafetyHalt = true;
-    gmoSafetyHaltReason = "INVALID_EXECUTION_DATA";
+    persistSafetyHalt("INVALID_EXECUTION_DATA");
     return c.json({
       orderSent: true,
       stopOrderSent: false,
@@ -4414,8 +4488,7 @@ if (
   settlePosition.length === 0 ||
   settlePosition.length > 10
 ) {
-  gmoSafetyHalt = true;
-  gmoSafetyHaltReason = "INVALID_EXECUTION_DATA";
+  persistSafetyHalt("INVALID_EXECUTION_DATA");
   return c.json({
     orderSent: true,
     stopOrderSent: false,
@@ -4647,8 +4720,7 @@ const protectionState = stopConfirmed
       : "PROTECTION_UNKNOWN";
 
 if (protectionState === "PROTECTION_FAILED" || protectionState === "PROTECTION_UNKNOWN") {
-  gmoSafetyHalt = true;
-  gmoSafetyHaltReason = protectionState;
+  persistSafetyHalt(protectionState);
 }
 
 return c.json({
@@ -4699,7 +4771,7 @@ emergencyCloseError,
 // 外部スケジューラから 08:00 / 15:00 / 21:00 (JST) に呼び出す。
 // LIVE_TRADING_ENABLED=false の間は実注文されない。
 app.post("/gmo-auto-run", async (c) => {
-  if (gmoSafetyHalt) {
+  if (newEntriesSafelyBlocked()) {
     return c.json({
       autoRun: false,
       error: "SAFETY_HALT",
@@ -6052,6 +6124,7 @@ app.get("/prelive-safety-audit", (c) => c.json({
   liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
   researchOnly: true,
   orderSent: false,
+  durableSafetyState: { configuredPath: safetyStateFile, storageHealthy: safetyStorageHealthy, storageError: safetyStorageError, halted: gmoSafetyHalt, reason: gmoSafetyHaltReason },
   checks: {
     liveGatePresent: true,
     dailyLossGatePresent: true,
@@ -6065,13 +6138,22 @@ app.get("/prelive-safety-audit", (c) => c.json({
     emergencyCloseAttemptPresent: true
   },
   blockers: [
-    "SAFETY_HALT_IN_PROCESS_MEMORY_NOT_DURABLE_ON_RESTART",
+    "DURABLE_SAFETY_HALT_RESTART_BEHAVIOR_NOT_YET_VERIFIED",
     "UNKNOWN_MARKET_ORDER_RESULT_REQUIRES_RECOVERY_AND_PROTECTION_AUDIT",
     "STOP_AND_EMERGENCY_CLOSE_NOT_END_TO_END_TESTED_WITH_BROKER",
     "BROKER_SPREAD_SLIPPAGE_COSTS_AND_STRATEGY_EDGE_NOT_VALIDATED"
   ],
   outcome: "NOT_APPROVED_FOR_LIVE_TRADING",
   note: "Read-only status. Do not enable LIVE_TRADING_ENABLED based on this endpoint."
+}));
+
+app.get("/durable-safety-status", (c) => c.json({
+  system: "Chagatto-2 Durable New Entry Safety",
+  readOnly: true, orderSent: false, liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+  storageHealthy: safetyStorageHealthy, storageError: safetyStorageError,
+  statePath: safetyStateFile, newEntriesBlocked: newEntriesSafelyBlocked(),
+  reason: gmoSafetyHaltReason,
+  note: "A false blocked state is NOT a live trading approval. No public reset route is exposed."
 }));
 
 const port = Number(process.env.PORT || 8080);
