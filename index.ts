@@ -5871,6 +5871,50 @@ app.get("/research-signal-diagnostic",async c=>{
   }catch(e:any){return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
 });
 
+// Research-only historical-time diagnostics; no changes to signal or execution logic.
+app.get("/research-signal-time-analysis", async c=>{
+  if(!archiveEnabled)return c.json({researchOnly:true,orderSent:false,configured:false,status:"DISABLED"});
+  try{
+    await signalJournalQueue;
+    const rows=await readSignalJournal();
+    const parts=(value:string)=>{
+      const d=new Date(value);
+      if(!Number.isFinite(d.getTime()))return null;
+      const jst=new Date(d.getTime()+9*60*60*1000);
+      return {hour:jst.getUTCHours(),day:jst.toISOString().slice(0,10)};
+    };
+    const summarize=(subset:SignalJournalRow[])=>{
+      const directional=subset.filter(r=>r.side!=="WAIT");
+      const evaluated=directional.filter(r=>r.futureMovePips!==null);
+      const wins=evaluated.filter(r=>(r.futureMovePips??0)>0).length;
+      const total=evaluated.reduce((sum,r)=>sum+(r.futureMovePips??0),0);
+      return {signals:subset.length,buy:subset.filter(r=>r.side==="BUY").length,
+        sell:subset.filter(r=>r.side==="SELL").length,wait:subset.filter(r=>r.side==="WAIT").length,
+        directional:evaluated.length,pending:directional.length-evaluated.length,
+        wins,losses:evaluated.filter(r=>(r.futureMovePips??0)<0).length,
+        flat:evaluated.filter(r=>r.futureMovePips===0).length,
+        directionalAccuracyPct:evaluated.length?Number((wins*100/evaluated.length).toFixed(2)):null,
+        sumHypotheticalPips:Number(total.toFixed(3)),
+        averageHypotheticalPips:evaluated.length?Number((total/evaluated.length).toFixed(3)):null,
+        evidence:evaluated.length>=100?"DESCRIPTIVE_SAMPLE_100_PLUS":evaluated.length>=30?"DESCRIPTIVE_SAMPLE_30_PLUS":"SMALL_SAMPLE_NOT_ACTIONABLE"};
+    };
+    const jstRows=rows.map(r=>({row:r,time:parts(r.recordedAt)})).filter(x=>x.time!==null);
+    const hourly=Array.from({length:24},(_,hour)=>({hourJst:hour,all:summarize(jstRows.filter(x=>x.time!.hour===hour).map(x=>x.row)),
+      buy:summarize(jstRows.filter(x=>x.time!.hour===hour&&x.row.side==="BUY").map(x=>x.row)),
+      sell:summarize(jstRows.filter(x=>x.time!.hour===hour&&x.row.side==="SELL").map(x=>x.row))}));
+    const buckets=[{label:"00-07 JST",start:0,end:8},{label:"08-15 JST",start:8,end:16},{label:"16-23 JST",start:16,end:24}].map(b=>{
+      const a=jstRows.filter(x=>x.time!.hour>=b.start&&x.time!.hour<b.end).map(x=>x.row);
+      return {period:b.label,all:summarize(a),buy:summarize(a.filter(r=>r.side==="BUY")),sell:summarize(a.filter(r=>r.side==="SELL"))};
+    });
+    const days=[...new Set(jstRows.map(x=>x.time!.day))].sort();
+    const daily=days.slice(-14).map(day=>({dateJst:day,...summarize(jstRows.filter(x=>x.time!.day===day).map(x=>x.row))}));
+    return c.json({system:"Chagatto-2 Prospective Time Diagnostics",researchOnly:true,orderSent:false,
+      privateTradingApiCalled:false,liveParametersChanged:false,timezone:"Asia/Tokyo",source:"Existing prospective signal journal (GMO public BID-only markout)",
+      total:summarize(rows),buckets,hourly,dailyLast14:daily,
+      caution:"Descriptive only. Small samples and correlated overlapping 5-minute signals must not be treated as independent trades. No spread/ASK, slippage, fees, fill or risk-adjusted P/L. Time buckets are not live filters. RSI and trend-at-signal were not historically stored and are deliberately not inferred."});
+  }catch(e:any){return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
+});
+
 const archiveProcessBootId = crypto.randomUUID();
 
 // Research-only persistent-volume probe. Does not expose archive contents or secrets.
