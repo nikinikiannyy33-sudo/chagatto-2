@@ -6156,6 +6156,51 @@ app.get("/durable-safety-status", (c) => c.json({
   note: "A false blocked state is NOT a live trading approval. No public reset route is exposed."
 }));
 
+// Independent persistence probe: never reads or modifies the live trading safety-halt marker.
+const volumeProbeFile = researchPath.join(safetyStateDir, "volume-restart-probe.json");
+const volumeProbeBootTime = new Date().toISOString();
+let volumeProbeFoundAtBoot = false;
+let volumeProbeBootError: string | null = null;
+try {
+  if (safetyStorageHealthy) {
+    volumeProbeFoundAtBoot = durableFs.existsSync(volumeProbeFile);
+  }
+} catch (error) {
+  volumeProbeBootError = String(error);
+}
+app.get("/safety-volume-restart-probe", (c) => {
+  let probe: any = null;
+  let error: string | null = volumeProbeBootError;
+  try {
+    if (!safetyStorageHealthy || newEntriesSafelyBlocked() && !safetyStorageHealthy) throw new Error("VOLUME_NOT_HEALTHY");
+    if (!durableFs.existsSync(volumeProbeFile)) {
+      // Exclusive creation is idempotent even when two requests race.
+      try {
+        durableFs.writeFileSync(volumeProbeFile, JSON.stringify({ version: 1, createdAt: new Date().toISOString(), createdByPid: process.pid }), { flag: "wx", mode: 0o600 });
+      } catch (writeError: any) {
+        if (writeError?.code !== "EEXIST") throw writeError;
+      }
+    }
+    probe = JSON.parse(durableFs.readFileSync(volumeProbeFile, "utf8"));
+    if (probe?.version !== 1 || !probe.createdAt) throw new Error("INVALID_PROBE_FILE");
+  } catch (e) {
+    error = String(e);
+  }
+  return c.json({
+    system: "Chagatto-2 Volume Restart Probe",
+    simulationOnly: true, orderSent: false, liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+    state: error ? "PROBE_ERROR" : volumeProbeFoundAtBoot ? "PERSISTED_ACROSS_STARTUP" : "WAITING_FOR_REDEPLOY",
+    volumeHealthy: safetyStorageHealthy, storageError: safetyStorageError,
+    markerFoundAtProcessStart: volumeProbeFoundAtBoot,
+    bootTimeUtc: volumeProbeBootTime,
+    markerCreatedAtUtc: probe?.createdAt ?? null,
+    markerPath: volumeProbeFile,
+    error,
+    realSafetyHaltUntouched: true,
+    note: "This checks a separate probe file on the same Volume. It does NOT prove actual halt recovery or broker order safety. Redeploy without wiping Volume, then reload."
+  });
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
