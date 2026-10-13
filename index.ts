@@ -5988,6 +5988,63 @@ app.get("/research-signal-indicators",async c=>{
   }catch(e:any){return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
 });
 
+
+// Read-only indicator capture troubleshooting: never invokes trading or refreshes market data.
+app.get("/research-indicator-health",async c=>{
+  if(!archiveEnabled)return c.json({researchOnly:true,orderSent:false,status:"ARCHIVE_DISABLED",nextAction:"Set research archive directory and verify volume."});
+  try{
+    await signalJournalQueue;
+    const rows=await readSignalJournal();
+    const annotated=rows.filter(r=>r.snapshot!==undefined);
+    const complete=annotated.filter(r=>[r.snapshot?.rsi14,r.snapshot?.sma7,r.snapshot?.sma8,r.snapshot?.atr14,r.snapshot?.adx14].every(v=>typeof v==="number"&&Number.isFinite(v)));
+    const partial=annotated.filter(r=>!complete.includes(r));
+    const mostRecent=rows.at(-1)??null;
+    const ageMin=mostRecent?Math.round((Date.now()-Date.parse(mostRecent.recordedAt))/60000):null;
+    const schedulerAction=String(lastSchedulerResult?.action??"NOT_YET_RUN");
+    let reason="CAPTURING";
+    if(!rows.length)reason="NO_JOURNAL_RECORDS";
+    else if(!annotated.length)reason="NO_NEW_SIGNALS_SINCE_INDICATOR_DEPLOY";
+    else if(!complete.length)reason="INDICATOR_FIELDS_INCOMPLETE";
+    else if(ageMin!==null&&ageMin>20)reason="NO_RECENT_JOURNAL_RECORD";
+    return c.json({system:"Chagatto-2 Indicator Capture Health",researchOnly:true,orderSent:false,
+      tradingEnabled:process.env.LIVE_TRADING_ENABLED==="true",archiveConfigured:archiveEnabled,
+      totalSignals:rows.length,withAnySnapshot:annotated.length,completeIndicatorSnapshots:complete.length,
+      incompleteSnapshots:partial.length,latestJournalTime:mostRecent?.recordedAt??null,
+      latestJournalAgeMinutes:ageMin,lastSchedulerAction:schedulerAction,
+      lastSchedulerStartedAt:lastSchedulerResult?.startedAt??null,
+      lastSchedulerError:lastSchedulerResult?.error??null,
+      archiveLastSuccess:researchArchiveLastSuccess,archiveLastError:researchArchiveLastError,
+      newestSnapshot:annotated.at(-1)?.snapshot??null,
+      newestIncompleteFields:partial.length?(["rsi14","sma7","sma8","atr14","adx14"] as const).filter(k=>typeof partial.at(-1)?.snapshot?.[k]!=="number"):[],
+      status:reason,explanation:reason==="INDICATOR_FIELDS_INCOMPLETE"?"Snapshot exists but some indicators are null: check sufficient completed 1H candles and signal fields.":
+        reason==="NO_RECENT_JOURNAL_RECORD"?"The scheduler may have skipped before smart-signal, or has not run recently; inspect /scheduler-status.":
+        reason==="NO_NEW_SIGNALS_SINCE_INDICATOR_DEPLOY"?"Only historical signals exist; new snapshots are captured after scheduler reaches smart-signal.":
+        "Research diagnostic only. No orders or API writes."});
+  }catch(e:any){return c.json({researchOnly:true,orderSent:false,status:"DIAGNOSTIC_ERROR",error:String(e?.message??e)},500);}
+});
+
+// Human-readable server-rendered dashboard; read-only and free of external assets.
+app.get("/research-indicator-dashboard",async c=>{
+  if(!archiveEnabled)return c.html("<h1>Research archive is disabled</h1>",503);
+  try{
+    await signalJournalQueue;
+    const rows=await readSignalJournal();
+    const complete=rows.filter(r=>r.snapshot&&[r.snapshot.rsi14,r.snapshot.sma7,r.snapshot.sma8,r.snapshot.atr14,r.snapshot.adx14].every(v=>typeof v==="number"&&Number.isFinite(v)));
+    const sides=(["BUY","SELL","WAIT"] as const).map(side=>{
+      const all=rows.filter(r=>r.side===side);const tagged=complete.filter(r=>r.side===side);
+      const scored=tagged.filter(r=>r.futureMovePips!==null&&side!=="WAIT");
+      return {side,all:all.length,tagged:tagged.length,scored:scored.length,winning:scored.filter(r=>(r.futureMovePips??0)>0).length,
+        pips:Number(scored.reduce((sum,r)=>sum+(r.futureMovePips??0),0).toFixed(2))};
+    });
+    const escape=(v:unknown)=>String(v??"—").replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[ch]||ch));
+    const fmt=(v:unknown)=>typeof v==="number"?escape(Number(v.toFixed(4))):"—";
+    const data=complete.slice(-30).reverse();
+    const rowsHtml=data.map(r=>`<tr><td>${escape(r.recordedAt)}</td><td>${escape(r.side)}</td><td>${fmt(r.snapshot?.rsi14)}</td><td>${fmt(r.snapshot?.sma7)}</td><td>${fmt(r.snapshot?.sma8)}</td><td>${fmt(r.snapshot?.atr14)}</td><td>${fmt(r.snapshot?.adx14)}</td><td>${escape(r.snapshot?.trend1h)}</td><td>${fmt(r.futureMovePips)}</td></tr>`).join("");
+    const summary=sides.map(r=>`<tr><th>${r.side}</th><td>${r.all}</td><td>${r.tagged}</td><td>${r.scored}</td><td>${r.scored?fmt(r.winning/r.scored*100)+"%":"—"}</td><td>${r.pips}</td></tr>`).join("");
+    return c.html(`<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>チャガット2号・指標診断</title><style>body{font-family:system-ui,sans-serif;margin:0 auto;padding:20px;max-width:1100px;background:#101827;color:#edf2fa}a{color:#99caff}.note{color:#c3cddd}table{border-collapse:collapse;width:100%;margin:14px 0}td,th{padding:9px;border-bottom:1px solid #3c4658;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}.scroll{overflow-x:auto}h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:30px}.card{background:#202c40;border-radius:12px;padding:14px}</style><h1>チャガット2号｜相場指標の記録</h1><p class="note">研究専用・注文なし・リアル取引の損益ではありません。過去の指標は後付けしません。</p><div class="card"><strong>全記録 ${rows.length}件 / 指標5種類すべて取得 ${complete.length}件</strong><p class="note">最新記録：${escape(rows.at(-1)?.recordedAt)} ／ 最新スケジューラー：${escape(lastSchedulerResult?.action??"未実行")}</p><a href="/research-indicator-health">指標記録の原因診断（JSON）</a> · <a href="/scheduler-status">スケジューラー状況</a> · <a href="/research-signal-indicators">詳細JSON</a></div><h2>BUY / SELL 別</h2><div class="scroll"><table><thead><tr><th>判定</th><th>全件</th><th>指標付き</th><th>評価済み</th><th>正解率*</th><th>参考pips*</th></tr></thead><tbody>${summary}</tbody></table></div><h2>直近の指標付き記録</h2><div class="scroll"><table><thead><tr><th>UTC記録時刻</th><th>判定</th><th>RSI14</th><th>SMA7</th><th>SMA8</th><th>ATR14</th><th>ADX14</th><th>1H方向</th><th>参考pips*</th></tr></thead><tbody>${rowsHtml||'<tr><td colspan="9">記録待ちです。上の診断リンクから原因を確認してください。</td></tr>'}</tbody></table></div><p class="note">*重複する5分ごとの方向予測を含み、スプレッド・約定・手数料は考慮していません。統計的優位性を示しません。</p></html>`);
+  }catch(e:any){return c.html(`<h1>診断表示エラー</h1><pre>${String(e?.message??e).replace(/[&<>]/g,"")}</pre>`,500);}
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
