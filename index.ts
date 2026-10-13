@@ -5483,6 +5483,92 @@ app.get('/chronological-filter-validation', async (c) => {
  }catch(e:any){return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
 });
 
+app.get('/prospective-filter-check', async (c) => {
+ try {
+  const [five,hours]=await Promise.all([fetchCompletedGmoCandles('5min',15),fetchCompletedGmoCandles('1hour',30)]);
+  const H=3600000, M=300000, pip=.01, cost=.5;
+  const jst=(time:number)=>{
+   const parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Tokyo',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23',weekday:'short'}).formatToParts(new Date(time));
+   const v=(k:string)=>parts.find(x=>x.type===k)?.value??'';
+   return {date:`${v('year')}-${v('month')}-${v('day')}`,hour:Number(v('hour')),weekend:['Sat','Sun'].includes(v('weekday'))};
+  };
+  type C={i:number;time:number;side:'BUY'|'SELL';rsi:number;adx:number;hour:number};
+  const entries:C[]=[];let hi=0;
+  for(let i=34;i+1<five.length;i++){
+   const b=five[i],t=b.time+M;
+   while(hi<hours.length&&hours[hi].time+H<=t)hi++;
+   if(hi<40)continue;
+   const h=hours.slice(0,hi),hc=h.map(x=>x.close),fc=five.slice(i-34,i+1).map(x=>x.close);
+   const a=sma(hc,7),z=sma(hc,8),r=rsi(hc,14),d=adx(h,14),f=sma(fc,5),g=sma(fc,10);
+   if([a,z,r,d,f,g].some(x=>x===null))continue;
+   const buy=a!>z!&&r!>=52&&r!<=72&&d!>=10&&f!>g!&&b.close>b.open;
+   const sell=a!<z!&&r!>=28&&r!<=48&&d!>=10&&f!<g!&&b.close<b.open;
+   if(buy||sell)entries.push({i:i+1,time:five[i+1].time,side:buy?'BUY':'SELL',rsi:r!,adx:d!,hour:jst(five[i+1].time).hour});
+  }
+  const frozenStart=Date.parse('2026-10-13T15:00:00.000Z'); // 2026-10-14 00:00 JST; frozen BEFORE subsequent observations
+  const freshEntries=entries.filter(e=>e.time>=frozenStart);
+  const modes=['CURRENT','SKIP_16_TO_23_JST','STRICT_BUY','BOTH'] as const;
+  type T={time:number;end:number;side:'BUY'|'SELL';pips:number;result:'WIN'|'LOSS'};
+  const run=(mode:typeof modes[number])=>{
+   const trades:T[]=[];let busy=0,day='',count=0,dailyPnl=0,streakSide='',streak=0,blockedSide='';
+   let pending:T|null=null;
+   const skips={position:0,weekend:0,filters:0,limits:0,threeLoss:0,insufficient:0};
+   for(const e of freshEntries){
+    const cur=jst(e.time);
+    if(day!==cur.date){day=cur.date;count=0;dailyPnl=0;}
+    if(pending&&e.time>=pending.end){
+      const closed:T=pending;pending=null;
+      dailyPnl+=closed.pips*10; // 1000 USD/JPY units: 1 pip ~10 yen, estimate only
+      if(closed.result==='LOSS'){
+       streak=streakSide===closed.side?streak+1:1;streakSide=closed.side;
+       if(streak>=3)blockedSide=closed.side;
+      }else{streak=0;streakSide='';}
+    }
+    if(cur.weekend){skips.weekend++;continue;}
+    if(e.time<busy){skips.position++;continue;}
+    if((mode==='SKIP_16_TO_23_JST'||mode==='BOTH')&&e.hour>=16){skips.filters++;continue;}
+    if((mode==='STRICT_BUY'||mode==='BOTH')&&e.side==='BUY'&&!(e.adx>=10&&e.adx<15&&e.rsi>=52&&e.rsi<60)){skips.filters++;continue;}
+    if(count>=20||dailyPnl<=-1200){skips.limits++;continue;}
+    if(blockedSide&&e.side!==blockedSide){blockedSide='';streak=0;streakSide='';}
+    if(blockedSide===e.side){skips.threeLoss++;continue;}
+    if(e.i+288>five.length){skips.insufficient++;continue;}
+    const entry=five[e.i].open;let end=e.i+287;let pips:number|null=null;
+    for(let j=e.i;j<=end;j++){
+      const b=five[j];const good=(e.side==='BUY'?b.high-entry:entry-b.low)/pip;
+      const bad=(e.side==='BUY'?entry-b.low:b.high-entry)/pip;
+      if(good>=20+cost/2||bad>=10-cost/2){end=j;pips=bad>=10-cost/2?-10-cost:20-cost;break;}
+    }
+    if(pips===null){const last=five[end];pips=(e.side==='BUY'?last.close-entry:entry-last.close)/pip-cost;}
+    const t:T={time:e.time,end:five[end].time+M,side:e.side,pips,result:pips>0?'WIN':'LOSS'};
+    trades.push(t);pending=t;busy=t.end;count++;
+   }
+   const summary=(a:T[])=>{
+    const w=a.filter(x=>x.result==='WIN').length,sum=a.reduce((v,x)=>v+x.pips,0);
+    return {trades:a.length,wins:w,losses:a.length-w,winRatePct:a.length?+(100*w/a.length).toFixed(2):null,
+     netPips:+sum.toFixed(2),averageNetPips:a.length?+(sum/a.length).toFixed(3):null};
+   };
+   const cutoff=frozenStart+(Date.now()-frozenStart)*.7;
+   return {mode,overall:summary(trades),buy:summary(trades.filter(x=>x.side==='BUY')),
+    sell:summary(trades.filter(x=>x.side==='SELL')),earlier70pct:summary(trades.filter(x=>x.time<cutoff)),
+    later30pct:summary(trades.filter(x=>x.time>=cutoff)),skipped:skips};
+  };
+  return c.json({system:'Chagatto-2 Prospective Frozen Filter Check',researchOnly:true,
+   orderSent:false,gmoPrivateApiCalled:false,liveParametersChanged:false,
+   candles5m:five.length,candles1h:hours.length,entryCandidates:freshEntries.length, frozenStartJst:'2026-10-14 00:00 JST',
+   evaluationStatus:'EXPLORATORY_ONLY',
+   readyForReview: freshEntries.length>=100 && Date.now()-frozenStart>=14*86400000,
+   minimumReviewConditions:'At least 14 days and 100 signal candidates, plus independent manual review; not approval for live trading',
+   assumptions:{source:'GMO historical BID-only 5m and 1h',entry:'Next 5m open; one position at a time',
+    exit:'TP20 SL10; max 24h; same-bar collision stop first; 0.5pips assumed roundtrip cost',
+    limits:'20 entries per JST day; approximate realized daily loss -1200 yen; JST weekend new entries disabled',
+    forward:'Strictly freezes start date; historical warm-up indicators permitted but scoring only on entries after cutoff. Rolling 15-day candle source can lose older data, so repeated snapshots are not cumulative or permanent.',
+    threeLoss:'Simplified closed-trade same-direction 3-loss guard; resets on opposite signal, NOT exact live completed-1h rule',
+    scope:'Exploratory descriptive analysis; guard and order execution fidelity are NOT verified',
+    bias:'Filters fixed from past data. This is prospective after cutoff, but provider rolling history loses data and execution assumptions are approximate. 70/30 subdivisions remain descriptive, not fitted.',
+    warning:'Do not use results to authorize real orders or claim expected profits'},comparisons:modes.map(run)});
+ }catch(e:any){return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);}
+});
+
 app.get("/direction-regime-diagnostic", async (c) => {
   try {
     const [five, hours] = await Promise.all([
