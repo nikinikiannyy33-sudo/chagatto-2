@@ -5397,6 +5397,118 @@ app.get("/historical-exit-comparison", async (c) => {
   }
 });
 
+
+
+// Read-only, pre-specified stratification of the CURRENT entry rule, without optimization.
+// It deliberately does not call any GMO private API, submit orders or alter scheduler logic.
+app.get("/direction-regime-diagnostic", async (c) => {
+  try {
+    const [five, hours] = await Promise.all([
+      fetchCompletedGmoCandles("5min", 15),
+      fetchCompletedGmoCandles("1hour", 30),
+    ]);
+    const fiveMs = 300000, hourMs = 3600000, pip = 0.01;
+    const cost = 0.5, maxBars = 288;
+    type Row = {
+      time:number; side:"BUY"|"SELL"; adx:number; rsi:number; atrPips:number;
+      jstHour:number; hourDirection:"UP"|"DOWN"|"FLAT";
+      outcome:"WIN"|"LOSS"|"INSUFFICIENT_DATA";
+      netPips:number|null; holdingBars:number|null;
+    };
+    const rows:Row[]=[];
+    let completedHours=0;
+    for(let i=34;i+1<five.length;i++) {
+      const bar=five[i], decisionTime=bar.time+fiveMs;
+      while(completedHours<hours.length && hours[completedHours].time+hourMs<=decisionTime) completedHours++;
+      if(completedHours<40) continue;
+      const h=hours.slice(0,completedHours), hc=h.map(x=>x.close), fc=five.slice(i-34,i+1).map(x=>x.close);
+      const m7=sma(hc,7),m8=sma(hc,8),rr=rsi(hc,14),aa=adx(h,14),at=atr(h,14);
+      const m5=sma(fc,5),m10=sma(fc,10);
+      if([m7,m8,rr,aa,at,m5,m10].some(x=>x===null)) continue;
+      const buy=m7!>m8! && rr!>=52 && rr!<=72 && aa!>=10 && m5!>m10! && bar.close>bar.open;
+      const sell=m7!<m8! && rr!>=28 && rr!<=48 && aa!>=10 && m5!<m10! && bar.close<bar.open;
+      if(!buy&&!sell)continue;
+      const entryIndex=i+1,entry=five[entryIndex].open, side=buy?"BUY":"SELL";
+      const end=entryIndex+maxBars-1;
+      let outcome:Row['outcome']='INSUFFICIENT_DATA';
+      let netPips:number|null=null, holdingBars:number|null=null;
+      if(end<five.length) {
+        for(let j=entryIndex;j<=end;j++) {
+          const x=five[j];
+          const favor=(buy?x.high-entry:entry-x.low)/pip;
+          const adverse=(buy?entry-x.low:x.high-entry)/pip;
+          const tpHit=favor>=20+cost/2,slHit=adverse>=10-cost/2;
+          if(tpHit||slHit) {
+            outcome=slHit?'LOSS':'WIN'; // same-bar collision conservatively LOSS
+            netPips=slHit?-10-cost:20-cost;
+            holdingBars=j-entryIndex+1;
+            break;
+          }
+        }
+        if(netPips===null) {
+          const last=five[end],diff=(buy?last.close-entry:entry-last.close)/pip-cost;
+          netPips=diff;outcome=diff>0?'WIN':'LOSS';holdingBars=maxBars;
+        }
+      }
+      // This is the 1h signal direction, not an independent 4h trend estimate.
+      const hourDirection=m7!>m8!?'UP':m7!<m8!?'DOWN':'FLAT';
+      const jstHour=Number(new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Tokyo',hour:'numeric',hourCycle:'h23'}).format(new Date(bar.time)));
+      rows.push({time:five[entryIndex].time,side,adx:aa!,rsi:rr!,atrPips:at!/pip,jstHour,
+        hourDirection,outcome,netPips,holdingBars});
+    }
+    const firstTime=five[0]?.time??0,lastTime=five[five.length-1]?.time??0;
+    const cut=firstTime+(lastTime-firstTime)*0.7;
+    const grouping=(x:Row,dimension:string):string=>{
+      switch(dimension){
+        case 'side':return x.side;
+        case 'timeOfDayJst':return x.jstHour<8?'00-07':x.jstHour<16?'08-15':'16-23';
+        case 'adxRange':return x.adx<15?'10-15':x.adx<20?'15-20':'20+';
+        case 'rsiRange':return x.rsi<40?'<40':x.rsi<50?'40-50':x.rsi<60?'50-60':'>=60';
+        case 'atr1hPips':return x.atrPips<10?'<10':x.atrPips<20?'10-20':'>=20';
+        case 'hourTrend':return x.hourDirection;
+        default:return 'ALL';
+      }
+    };
+    const summarize=(list:Row[])=>{
+      const known=list.filter(x=>x.netPips!==null),win=known.filter(x=>x.netPips!>0),loss=known.filter(x=>x.netPips!<=0);
+      const sum=known.reduce((v,x)=>v+x.netPips!,0);
+      return {signals:list.length,evaluable:known.length,insufficientForwardData:list.length-known.length,
+        wins:win.length,losses:loss.length,
+        winRatePct:known.length?Number((100*win.length/known.length).toFixed(2)):null,
+        totalNetPips:known.length?Number(sum.toFixed(2)):null,
+        averageNetPips:known.length?Number((sum/known.length).toFixed(3)):null,
+        evidenceLevel:known.length>=50?'DESCRIPTIVE_50_PLUS':known.length>=20?'SMALL_SAMPLE':'VERY_SMALL_SAMPLE'};
+    };
+    const dimensions=['side','timeOfDayJst','adxRange','rsiRange','atr1hPips','hourTrend'];
+    const strata=dimensions.map(dimension=>{
+      const keys=[...new Set(rows.map(r=>grouping(r,dimension)))].sort();
+      return {dimension,groups:keys.map(key=>{
+        const group=rows.filter(r=>grouping(r,dimension)===key);
+        return {key,overall:summarize(group),earlier70pct:summarize(group.filter(r=>r.time<cut)),later30pct:summarize(group.filter(r=>r.time>=cut)),
+          bySide:{BUY:summarize(group.filter(r=>r.side==='BUY')),SELL:summarize(group.filter(r=>r.side==='SELL'))}};
+      })};
+    });
+    const displayRows=rows.slice(0,5).map(x=>({time:new Date(x.time).toISOString(),side:x.side,outcome:x.outcome,netPips:x.netPips}));
+    return c.json({system:'Chagatto-2 Direction & Regime Diagnostic',researchOnly:true,orderSent:false,
+      gmoPrivateApiCalled:false,liveParametersChanged:false,
+      source:'GMO public BID-only 5m/1h OHLC',candles5m:five.length,candles1h:hours.length,
+      entryCandidates:rows.length,assumptions:{
+        baseSignal:'CURRENT: 1H SMA7/8, RSI52-72 or 28-48, ADX>=10; 5m SMA5/10 + candle direction',
+        exit:'TP20 / SL10, max 24h; if neither hit, market exit at 24h close',
+        roundTripCostPips:cost,costIsAssumption:true,
+        sameBarCollision:'STOP first; scored LOSS',
+        buckets:'Prespecified descriptive categories, not fitted optimal thresholds',
+        split:'Chronological 70/30 boundary of candle time range; not a fully out-of-sample strategy test',
+        dataLimit:'Public BID-only history; no ASK, real spreads, slippage, gaps, complete market hours, or actual order history',
+        overlapLimit:'Signals evaluated independently, NOT one-position-only or 3-loss-guard portfolio simulation',
+        warning:'Do not turn a high-scoring bucket into a live filter without validating fresh unseen dates.'
+      },overall:summarize(rows),earlier70pct:summarize(rows.filter(r=>r.time<cut)),
+      later30pct:summarize(rows.filter(r=>r.time>=cut)),strata,sampleTrades:displayRows});
+  } catch(e:any) {
+    return c.json({researchOnly:true,orderSent:false,error:String(e?.message??e)},500);
+  }
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
