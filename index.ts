@@ -6524,6 +6524,50 @@ app.get('/prelive-reconciliation-gate-test',c=>{
     testCount:tests.length,allPassed:tests.every(t=>t.passed),tests,liveApproved:false});
 });
 
+// Research-only end-to-end decision table. No broker call, no filesystem mutation.
+type ProtectionScenario = {name:string; intentSaved:boolean; postOutcome:'ACK'|'UNKNOWN'|'REJECTED'|'NOT_SENT'; execution:'FILLED'|'NONE'|'UNKNOWN'; stopPlacement:'ACK'|'FAILED'|'UNKNOWN'|'NOT_ATTEMPTED'; stopVerified:boolean; brokerReadsOk:boolean; expected:string};
+function evaluateProtectionPath(s:ProtectionScenario){
+  let phase='BEFORE_POST';
+  let marketPostAllowed=false;
+  let newEntryBlocked=true;
+  let manualReconciliation=true;
+  const trace:string[]=[];
+  if(!s.intentSaved){trace.push('INTENT_NOT_DURABLE');return {phase:'HALT_INTENT_NOT_DURABLE',trace,marketPostAllowed,newEntryBlocked,manualReconciliation};}
+  trace.push('INTENT_DURABLE');marketPostAllowed=true;
+  if(s.postOutcome==='NOT_SENT'){trace.push('NO_POST');return {phase:'HALT_PENDING_INTENT',trace,marketPostAllowed,newEntryBlocked,manualReconciliation};}
+  if(s.postOutcome==='UNKNOWN'){trace.push('POST_OUTCOME_UNKNOWN');return {phase:'HALT_ORDER_UNKNOWN',trace,marketPostAllowed,newEntryBlocked,manualReconciliation};}
+  if(s.postOutcome==='REJECTED'){trace.push('POST_REJECTED');return {phase:'HALT_REJECTED_RECONCILE',trace,marketPostAllowed,newEntryBlocked,manualReconciliation};}
+  trace.push('ORDER_ACKNOWLEDGED');
+  if(!s.brokerReadsOk){trace.push('BROKER_RECONCILIATION_UNAVAILABLE');return {phase:'HALT_BROKER_UNAVAILABLE',trace,marketPostAllowed,newEntryBlocked,manualReconciliation};}
+  if(s.execution!=='FILLED'){trace.push('EXECUTION_NOT_CONFIRMED');return {phase:'HALT_EXECUTION_UNRESOLVED',trace,marketPostAllowed,newEntryBlocked,manualReconciliation};}
+  trace.push('EXECUTION_CONFIRMED');
+  if(s.stopPlacement!=='ACK'){trace.push('STOP_NOT_ACKNOWLEDGED');return {phase:'HALT_STOP_UNCONFIRMED',trace,marketPostAllowed,newEntryBlocked,manualReconciliation};}
+  trace.push('STOP_ACKNOWLEDGED');
+  if(!s.stopVerified){trace.push('STOP_COVERAGE_NOT_VERIFIED');return {phase:'HALT_STOP_COVERAGE_UNVERIFIED',trace,marketPostAllowed,newEntryBlocked,manualReconciliation};}
+  trace.push('STOP_COVERAGE_LOGICALLY_VERIFIED');
+  phase='SIMULATED_PROTECTION_PATH_COMPLETE';
+  manualReconciliation=false;
+  // Even a passing synthetic path never grants live authorization.
+  return {phase,trace,marketPostAllowed,newEntryBlocked,manualReconciliation};
+}
+app.get('/order-stop-lifecycle-simulation',c=>{
+  const base={intentSaved:true,postOutcome:'ACK' as const,execution:'FILLED' as const,stopPlacement:'ACK' as const,stopVerified:true,brokerReadsOk:true};
+  const scenarios:ProtectionScenario[]=[
+    {...base,name:'INTENT_NOT_SAVED',intentSaved:false,expected:'HALT_INTENT_NOT_DURABLE'},
+    {...base,name:'CRASH_BEFORE_POST',postOutcome:'NOT_SENT',expected:'HALT_PENDING_INTENT'},
+    {...base,name:'POST_RESULT_UNKNOWN',postOutcome:'UNKNOWN',expected:'HALT_ORDER_UNKNOWN'},
+    {...base,name:'ORDER_REJECTED',postOutcome:'REJECTED',expected:'HALT_REJECTED_RECONCILE'},
+    {...base,name:'BROKER_READ_FAILED',brokerReadsOk:false,expected:'HALT_BROKER_UNAVAILABLE'},
+    {...base,name:'EXECUTION_UNKNOWN',execution:'UNKNOWN',expected:'HALT_EXECUTION_UNRESOLVED'},
+    {...base,name:'STOP_POST_FAILED',stopPlacement:'FAILED',expected:'HALT_STOP_UNCONFIRMED'},
+    {...base,name:'STOP_POST_UNKNOWN',stopPlacement:'UNKNOWN',expected:'HALT_STOP_UNCONFIRMED'},
+    {...base,name:'STOP_COVERAGE_MISMATCH',stopVerified:false,expected:'HALT_STOP_COVERAGE_UNVERIFIED'},
+    {...base,name:'SYNTHETIC_SUCCESS',expected:'SIMULATED_PROTECTION_PATH_COMPLETE'}
+  ];
+  const tests=scenarios.map(s=>{const result=evaluateProtectionPath(s);return {scenario:s.name,phase:result.phase,marketPostAllowed:result.marketPostAllowed,newEntryBlocked:result.newEntryBlocked,manualReconciliation:result.manualReconciliation,passed:result.phase===s.expected && result.newEntryBlocked && (s.name!=='INTENT_NOT_SAVED'||!result.marketPostAllowed)};});
+  return c.json({system:'Chagatto-2 Order-STOP Lifecycle Simulation',mode:'SIMULATION_ONLY',liveTradingEnabled:false,orderSent:false,stopOrderSent:false,gmoPrivateApiCalled:false,volumeOrSafetyStateChanged:false,realBrokerSafetyVerified:false,liveApproved:false,testCount:tests.length,allPassed:tests.every(t=>t.passed),tests,limitations:['PURE_DECISION_MODEL_NOT_ACTUAL_ORDER_CODE','NO_REAL_CRASH_INJECTION','NO_BROKER_STOP_FILL_TEST','NO_TRANSACTION_COST_VALIDATION']});
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
