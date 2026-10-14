@@ -2465,7 +2465,11 @@ async function gmoPrivateGet(path: string, query = "") {
   });
   const data: any = await response.json();
   if (!response.ok || data?.status !== 0) {
-    throw new Error(`GMO ${path} failed: ${JSON.stringify(data)}`);
+    const brokerReadError = new Error(`GMO ${path} failed: ${JSON.stringify(data)}`);
+    // Diagnostic metadata only: do not change the error message or order behavior.
+    (brokerReadError as any).brokerHttpStatus = response.status;
+    (brokerReadError as any).brokerApiStatus = data?.status;
+    throw brokerReadError;
   }
   return data;
 }
@@ -6991,7 +6995,12 @@ app.get('/fx-order-id-reconciliation-audit', async c => {
               const candidate=messages.find((item:any)=>typeof item?.code==='string' && /^ERR-[0-9]{3,6}$/.test(item.code));
               if(candidate) brokerErrorCode=candidate.code;
             } catch { /* Keep the diagnostic fail-closed if payload is malformed. */ }
+            const reason:any=result.reason;
+            const httpStatus=Number.isInteger(reason?.brokerHttpStatus)?reason.brokerHttpStatus:undefined;
+            const apiStatus=Number.isInteger(reason?.brokerApiStatus)?reason.brokerApiStatus:undefined;
             return {status:'FAILED',category:'GMO_API_REJECTION',
+              ...(httpStatus!==undefined?{httpStatus}:{}),
+              ...(apiStatus!==undefined?{apiStatus}:{}),
               ...(brokerErrorCode?{brokerErrorCode}:{brokerErrorCodeUnavailable:true})};
           }
           if(/fetch failed|network|timeout|abort/i.test(message)) return {status:'FAILED',category:'TRANSPORT_FAILURE'};
