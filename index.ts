@@ -4861,7 +4861,12 @@ let emergencyCloseSucceeded = false;
 let emergencyCloseData: any = null;
 let emergencyCloseError: string | null = null;
 
-if (!stopConfirmed && activeOrdersCheckSucceeded) {
+// A successful activeOrders snapshot alone cannot prove the OCO is absent:
+// pagination, race with matching and broker execution history are not verified.
+// Do not submit an automatic emergency market-close in this ambiguous state.
+// Manual broker reconciliation is mandatory before any further action.
+const emergencyCloseAbsenceProven = false;
+if (!stopConfirmed && activeOrdersCheckSucceeded && emergencyCloseAbsenceProven) {
   emergencyCloseAttempted = true;
 
   const emergencyTimestamp = Date.now().toString();
@@ -4934,11 +4939,11 @@ if (protectionState === "PROTECTION_FAILED" || protectionState === "PROTECTION_U
 }
 // The write-ahead intent remains until STOP coverage is broker-confirmed.
 // For emergency-close submissions or uncertain status, fail closed and require reconciliation.
-if (stopConfirmed) {
-  clearPendingMarketOrderAfterConfirmedStop();
-} else {
-  persistSafetyHalt("PENDING_MARKET_ORDER_REQUIRES_RECONCILIATION");
-}
+// Broker POST acknowledgement is not evidence of STOP activation, coverage,
+// correct position linkage or eventual execution. The pending marker must
+// survive process restarts until order-specific broker reconciliation exists.
+// Never automatically clear the marker on a successful POST response.
+persistSafetyHalt("PENDING_MARKET_ORDER_REQUIRES_ORDER_SPECIFIC_RECONCILIATION");
 
 return c.json({
   orderSent: true,
@@ -4983,6 +4988,21 @@ emergencyCloseError,
   gmoOrderInProgress = false;
 }
 });
+
+// Read-only explanation of the hardening. This is not live approval.
+app.get("/stop-ack-safety-audit", c => c.json({
+  system: "Chagatto-2 STOP Acknowledgement Safety Audit",
+  readOnly: true,
+  liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+  orderSent: false,
+  privateBrokerApiCalledByAudit: false,
+  pendingIntentAutoClearedOnAck: false,
+  emergencyMarketCloseAllowedOnIncompleteActiveOrderSnapshot: false,
+  safeHaltRequiredUntilOrderSpecificReconciliation: true,
+  verifiedWithActualBroker: false,
+  approvedForLive: false,
+  note: "This audit reports fail-closed code policy, not GMO fill/STOP protection. A pending intent must not be manually cleared without checking broker orders, executions, positions and protective stops."
+}));
 
 // 自動実行用エンドポイント。
 // 外部スケジューラから 08:00 / 15:00 / 21:00 (JST) に呼び出す。
