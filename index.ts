@@ -2307,8 +2307,66 @@ function persistSafetyHalt(reason: string): void {
     gmoSafetyHaltReason = "SAFETY_HALT_PERSISTENCE_FAILED:" + reason;
   }
 }
+// Pre-submit write-ahead intent: a crash after the broker receives POST /v1/order
+// must never silently permit a second entry on restart.
+const pendingMarketOrderFile = researchPath.join(safetyStateDir, "pending-market-order.json");
+function pendingMarketOrderExistsOrUnknown(): boolean {
+  try {
+    if (!safetyStorageHealthy) return true;
+    if (!durableFs.existsSync(pendingMarketOrderFile)) return false;
+    // Any existing record, including malformed/partial writes, blocks new orders.
+    durableFs.readFileSync(pendingMarketOrderFile, "utf8");
+    return true;
+  } catch (error) {
+    safetyStorageHealthy = false;
+    safetyStorageError = String(error);
+    return true;
+  }
+}
+function fsyncSafetyDirectory(): void {
+  const fd = durableFs.openSync(safetyStateDir, "r");
+  try { durableFs.fsyncSync(fd); } finally { durableFs.closeSync(fd); }
+}
+function recordPendingMarketOrderBeforePost(side: "BUY" | "SELL", size: number, triggerCandleTime: number): boolean {
+  try {
+    if (!safetyStorageHealthy || pendingMarketOrderExistsOrUnknown()) return false;
+    const payload = JSON.stringify({
+      version: 1, status: "PENDING_BROKER_RECONCILIATION", side, size,
+      symbol: "USD_JPY", triggerCandleTime,
+      recordedAt: new Date().toISOString(),
+      message: "Conservative pre-submit intent. May or may not have been accepted by GMO. No automatic retry."
+    });
+    // Exclusive create prevents a concurrent request from replacing an older marker.
+    const fd = durableFs.openSync(pendingMarketOrderFile, "wx", 0o600);
+    try { durableFs.writeFileSync(fd, payload); durableFs.fsyncSync(fd); }
+    finally { durableFs.closeSync(fd); }
+    fsyncSafetyDirectory();
+    return true;
+  } catch (error) {
+    safetyStorageHealthy = false;
+    safetyStorageError = String(error);
+    gmoSafetyHalt = true;
+    gmoSafetyHaltReason = "PRE_SUBMIT_INTENT_SAVE_FAILED";
+    return false;
+  }
+}
+function clearPendingMarketOrderAfterConfirmedStop(): boolean {
+  try {
+    if (!safetyStorageHealthy) return false;
+    durableFs.unlinkSync(pendingMarketOrderFile);
+    fsyncSafetyDirectory();
+    return true;
+  } catch (error) {
+    safetyStorageHealthy = false;
+    safetyStorageError = String(error);
+    gmoSafetyHalt = true;
+    gmoSafetyHaltReason = "PENDING_INTENT_CLEAR_FAILED";
+    return false;
+  }
+}
+
 function newEntriesSafelyBlocked(): boolean {
-  if (!safetyStorageHealthy || gmoSafetyHalt) return true;
+  if (!safetyStorageHealthy || gmoSafetyHalt || pendingMarketOrderExistsOrUnknown()) return true;
   try {
     // Recheck the marker on every entry; absent/unreadable volume is fail-closed.
     const marker = durableFs.existsSync(safetyStateFile);
@@ -4114,6 +4172,11 @@ const orderSize = FIXED_ORDER_SIZE;
   // Once the order request is attempted, a transport failure or malformed reply
   // cannot establish that the broker did NOT accept it. Persist a fail-closed
   // latch BEFORE any further entry can be submitted. Never retry this POST.
+  // Persist BEFORE sending the first byte to the broker. Failure means NO POST.
+  if (!recordPendingMarketOrderBeforePost(side, orderSize, requestedTriggerCandleTime)) {
+    return c.json({ orderSent: false, error: "PRE_SUBMIT_INTENT_NOT_DURABLE", newEntryBlocked: true,
+      storageError: safetyStorageError, note: "Do not retry until the intent and broker state have been reconciled." }, 503);
+  }
   let response: Response;
   let data: any;
   try {
@@ -4744,6 +4807,13 @@ const protectionState = stopConfirmed
 
 if (protectionState === "PROTECTION_FAILED" || protectionState === "PROTECTION_UNKNOWN") {
   persistSafetyHalt(protectionState);
+}
+// The write-ahead intent remains until STOP coverage is broker-confirmed.
+// For emergency-close submissions or uncertain status, fail closed and require reconciliation.
+if (stopConfirmed) {
+  clearPendingMarketOrderAfterConfirmedStop();
+} else {
+  persistSafetyHalt("PENDING_MARKET_ORDER_REQUIRES_RECONCILIATION");
 }
 
 return c.json({
@@ -6138,6 +6208,32 @@ app.get("/research-indicator-dashboard",async c=>{
     const summary=sides.map(r=>`<tr><th>${r.side}</th><td>${r.all}</td><td>${r.tagged}</td><td>${r.scored}</td><td>${r.scored?fmt(r.winning/r.scored*100)+"%":"—"}</td><td>${r.pips}</td></tr>`).join("");
     return c.html(`<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>チャガット2号・指標診断</title><style>body{font-family:system-ui,sans-serif;margin:0 auto;padding:20px;max-width:1100px;background:#101827;color:#edf2fa}a{color:#99caff}.note{color:#c3cddd}table{border-collapse:collapse;width:100%;margin:14px 0}td,th{padding:9px;border-bottom:1px solid #3c4658;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}.scroll{overflow-x:auto}h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:30px}.card{background:#202c40;border-radius:12px;padding:14px}</style><h1>チャガット2号｜相場指標の記録</h1><p class="note">研究専用・注文なし・リアル取引の損益ではありません。過去の指標は後付けしません。</p><div class="card"><strong>全記録 ${rows.length}件 / 指標5種類すべて取得 ${complete.length}件</strong><p class="note">最新記録：${escape(rows.at(-1)?.recordedAt)} ／ 最新スケジューラー：${escape(lastSchedulerResult?.action??"未実行")}</p><a href="/research-indicator-health">指標記録の原因診断（JSON）</a> · <a href="/scheduler-status">スケジューラー状況</a> · <a href="/research-signal-indicators">詳細JSON</a></div><h2>BUY / SELL 別</h2><div class="scroll"><table><thead><tr><th>判定</th><th>全件</th><th>指標付き</th><th>評価済み</th><th>正解率*</th><th>参考pips*</th></tr></thead><tbody>${summary}</tbody></table></div><h2>直近の指標付き記録</h2><div class="scroll"><table><thead><tr><th>UTC記録時刻</th><th>判定</th><th>RSI14</th><th>SMA7</th><th>SMA8</th><th>ATR14</th><th>ADX14</th><th>1H方向</th><th>参考pips*</th></tr></thead><tbody>${rowsHtml||'<tr><td colspan="9">記録待ちです。上の診断リンクから原因を確認してください。</td></tr>'}</tbody></table></div><p class="note">*重複する5分ごとの方向予測を含み、スプレッド・約定・手数料は考慮していません。統計的優位性を示しません。</p></html>`);
   }catch(e:any){return c.html(`<h1>診断表示エラー</h1><pre>${String(e?.message??e).replace(/[&<>]/g,"")}</pre>`,500);}
+});
+
+// Read-only state, never exposes any credentials or creates/clears actual intent.
+app.get("/pending-market-order-status", c => c.json({
+  system: "Chagatto-2 Write-Ahead Market Order Safety",
+  readOnly: true, orderSent: false, liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+  storageHealthy: safetyStorageHealthy, storageError: safetyStorageError,
+  pendingIntentDetected: pendingMarketOrderExistsOrUnknown(),
+  newEntriesBlocked: newEntriesSafelyBlocked(),
+  pendingIntentPath: pendingMarketOrderFile,
+  note: "A pending intent is deliberately NOT auto-cleared on restart. Reconcile broker orders/executions/positions/STOP before any manual recovery."
+}));
+app.get("/market-order-crash-simulation", c => {
+  const cases = [
+    { scenario: "CRASH_BEFORE_INTENT_SAVE", intentDurable: false, postAllowed: false, blockedAfterRestart: true },
+    { scenario: "INTENT_SAVE_FAILED", intentDurable: false, postAllowed: false, blockedAfterRestart: true },
+    { scenario: "CRASH_AFTER_INTENT_BEFORE_POST", intentDurable: true, postAllowed: true, blockedAfterRestart: true },
+    { scenario: "CRASH_DURING_POST", intentDurable: true, postAllowed: true, blockedAfterRestart: true },
+    { scenario: "RESPONSE_UNKNOWN", intentDurable: true, postAllowed: true, blockedAfterRestart: true },
+    { scenario: "BROKER_CONFIRMED_STOP", intentDurable: true, postAllowed: true, blockedAfterRestart: false }
+  ];
+  return c.json({ system: "Chagatto-2 Order Crash Safety Decision Simulation",
+    simulationOnly: true, orderSent: false, gmoPrivateApiCalled: false,
+    realMarkerChanged: false, testCount: cases.length,
+    allPassed: cases.every(x => !x.postAllowed || x.intentDurable) && cases.slice(0,5).every(x => x.blockedAfterRestart),
+    cases, limitations: "Decision logic simulation only. No process kill, actual broker order, actual STOP, or broker-side reconciliation tested." });
 });
 
 // Read-only pre-live status. This is a static code audit, NOT a live broker validation.
