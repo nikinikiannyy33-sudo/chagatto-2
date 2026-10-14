@@ -7002,7 +7002,16 @@ app.get('/fx-order-id-reconciliation-audit', async c => {
         Array.isArray(orders?.data)?orders.data:[];
       const execRows:any[]=Array.isArray(execs?.data?.list)?execs.data.list:
         Array.isArray(execs?.data)?execs.data:[];
-      const orderMatches=orderRows.length>0&&orderRows.every(r=>String(r?.orderId??'')===id);
+      // A successful HTTP/API response without an order record is not a reconciled order.
+      // Preserve the distinction from a rejected broker request; never treat it as "no order".
+      if (orderRows.length === 0 || execRows.length === 0) {
+        results.push({readable:true,recordMatches:false,
+          reason:orderRows.length===0?'ORDER_RECORD_NOT_RETURNED':'EXECUTION_RECORD_NOT_RETURNED',
+          orderRows:orderRows.length,executionRows:execRows.length,
+          reconciliationRequired:true,stopCoverageVerified:false});
+        continue;
+      }
+      const orderMatches=orderRows.every(r=>String(r?.orderId??'')===id);
       const execMatches=execRows.length>0&&execRows.every(r=>String(r?.orderId??'')===id);
       const executionIds=execRows.map(r=>String(r?.executionId??''));
       const uniqueExecutions=executionIds.every(x=>/^\d+$/.test(x))&&new Set(executionIds).size===executionIds.length;
