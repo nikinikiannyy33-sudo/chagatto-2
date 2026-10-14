@@ -6389,6 +6389,79 @@ app.get("/broker-reconciliation-readonly", async (c) => {
     note:"Snapshot is NOT proof that a STOP protects a specific position. No pagination or order-specific historical reconciliation; never clear a pending intent based on this endpoint." });
 });
 
+
+
+// Conservative, read-only STOP-to-position audit. An unlinked STOP is NEVER
+// assumed to protect any position; no mutable broker or safety operation here.
+type StopAuditPosition = {positionId?:string; side?:string; size?:string|number; amount?:string|number};
+type StopAuditOrder = {executionType?:string; side?:string; settlePosition?:any; size?:string|number; orderSize?:string|number; status?:string};
+function assessStopCoverage(positions:StopAuditPosition[], orders:StopAuditOrder[]) {
+  const stops = orders.filter(o => String(o?.executionType ?? '').toUpperCase() === 'STOP');
+  const positionResults = positions.map(p => {
+    const id = String(p?.positionId ?? '');
+    const side = String(p?.side ?? '').toUpperCase();
+    const qty = Number(p?.size ?? p?.amount);
+    const explicit = stops.filter(o => Array.isArray(o?.settlePosition) && o.settlePosition.some((x:any)=>String(x?.positionId ?? '') === id) && !!id);
+    const correctSide = explicit.filter(o => String(o?.side ?? '').toUpperCase() === (side === 'BUY' ? 'SELL' : side === 'SELL' ? 'BUY' : 'UNKNOWN'));
+    const covered = correctSide.reduce((sum,o) => {
+      const lines = (o.settlePosition as any[]).filter(x => String(x?.positionId ?? '') === id);
+      return sum + lines.reduce((n,x)=>n + (Number.isFinite(Number(x?.size)) && Number(x.size)>0 ? Number(x.size):0), 0);
+    },0);
+    // Unknown quantities and ambiguous IDs are unsafe: explicitly never pass.
+    const status = !id || !['BUY','SELL'].includes(side) || !Number.isFinite(qty) || qty<=0
+      ? 'POSITION_DATA_INCOMPLETE'
+      : !explicit.length ? 'NO_EXPLICIT_STOP_LINK'
+      : !correctSide.length ? 'STOP_DIRECTION_MISMATCH'
+      : covered < qty ? 'STOP_SIZE_NOT_PROVEN' : 'EXPLICIT_COVERAGE_PRESENT_NOT_BROKER_VERIFIED';
+    return {status, explicitLinkedStops: explicit.length, oppositeSideStops:correctSide.length,
+      quantityAvailable:Number.isFinite(qty)&&qty>0, explicitLinkedQuantity:covered,
+      positionQuantity:Number.isFinite(qty)&&qty>0?qty:null};
+  });
+  const unlinkedStops = stops.filter(o=>!Array.isArray(o.settlePosition)||o.settlePosition.length===0).length;
+  const apparentlyCovered = positionResults.filter(x=>x.status==='EXPLICIT_COVERAGE_PRESENT_NOT_BROKER_VERIFIED').length;
+  return {positionCount:positions.length, stopCount:stops.length, unlinkedStops,
+    apparentlyCovered, unresolvedPositions:positionResults.length-apparentlyCovered,
+    positions:positionResults,
+    note:'Explicit stop linkage, side and size are indicative only. Does NOT prove broker fill, STOP trigger, OCO, or historical order safety.'};
+}
+
+app.get('/stop-position-coverage-diagnostic', async (c)=>{
+  const base={system:'Chagatto-2 STOP Position Coverage Diagnostic',readOnly:true,
+    orderSent:false, stopOrderSent:false, safetyStateChanged:false,
+    liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',
+    pendingIntentDetected:pendingMarketOrderExistsOrUnknown()};
+  if (!safetyStorageHealthy) return c.json({...base,status:'INCOMPLETE_BLOCK_NEW_ENTRIES',error:'SAFETY_STORAGE_UNAVAILABLE'},503);
+  const [p,o]=await Promise.allSettled([
+    gmoPrivateGet('/v1/openPositions','?symbol=USD_JPY&count=100'),
+    gmoPrivateGet('/v1/activeOrders','?symbol=USD_JPY&count=100')]);
+  if(p.status==='rejected'||o.status==='rejected') return c.json({...base,status:'INCOMPLETE_BLOCK_NEW_ENTRIES',error:'BROKER_READ_FAILED'},503);
+  const extract=(v:any)=>Array.isArray(v?.data?.list)?v.data.list:Array.isArray(v?.data)?v.data:null;
+  const positions=extract(p.value),orders=extract(o.value);
+  if(!positions||!orders) return c.json({...base,status:'INCOMPLETE_BLOCK_NEW_ENTRIES',error:'UNEXPECTED_BROKER_DATA'},503);
+  const audit=assessStopCoverage(positions,orders);
+  const status=positions.length===0?'NO_OPEN_POSITION_NOT_A_LIVE_STOP_TEST':'STOP_COVERAGE_REQUIRES_MANUAL_BROKER_VERIFICATION';
+  return c.json({...base,status,newEntryRecommendation:'BLOCK_UNTIL_SEPARATELY_AUTHORIZED',
+    ...audit, checks:{allPagesFetched:false,stopExecutionVerified:false,stopFillVerified:false,
+      brokerStopToPositionProtectionVerified:false,liveApproved:false},
+    warning:'No IDs or secrets exposed. Do NOT automatically release any pending order or safety halt based on this audit.'});
+});
+
+app.get('/stop-position-coverage-simulation',c=>{
+  const cases=[
+    {name:'NO_POSITIONS',p:[],o:[],expected:0},
+    {name:'MISSING_STOP',p:[{positionId:'a',side:'BUY',size:1000}],o:[],expected:1},
+    {name:'UNLINKED_STOP',p:[{positionId:'a',side:'BUY',size:1000}],o:[{executionType:'STOP',side:'SELL'}],expected:1},
+    {name:'WRONG_DIRECTION',p:[{positionId:'a',side:'BUY',size:1000}],o:[{executionType:'STOP',side:'BUY',settlePosition:[{positionId:'a',size:1000}]}],expected:1},
+    {name:'PARTIAL_SIZE',p:[{positionId:'a',side:'BUY',size:1000}],o:[{executionType:'STOP',side:'SELL',settlePosition:[{positionId:'a',size:500}]}],expected:1},
+    {name:'EXPLICIT_COVERAGE_ONLY',p:[{positionId:'a',side:'BUY',size:1000}],o:[{executionType:'STOP',side:'SELL',settlePosition:[{positionId:'a',size:1000}]}],expected:0},
+    {name:'MISSING_POSITION_ID',p:[{side:'SELL',size:1000}],o:[{executionType:'STOP',side:'BUY'}],expected:1},
+  ];
+  const tests=cases.map(x=>{const a=assessStopCoverage(x.p,x.o);return {name:x.name,unresolvedPositions:a.unresolvedPositions,passed:a.unresolvedPositions===x.expected,brokerSafetyVerified:false};});
+  return c.json({system:'Chagatto-2 STOP Coverage Simulation',simulationOnly:true,orderSent:false,
+    privateGmoApiCalled:false,safetyStateChanged:false,liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',
+    tests,allPassed:tests.every(t=>t.passed),note:'Synthetic inputs only; cannot validate actual GMO STOP protection or execution.'});
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
