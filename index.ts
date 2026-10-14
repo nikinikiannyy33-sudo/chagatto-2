@@ -3916,6 +3916,38 @@ app.get('/pre-entry-pagination-metadata-test', c => {
     note:'Position metadata classifier test; active-order metadata enforced in the real gmo-order path. No live execution.'});
 });
 
+// Read-only regression exercise of the same two classifiers used by /gmo-order.
+// This is NOT a broker test or an authorization to trade.
+app.get('/pre-entry-combined-guard-regression', (c) => {
+  const cases: {name:string; position:any; orders:any[]|null; incomplete:boolean; expected:boolean}[] = [
+    {name:'BOTH_VERIFIED_EMPTY',position:{status:0,data:{list:[],totalCount:0}},orders:[],incomplete:false,expected:true},
+    {name:'EXISTING_POSITION',position:{status:0,data:{list:[{positionId:'test'}],totalCount:1}},orders:[],incomplete:false,expected:false},
+    {name:'EXISTING_STOP',position:{status:0,data:{list:[],totalCount:0}},orders:[{executionType:'STOP',settleType:'CLOSE'}],incomplete:false,expected:false},
+    {name:'PENDING_CLOSE',position:{status:0,data:{list:[],totalCount:0}},orders:[{settleType:'CLOSE'}],incomplete:false,expected:false},
+    {name:'BOTH_OCCUPIED',position:{status:0,data:{list:[{}],totalCount:1}},orders:[{}],incomplete:false,expected:false},
+    {name:'POSITION_MISSING_DATA',position:{status:0},orders:[],incomplete:false,expected:false},
+    {name:'POSITION_ERROR',position:{status:1,data:{list:[]}},orders:[],incomplete:false,expected:false},
+    {name:'POSITION_INCOMPLETE',position:{status:0,data:{list:[],totalCount:1}},orders:[],incomplete:false,expected:false},
+    {name:'POSITION_NULL_TOTAL',position:{status:0,data:{list:[],totalCount:null}},orders:[],incomplete:false,expected:false},
+    {name:'POSITION_LIMIT',position:{status:0,data:{list:Array.from({length:100},()=>({}))}},orders:[],incomplete:false,expected:false},
+    {name:'ORDER_RESPONSE_MISSING',position:{status:0,data:{list:[]}},orders:null,incomplete:false,expected:false},
+    {name:'ORDERS_INCOMPLETE',position:{status:0,data:{list:[]}},orders:[],incomplete:true,expected:false},
+    {name:'ORDERS_LIMIT',position:{status:0,data:{list:[]}},orders:Array.from({length:100},()=>({})),incomplete:false,expected:false},
+    {name:'POSITION_BAD_COUNT_TYPE',position:{status:0,data:{list:[],count:true}},orders:[],incomplete:false,expected:false},
+  ];
+  const tests=cases.map(x=>{
+    const p=decidePreEntryPositionSafety(x.position);
+    const o=decidePreEntryActiveOrderSafety(x.orders,x.incomplete);
+    const allowed=p.allowed && o.allowed;
+    return {name:x.name,positionReason:p.reason,orderReason:o.reason,allowed,passed:allowed===x.expected};
+  });
+  return c.json({system:'Chagatto-2 Combined Pre-entry Guard Regression',
+    simulationOnly:true,orderSent:false,brokerCalled:false,safetyStateChanged:false,
+    liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',
+    testCount:tests.length,allPassed:tests.every(x=>x.passed),tests,
+    limitations:['SHARED_CLASSIFIERS_NOT_FULL_POST_AUTH_ORDER_FLOW','NO_BROKER_IO','NO_STOP_FILL_TEST','NO_LIVE_APPROVAL']});
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
@@ -6719,6 +6751,87 @@ app.get('/actual-order-route-disabled-probe', async (c) => {
       'NO_LIVE_APPROVAL'
     ]
   });
+});
+
+
+// Consolidated pre-live verification: 14 shared pre-entry checks,
+// 10 order/STOP decision checks, and 4 real Hono kill-switch checks.
+// Only runs when live trading is explicitly disabled. No broker I/O.
+app.get('/final-safety-batch', async c => {
+  if (process.env.LIVE_TRADING_ENABLED !== 'false') {
+    return c.json({system:'Chagatto-2 Final Safety Batch',executed:false,allPassed:false,
+      reason:'REFUSE_UNLESS_LIVE_TRADING_ENABLED_FALSE',liveApproved:false},409);
+  }
+  const positionEmpty={status:0,data:{list:[],totalCount:0}};
+  const combinedCases:[string,any,any[]|null,boolean,boolean][]=[
+    ['BOTH_EMPTY',positionEmpty,[],false,true],
+    ['OPEN_POSITION',{status:0,data:{list:[{positionId:'x'}],totalCount:1}},[],false,false],
+    ['STALE_STOP',positionEmpty,[{executionType:'STOP'}],false,false],
+    ['PENDING_OPEN',positionEmpty,[{settleType:'OPEN'}],false,false],
+    ['PENDING_CLOSE',positionEmpty,[{settleType:'CLOSE'}],false,false],
+    ['UNKNOWN_ORDER',positionEmpty,[{}],false,false],
+    ['INVALID_POSITION',{status:0,data:{}},[],false,false],
+    ['POSITION_ERROR',{status:1,data:{list:[]}},[],false,false],
+    ['TRUNCATED_POSITION',{status:0,data:{list:[],totalCount:1}},[],false,false],
+    ['NULL_POSITION_COUNT',{status:0,data:{list:[],totalCount:null}},[],false,false],
+    ['POSITION_PAGE_LIMIT',{status:0,data:{list:Array.from({length:100},()=>({}))}},[],false,false],
+    ['UNKNOWN_ORDER_REPLY',positionEmpty,null,false,false],
+    ['ORDER_PAGE_INCOMPLETE',positionEmpty,[],true,false],
+    ['ORDER_PAGE_LIMIT',positionEmpty,Array.from({length:100},()=>({})),false,false]
+  ];
+  const preEntry=combinedCases.map(([name,position,orders,incomplete,expected])=>{
+    const pos=decidePreEntryPositionSafety(position);
+    const ord=decidePreEntryActiveOrderSafety(orders,incomplete);
+    const allowed=pos.allowed && ord.allowed;
+    return {name,passed:allowed===expected,allowed,positionReason:pos.reason,orderReason:ord.reason};
+  });
+  const base={intentSaved:true,postOutcome:'ACK' as const,execution:'FILLED' as const,
+    stopPlacement:'ACK' as const,stopVerified:true,brokerReadsOk:true};
+  const lifecycle:ProtectionScenario[]=[
+    {...base,name:'INTENT_NOT_SAVED',intentSaved:false,expected:'HALT_INTENT_NOT_DURABLE'},
+    {...base,name:'CRASH_BEFORE_POST',postOutcome:'NOT_SENT',expected:'HALT_PENDING_INTENT'},
+    {...base,name:'ORDER_RESULT_UNKNOWN',postOutcome:'UNKNOWN',expected:'HALT_ORDER_UNKNOWN'},
+    {...base,name:'ORDER_REJECTED',postOutcome:'REJECTED',expected:'HALT_REJECTED_RECONCILE'},
+    {...base,name:'BROKER_READ_FAIL',brokerReadsOk:false,expected:'HALT_BROKER_UNAVAILABLE'},
+    {...base,name:'EXECUTION_UNKNOWN',execution:'UNKNOWN',expected:'HALT_EXECUTION_UNRESOLVED'},
+    {...base,name:'STOP_FAILED',stopPlacement:'FAILED',expected:'HALT_STOP_UNCONFIRMED'},
+    {...base,name:'STOP_RESULT_UNKNOWN',stopPlacement:'UNKNOWN',expected:'HALT_STOP_UNCONFIRMED'},
+    {...base,name:'STOP_COVERAGE_MISMATCH',stopVerified:false,expected:'HALT_STOP_COVERAGE_UNVERIFIED'},
+    {...base,name:'SYNTHETIC_SUCCESS',expected:'SIMULATED_PROTECTION_PATH_COMPLETE'}
+  ];
+  const orderStop=lifecycle.map(x=>{
+    const got=evaluateProtectionPath(x);
+    return {name:x.name,phase:got.phase,passed:got.phase===x.expected && got.newEntryBlocked===true};
+  });
+  const pendingBefore=pendingMarketOrderExistsOrUnknown();
+  const haltBefore=newEntriesSafelyBlocked();
+  const routeCases:[string,any][]=[
+    ['NO_BODY',undefined],['INVALID_SIDE',{side:'BAD',triggerCandleTime:1}],
+    ['BUY',{side:'BUY',triggerCandleTime:Date.now()}],
+    ['SELL',{side:'SELL',triggerCandleTime:Date.now()}]
+  ];
+  const actualRoute=[];
+  for(const [name,payload] of routeCases){
+    const req=new Request(new URL('/gmo-order',c.req.url),{
+      method:'POST',headers:payload===undefined?{}:{'Content-Type':'application/json'},
+      body:payload===undefined?undefined:JSON.stringify(payload)});
+    const resp=await app.fetch(req);
+    let body:any=null;
+    try {body=await resp.json();} catch {}
+    actualRoute.push({name,status:resp.status,
+      passed:resp.status===403 && body?.orderSent===false && body?.error==='LIVE_TRADING_ENABLED is false'});
+  }
+  const stateUnchanged=pendingBefore===pendingMarketOrderExistsOrUnknown() && haltBefore===newEntriesSafelyBlocked();
+  const allPassed=[...preEntry,...orderStop,...actualRoute].every(x=>x.passed) && stateUnchanged;
+  return c.json({system:'Chagatto-2 Consolidated Prelive Safety Batch',
+    mode:'NO_BROKER_IO_LIVE_DISABLED',testCount:preEntry.length+orderStop.length+actualRoute.length,
+    allPassed,groups:{preEntry:{count:preEntry.length,passed:preEntry.every(x=>x.passed),tests:preEntry},
+      orderStop:{count:orderStop.length,passed:orderStop.every(x=>x.passed),tests:orderStop},
+      actualRoute:{count:actualRoute.length,passed:actualRoute.every(x=>x.passed),tests:actualRoute}},
+    stateUnchanged,orderSent:false,stopSent:false,brokerApiCalledByTest:false,
+    liveApproved:false,limitations:[
+      'REAL_ROUTE_TESTS_ONLY_KILL_SWITCH','LIFECYCLE_IS_DECISION_MODEL_NOT_POST_AUTH_INJECTION',
+      'NO_LIVE_GMO_ORDER_OR_STOP_TRIGGER_TEST','NO_STRATEGY_AND_TRANSACTION_COST_APPROVAL']});
 });
 
 const port = Number(process.env.PORT || 8080);
