@@ -6858,6 +6858,43 @@ app.get('/final-safety-batch', async c => {
       'NO_LIVE_GMO_ORDER_OR_STOP_TRIGGER_TEST','NO_STRATEGY_AND_TRANSACTION_COST_APPROVAL']});
 });
 
+// Broker snapshot completeness audit. Diagnostic only: never authorizes orders.
+// A single page cannot prove protective STOP fill or historical outcomes.
+app.get('/stop-protection-evidence-audit', async c => {
+  const base = { system:'Chagatto-2 STOP Protection Evidence Audit', readOnly:true,
+    orderSent:false, stopOrderSent:false, safetyStateChanged:false,
+    liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',
+    approvedForLive:false, completeProtectionVerificationImplemented:false,
+    newEntryRecommendation:'BLOCK_UNTIL_SEPARATELY_AUTHORIZED' };
+  if (!safetyStorageHealthy) return c.json({...base, status:'INCOMPLETE', reason:'STORAGE_UNAVAILABLE'},503);
+  const sources = [
+    ['/v1/openPositions','?symbol=USD_JPY&count=100'],
+    ['/v1/activeOrders','?symbol=USD_JPY&count=100'],
+    ['/v1/latestExecutions','?symbol=USD_JPY&count=100']
+  ] as const;
+  const replies = await Promise.allSettled(sources.map(([path,query])=>gmoPrivateGet(path,query)));
+  if (replies.some(r=>r.status==='rejected')) return c.json({...base,status:'INCOMPLETE',reason:'BROKER_READ_FAILED'},503);
+  const inspect=(response:any)=>{
+    if (response?.status !== 0) return {valid:false,count:null,declaredCount:null,paginationProven:false};
+    const list=Array.isArray(response?.data?.list)?response.data.list:Array.isArray(response?.data)?response.data:null;
+    if (!list) return {valid:false,count:null,declaredCount:null,paginationProven:false};
+    const declared=response?.data?.totalCount;
+    // Only explicit, integer totalCount matching an under-limit list can prove one-page completeness.
+    const totalOk=typeof declared==='number' && Number.isSafeInteger(declared) && declared>=0 && declared===list.length && list.length<100;
+    return {valid:true,count:list.length,declaredCount:typeof declared==='number'?declared:null,paginationProven:totalOk};
+  };
+  const snapshots=replies.map(r=>inspect((r as PromiseFulfilledResult<any>).value));
+  const [positions,orders,executions]=snapshots;
+  const complete=snapshots.every(x=>x.valid && x.paginationProven);
+  // No broker-specific order/position linking, historical STOP trigger or fill proof is implemented.
+  return c.json({...base, status:complete?'SNAPSHOTS_COMPLETE_PROTECTION_UNVERIFIED':'INCOMPLETE_UNVERIFIABLE_PAGINATION',
+    snapshots:{positions,activeOrders:orders,recentExecutions:executions},
+    pendingIntentDetected:pendingMarketOrderExistsOrUnknown(),
+    checks:{allThreePagesProvenComplete:complete,orderSpecificReconciliation:false,
+      stopToPositionProtectionVerified:false,stopTriggerOrFillVerified:false},
+    note:'Read-only audit. Even three complete snapshots cannot prove protective STOP status or authorize trading.'},complete?200:409);
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
