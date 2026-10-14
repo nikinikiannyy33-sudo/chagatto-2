@@ -3826,6 +3826,36 @@ app.get("/market-hours-status", (c) => {
   });
 });
 
+
+// Pure classifier used by the real /gmo-order safety gate and its read-only test.
+// A complete, empty order list is the ONLY acceptable state for a new entry.
+function decidePreEntryActiveOrderSafety(rows: any[] | null, pageIncomplete = false) {
+  if (!Array.isArray(rows)) return {allowed:false,reason:'ACTIVE_ORDER_RESPONSE_UNVERIFIABLE',activeOrderCount:null};
+  if (pageIncomplete || rows.length >= 100) return {allowed:false,reason:'ACTIVE_ORDER_PAGINATION_NOT_VERIFIED',activeOrderCount:rows.length};
+  if (rows.length > 0) return {allowed:false,reason:'EXISTING_BROKER_ORDER_REQUIRES_RECONCILIATION',activeOrderCount:rows.length};
+  return {allowed:true,reason:'NO_ACTIVE_BROKER_ORDERS',activeOrderCount:0};
+}
+
+app.get('/pre-entry-active-order-guard-test', (c) => {
+  const cases = [
+    {name:'EMPTY_VERIFIED', rows:[], incomplete:false, allowed:true},
+    {name:'STALE_STOP', rows:[{executionType:'STOP',settleType:'CLOSE'}], incomplete:false, allowed:false},
+    {name:'OPEN_PENDING', rows:[{executionType:'MARKET',settleType:'OPEN'}], incomplete:false, allowed:false},
+    {name:'CLOSE_PENDING', rows:[{executionType:'LIMIT',settleType:'CLOSE'}], incomplete:false, allowed:false},
+    {name:'UNKNOWN_ORDER_TYPE', rows:[{}], incomplete:false, allowed:false},
+    {name:'MALFORMED_RESPONSE', rows:null, incomplete:false, allowed:false},
+    {name:'INCOMPLETE_PAGE', rows:[], incomplete:true, allowed:false},
+    {name:'PAGE_LIMIT_REACHED', rows:Array.from({length:100},()=>({})), incomplete:false, allowed:false}
+  ];
+  const tests = cases.map(x => {const got=decidePreEntryActiveOrderSafety(x.rows,x.incomplete);
+    return {name:x.name,reason:got.reason,allowed:got.allowed,passed:got.allowed===x.allowed};});
+  return c.json({system:'Chagatto-2 Pre-entry Active Order Guard',simulationOnly:true,
+    orderSent:false,gmoPrivateApiCalled:false,volumeStateChanged:false,
+    liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',
+    testCount:tests.length,allPassed:tests.every(x=>x.passed),tests,
+    limitations:['PURE_CLASSIFIER_PLUS_REAL_ROUTE_INTEGRATION_NOT_POST_AUTH_PROBE','NO_LIVE_ORDER_TEST','NO_FULL_ORDER_HISTORY_PAGINATION']});
+});
+
 app.post("/gmo-order", async (c) => {
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
@@ -4026,21 +4056,27 @@ try {
   }, 503);
 }
 
-const activeOrders = Array.isArray(activeOrderData?.data)
-  ? activeOrderData.data
-  : Array.isArray(activeOrderData?.data?.list)
-    ? activeOrderData.data.list
-    : [];
-
-const openActiveOrders = activeOrders.filter(
-  (x: any) => String(x?.settleType ?? "").toUpperCase() === "OPEN"
+// Fail closed on missing or incomplete broker lists. A stale STOP or CLOSE
+// order can be hazardous even if the account currently has no positions.
+const brokerOrderList = Array.isArray(activeOrderData?.data?.list)
+  ? activeOrderData.data.list
+  : Array.isArray(activeOrderData?.data)
+    ? activeOrderData.data
+    : null;
+const brokerOrderPageIncomplete =
+  (activeOrderData?.data?.totalCount !== undefined &&
+    Number(activeOrderData.data.totalCount) > (brokerOrderList?.length ?? 0)) ||
+  (activeOrderData?.data?.count !== undefined &&
+    Number(activeOrderData.data.count) > (brokerOrderList?.length ?? 0));
+const activeOrderDecision = decidePreEntryActiveOrderSafety(
+  brokerOrderList, brokerOrderPageIncomplete
 );
-
-if (openActiveOrders.length > 0) {
+if (!activeOrderDecision.allowed) {
   return c.json({
     orderSent: false,
-    error: "OPEN_ORDER_ALREADY_ACTIVE",
-    activeOrderCount: openActiveOrders.length,
+    error: activeOrderDecision.reason,
+    activeOrderCount: activeOrderDecision.activeOrderCount,
+    note: 'No new market order until every existing broker order is reconciled.'
   }, 409);
 }
 
