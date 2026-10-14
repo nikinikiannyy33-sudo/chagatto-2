@@ -6874,25 +6874,28 @@ app.get('/stop-protection-evidence-audit', async c => {
   ] as const;
   const replies = await Promise.allSettled(sources.map(([path,query])=>gmoPrivateGet(path,query)));
   if (replies.some(r=>r.status==='rejected')) return c.json({...base,status:'INCOMPLETE',reason:'BROKER_READ_FAILED'},503);
-  const inspect=(response:any)=>{
-    if (response?.status !== 0) return {valid:false,count:null,declaredCount:null,paginationProven:false};
+  // GMO FX activeOrders uses prevId for older pages, not totalCount.
+  // latestExecutions returns a limited recent set: never call it full history.
+  const inspect=(response:any, source:'positions'|'orders'|'executions')=>{
+    if (response?.status !== 0) return {valid:false,count:null,atPageLimit:null,hasExplicitTotalCount:false};
     const list=Array.isArray(response?.data?.list)?response.data.list:Array.isArray(response?.data)?response.data:null;
-    if (!list) return {valid:false,count:null,declaredCount:null,paginationProven:false};
-    const declared=response?.data?.totalCount;
-    // Only explicit, integer totalCount matching an under-limit list can prove one-page completeness.
-    const totalOk=typeof declared==='number' && Number.isSafeInteger(declared) && declared>=0 && declared===list.length && list.length<100;
-    return {valid:true,count:list.length,declaredCount:typeof declared==='number'?declared:null,paginationProven:totalOk};
+    if (!list) return {valid:false,count:null,atPageLimit:null,hasExplicitTotalCount:false};
+    return {valid:true,count:list.length,atPageLimit:list.length>=100,hasExplicitTotalCount:false,
+      meaning:source==='executions'?'RECENT_EXECUTIONS_ONLY_NOT_FULL_HISTORY':
+        source==='orders'?'FX_PREVID_PAGINATION_NOT_EXHAUSTED_PROOF':'POSITION_SNAPSHOT_NOT_HISTORICAL_PROOF'};
   };
-  const snapshots=replies.map(r=>inspect((r as PromiseFulfilledResult<any>).value));
+  const snapshots=replies.map((r,i)=>inspect((r as PromiseFulfilledResult<any>).value,
+    (['positions','orders','executions'] as const)[i]));
   const [positions,orders,executions]=snapshots;
-  const complete=snapshots.every(x=>x.valid && x.paginationProven);
-  // No broker-specific order/position linking, historical STOP trigger or fill proof is implemented.
-  return c.json({...base, status:complete?'SNAPSHOTS_COMPLETE_PROTECTION_UNVERIFIED':'INCOMPLETE_UNVERIFIABLE_PAGINATION',
+  const allReadable=snapshots.every(x=>x.valid);
+  // Do not overstate empty snapshots as order-specific evidence or permission for live trading.
+  return c.json({...base, status:allReadable?'READABLE_SNAPSHOTS_INSUFFICIENT_FOR_PROTECTION_PROOF':'INCOMPLETE_BROKER_RESPONSE',
     snapshots:{positions,activeOrders:orders,recentExecutions:executions},
     pendingIntentDetected:pendingMarketOrderExistsOrUnknown(),
-    checks:{allThreePagesProvenComplete:complete,orderSpecificReconciliation:false,
-      stopToPositionProtectionVerified:false,stopTriggerOrFillVerified:false},
-    note:'Read-only audit. Even three complete snapshots cannot prove protective STOP status or authorize trading.'},complete?200:409);
+    checks:{allThreeBrokerReadsSucceeded:allReadable,allThreePagesProvenComplete:false,
+      orderSpecificReconciliation:false,stopToPositionProtectionVerified:false,stopTriggerOrFillVerified:false},
+    nextRequired:'FX_ACTIVE_ORDERS_PREVID_PAGINATION_AND_ORDER_ID_SPECIFIC_RECONCILIATION',
+    note:'GMO FX does not promise totalCount on these responses. A page with fewer than 100 items does not prove full execution history. Read-only; never approve live.'},allReadable?200:409);
 });
 
 const port = Number(process.env.PORT || 8080);
