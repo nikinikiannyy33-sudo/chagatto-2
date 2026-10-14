@@ -6969,13 +6969,21 @@ app.get('/fx-order-id-reconciliation-audit', async c => {
       orderSpecificReconciliation:false,stopProtectionVerified:false});
     const results:any[]=[];
     for(const id of ids) {
-      let orders:any,execs:any;
-      try {
-        // FX endpoint supports orderId; never pass clientOrderId here.
-        [orders,execs]=await Promise.all([
-          gmoPrivateGet('/v1/orders','?orderId='+encodeURIComponent(id)),
-          gmoPrivateGet('/v1/executions','?orderId='+encodeURIComponent(id))]);
-      }catch(error){ results.push({readable:false,reason:'ORDER_SPECIFIC_BROKER_READ_FAILED'});continue; }
+      // Read each endpoint independently so one failed broker read does not hide the cause.
+      // Never return raw error messages: they can include broker response details.
+      const [orderFetch, executionFetch] = await Promise.allSettled([
+        gmoPrivateGet('/v1/orders','?orderId='+encodeURIComponent(id)),
+        gmoPrivateGet('/v1/executions','?orderId='+encodeURIComponent(id))]);
+      if (orderFetch.status !== 'fulfilled' || executionFetch.status !== 'fulfilled') {
+        results.push({readable:false,reason:'ORDER_SPECIFIC_BROKER_READ_FAILED',
+          orderRead:orderFetch.status==='fulfilled'?'OK':'FAILED',
+          executionRead:executionFetch.status==='fulfilled'?'OK':'FAILED',
+          // No retry or trade; a historical unavailability is not evidence of a missing order.
+          reconciliationRequired:true});
+        continue;
+      }
+      const orders:any=orderFetch.value;
+      const execs:any=executionFetch.value;
       const orderRows:any[]=Array.isArray(orders?.data?.list)?orders.data.list:
         Array.isArray(orders?.data)?orders.data:[];
       const execRows:any[]=Array.isArray(execs?.data?.list)?execs.data.list:
@@ -6998,7 +7006,7 @@ app.get('/fx-order-id-reconciliation-audit', async c => {
       results,orderSpecificReconciliationSampled:everyRecordMatched,
       fullOrderHistoryReconciled:false,positionIdToStopCoverageVerified:false,
       stopTriggerOrFillVerified:false,
-      note:'Bounded sample only. Order IDs, position IDs, client IDs and personal details withheld. Not evidence of complete history or live trading safety.'},everyRecordMatched?200:409);
+      note:'Bounded sample only. Failed endpoint is identified without disclosing broker errors or IDs. Historical read failures may reflect retention, permissions, API rejection or transport; they are not proof that an order is absent. Not evidence of STOP coverage or live trading safety.'},everyRecordMatched?200:409);
   }catch(error){return c.json({...base,status:'UNVERIFIABLE',reason:'BROKER_READ_FAILED'},503);}
 });
 
