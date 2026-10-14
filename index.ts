@@ -3827,14 +3827,6 @@ app.get("/market-hours-status", (c) => {
 });
 
 app.post("/gmo-order", async (c) => {
-  if (!isGmoFxTradingHoursJst()) {
-    return c.json({
-      orderSent: false,
-      error: "GMO_FX_MARKET_CLOSED",
-      regularTradingHours: "Mon 07:00 - Sat 05:59 JST",
-      jst: jstParts(),
-    }, 409);
-  }
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
     return c.json({
@@ -3843,6 +3835,14 @@ app.post("/gmo-order", async (c) => {
     }, 403);
   }
 
+  if (!isGmoFxTradingHoursJst()) {
+    return c.json({
+      orderSent: false,
+      error: "GMO_FX_MARKET_CLOSED",
+      regularTradingHours: "Mon 07:00 - Sat 05:59 JST",
+      jst: jstParts(),
+    }, 409);
+  }
   // 安全装置2：管理者トークン
   const adminToken = process.env.ADMIN_TOKEN;
   const receivedToken = c.req.header("X-ADMIN-TOKEN");
@@ -6566,6 +6566,67 @@ app.get('/order-stop-lifecycle-simulation',c=>{
   ];
   const tests=scenarios.map(s=>{const result=evaluateProtectionPath(s);return {scenario:s.name,phase:result.phase,marketPostAllowed:result.marketPostAllowed,newEntryBlocked:result.newEntryBlocked,manualReconciliation:result.manualReconciliation,passed:result.phase===s.expected && result.newEntryBlocked && (s.name!=='INTENT_NOT_SAVED'||!result.marketPostAllowed)};});
   return c.json({system:'Chagatto-2 Order-STOP Lifecycle Simulation',mode:'SIMULATION_ONLY',liveTradingEnabled:false,orderSent:false,stopOrderSent:false,gmoPrivateApiCalled:false,volumeOrSafetyStateChanged:false,realBrokerSafetyVerified:false,liveApproved:false,testCount:tests.length,allPassed:tests.every(t=>t.passed),tests,limitations:['PURE_DECISION_MODEL_NOT_ACTUAL_ORDER_CODE','NO_REAL_CRASH_INJECTION','NO_BROKER_STOP_FILL_TEST','NO_TRANSACTION_COST_VALIDATION']});
+});
+
+
+// Read-only execution-path probe. Calls the REAL /gmo-order route only while
+// trading is explicitly disabled, without credentials, and never calls GMO.
+// This is NOT fault injection beyond the route's first live-trading gate.
+app.get('/actual-order-route-disabled-probe', async (c) => {
+  const enabled = process.env.LIVE_TRADING_ENABLED;
+  if (enabled !== 'false') {
+    return c.json({
+      system: 'Chagatto-2 Actual Order Route Disabled Probe',
+      attempted: false,
+      passed: false,
+      liveTradingEnabledValue: enabled === 'true' ? 'true' : 'not_explicitly_false',
+      reason: 'REFUSED_UNLESS_LIVE_TRADING_ENABLED_EXPLICITLY_FALSE',
+      orderSent: false,
+      liveApproved: false
+    }, 409);
+  }
+  const beforePending = pendingMarketOrderExistsOrUnknown();
+  const beforeBlocked = newEntriesSafelyBlocked();
+  const cases = [
+    { name: 'NO_BODY', payload: undefined },
+    { name: 'INVALID_SIDE', payload: { side: 'NOT_A_SIDE', triggerCandleTime: 1 } },
+    { name: 'PLAUSIBLE_BUY', payload: { side: 'BUY', triggerCandleTime: Date.now() } },
+    { name: 'PLAUSIBLE_SELL', payload: { side: 'SELL', triggerCandleTime: Date.now() } }
+  ];
+  const tests = [];
+  for (const sample of cases) {
+    const request = new Request(new URL('/gmo-order', c.req.url).toString(), {
+      method: 'POST',
+      headers: sample.payload === undefined ? {} : {'Content-Type': 'application/json'},
+      body: sample.payload === undefined ? undefined : JSON.stringify(sample.payload)
+    });
+    const response = await app.fetch(request);
+    let body: any = null;
+    try { body = await response.json(); } catch { /* treat as failed */ }
+    tests.push({name: sample.name, status: response.status,
+      error: String(body?.error ?? ''), orderSent: body?.orderSent,
+      passed: response.status === 403 && body?.orderSent === false && body?.error === 'LIVE_TRADING_ENABLED is false'});
+  }
+  const afterPending = pendingMarketOrderExistsOrUnknown();
+  const afterBlocked = newEntriesSafelyBlocked();
+  const stateUnchanged = beforePending === afterPending && beforeBlocked === afterBlocked;
+  return c.json({
+    system: 'Chagatto-2 Actual Order Route Disabled Probe',
+    mode: 'REAL_HONO_ROUTE_WITH_TRADING_DISABLED',
+    liveTradingEnabled: false, orderSent: false, stopOrderSent: false,
+    directBrokerApiCalledByProbe: false, volumeStateChangedByProbe: false,
+    testCount: tests.length,
+    allPassed: tests.every(t => t.passed) && stateUnchanged,
+    pendingIntentUnchanged: beforePending === afterPending,
+    safetyGateUnchanged: beforeBlocked === afterBlocked,
+    tests,
+    limitations: [
+      'TESTS_ONLY_THE_REAL_ROUTE_KILL_SWITCH_NOT_POST_AUTH_ORDER_FLOW',
+      'NO_BROKER_ORDER_OR_STOP_PLACED',
+      'NO_CRASH_DURING_POST_OR_BROKER_FAULT_INJECTION',
+      'NO_LIVE_APPROVAL'
+    ]
+  });
 });
 
 const port = Number(process.env.PORT || 8080);
