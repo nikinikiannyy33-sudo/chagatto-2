@@ -6462,6 +6462,62 @@ app.get('/stop-position-coverage-simulation',c=>{
     tests,allPassed:tests.every(t=>t.passed),note:'Synthetic inputs only; cannot validate actual GMO STOP protection or execution.'});
 });
 
+
+// Pre-live reconciliation decision: a deliberately conservative, read-only gate.
+// This endpoint does NOT authorize any trade, clear safety state, or mutate broker data.
+function assessPreliveReadiness(input: {storageHealthy:boolean; pending:boolean; halted:boolean; brokerReadsOk:boolean; shapeOk:boolean; positions:number; orders:number; stopUnresolved:number}) {
+  const blockers:string[]=[];
+  if(!input.storageHealthy) blockers.push('SAFETY_STORAGE_UNAVAILABLE');
+  if(input.pending) blockers.push('PENDING_ORDER_INTENT_REQUIRES_MANUAL_RECONCILIATION');
+  if(input.halted) blockers.push('SAFETY_HALT_ACTIVE');
+  if(!input.brokerReadsOk) blockers.push('BROKER_SNAPSHOT_FAILED');
+  if(!input.shapeOk) blockers.push('BROKER_RESPONSE_INCOMPLETE');
+  if(input.positions>0) blockers.push('OPEN_POSITIONS_REQUIRE_MANUAL_PROTECTION_AUDIT');
+  if(input.orders>0) blockers.push('ACTIVE_ORDERS_REQUIRE_MANUAL_AUDIT');
+  if(input.stopUnresolved>0) blockers.push('STOP_COVERAGE_UNRESOLVED');
+  // An empty snapshot is not authorization: missing history, latency, spread, execution tests remain.
+  return {decision:'BLOCK_NEW_ENTRY', blockers, brokerSafetyVerified:false, liveApproved:false};
+}
+app.get('/prelive-reconciliation-gate', async c=>{
+  const base={system:'Chagatto-2 Prelive Reconciliation Gate',readOnly:true,orderSent:false,
+    stopOrderSent:false,safetyStateChanged:false,liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true'};
+  const pending=pendingMarketOrderExistsOrUnknown();
+  const storageHealthy=safetyStorageHealthy;
+  const halted=newEntriesSafelyBlocked() && !pending ? true : gmoSafetyHalt;
+  if(!storageHealthy || !safetyStorageHealthy) return c.json({...base,...assessPreliveReadiness({storageHealthy:false,pending,halted:true,brokerReadsOk:false,shapeOk:false,positions:0,orders:0,stopUnresolved:0}),dataStatus:'UNAVAILABLE'},503);
+  const responses=await Promise.allSettled([
+    gmoPrivateGet('/v1/openPositions','?symbol=USD_JPY&count=100'),
+    gmoPrivateGet('/v1/activeOrders','?symbol=USD_JPY&count=100'),
+    gmoPrivateGet('/v1/latestExecutions','?symbol=USD_JPY&count=100')]);
+  const readsOk=responses.every(r=>r.status==='fulfilled');
+  const extract=(v:any):any[]|null=>Array.isArray(v?.data?.list)?v.data.list:Array.isArray(v?.data)?v.data:null;
+  const positions=readsOk?extract((responses[0] as PromiseFulfilledResult<any>).value):null;
+  const orders=readsOk?extract((responses[1] as PromiseFulfilledResult<any>).value):null;
+  const executions=readsOk?extract((responses[2] as PromiseFulfilledResult<any>).value):null;
+  const shapeOk=!!positions && !!orders && !!executions;
+  const audit=shapeOk?assessStopCoverage(positions!,orders!):null;
+  const assessment=assessPreliveReadiness({storageHealthy,pending,halted,brokerReadsOk:readsOk,shapeOk,
+    positions:positions?.length??0,orders:orders?.length??0,stopUnresolved:audit?.unresolvedPositions??0});
+  return c.json({...base,...assessment,dataStatus:shapeOk?'SNAPSHOT_RECEIVED':'INCOMPLETE',
+    counts:shapeOk?{positions:positions!.length,activeOrders:orders!.length,recentExecutions:executions!.length,unresolvedPositions:audit!.unresolvedPositions}:null,
+    limitations:['NO_PAGINATION','NO_ORDER_SPECIFIC_EXECUTION_PROOF','NO_REAL_STOP_TRIGGER_OR_FILL_TEST','NO_COST_OR_STRATEGY_VALIDATION'],
+    note:'Read-only snapshot. Never clears a pending intent or grants trading authorization.'},shapeOk?200:503);
+});
+app.get('/prelive-reconciliation-gate-test',c=>{
+  const scenarios=[
+    {name:'EMPTY_SNAPSHOT',v:{storageHealthy:true,pending:false,halted:false,brokerReadsOk:true,shapeOk:true,positions:0,orders:0,stopUnresolved:0},expected:[]},
+    {name:'STORAGE_FAILURE',v:{storageHealthy:false,pending:false,halted:false,brokerReadsOk:true,shapeOk:true,positions:0,orders:0,stopUnresolved:0},expected:['SAFETY_STORAGE_UNAVAILABLE']},
+    {name:'PENDING_INTENT',v:{storageHealthy:true,pending:true,halted:false,brokerReadsOk:true,shapeOk:true,positions:0,orders:0,stopUnresolved:0},expected:['PENDING_ORDER_INTENT_REQUIRES_MANUAL_RECONCILIATION']},
+    {name:'HALT_ACTIVE',v:{storageHealthy:true,pending:false,halted:true,brokerReadsOk:true,shapeOk:true,positions:0,orders:0,stopUnresolved:0},expected:['SAFETY_HALT_ACTIVE']},
+    {name:'BROKER_UNAVAILABLE',v:{storageHealthy:true,pending:false,halted:false,brokerReadsOk:false,shapeOk:false,positions:0,orders:0,stopUnresolved:0},expected:['BROKER_SNAPSHOT_FAILED','BROKER_RESPONSE_INCOMPLETE']},
+    {name:'OPEN_POSITION',v:{storageHealthy:true,pending:false,halted:false,brokerReadsOk:true,shapeOk:true,positions:1,orders:0,stopUnresolved:1},expected:['OPEN_POSITIONS_REQUIRE_MANUAL_PROTECTION_AUDIT','STOP_COVERAGE_UNRESOLVED']},
+    {name:'ACTIVE_ORDER',v:{storageHealthy:true,pending:false,halted:false,brokerReadsOk:true,shapeOk:true,positions:0,orders:1,stopUnresolved:0},expected:['ACTIVE_ORDERS_REQUIRE_MANUAL_AUDIT']},
+  ];
+  const tests=scenarios.map(s=>{const result=assessPreliveReadiness(s.v);return {scenario:s.name,passed:result.decision==='BLOCK_NEW_ENTRY' && !result.liveApproved && JSON.stringify(result.blockers)===JSON.stringify(s.expected)};});
+  return c.json({system:'Chagatto-2 Prelive Gate Simulation',simulationOnly:true,orderSent:false,privateGmoApiCalled:false,safetyStateChanged:false,
+    testCount:tests.length,allPassed:tests.every(t=>t.passed),tests,liveApproved:false});
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
