@@ -6344,6 +6344,51 @@ app.get("/unknown-order-outcome-test", (c) => {
     limits: "Source-path simulation only. Does not validate broker executions, STOP placement, exchange behavior or recovery after a real outage." });
 });
 
+// Read-only broker-side reconciliation snapshot. Does not modify any safety state.
+// Deliberately returns only aggregate counts; never exposes account IDs or keys.
+app.get("/broker-reconciliation-readonly", async (c) => {
+  const base = {
+    system: "Chagatto-2 Broker Reconciliation Read Only",
+    readOnly: true, orderSent: false, stopOrderSent: false,
+    safetyStateChanged: false,
+    liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+    symbol: "USD_JPY",
+    pendingIntentDetected: pendingMarketOrderExistsOrUnknown(),
+    volumeHealthy: safetyStorageHealthy,
+  };
+  if (!safetyStorageHealthy) {
+    return c.json({ ...base, status: "RECONCILIATION_INCOMPLETE", newEntryRecommendation: "BLOCK", error: "SAFETY_VOLUME_UNAVAILABLE" }, 503);
+  }
+  const paths = [
+    ["positions", "/v1/openPositions", "?symbol=USD_JPY&count=100"],
+    ["orders", "/v1/activeOrders", "?symbol=USD_JPY&count=100"],
+    ["executions", "/v1/latestExecutions", "?symbol=USD_JPY&count=100"],
+  ] as const;
+  const settled = await Promise.allSettled(paths.map(([,path,q]) => gmoPrivateGet(path, q)));
+  const failures = settled.flatMap((r,i) => r.status === "rejected" ? [paths[i][0]] : []);
+  if (failures.length) {
+    return c.json({ ...base, status:"RECONCILIATION_INCOMPLETE", newEntryRecommendation:"BLOCK",
+      failedSources:failures, note:"Broker read failed. Do not clear pending intent or resume orders." }, 503);
+  }
+  const items = settled.map(r => r.status === "fulfilled" ? r.value : null);
+  const listOf = (v:any):any[] | null => Array.isArray(v?.data?.list) ? v.data.list : Array.isArray(v?.data) ? v.data : null;
+  const positions = listOf(items[0]);
+  const orders = listOf(items[1]);
+  const executions = listOf(items[2]);
+  if (!positions || !orders || !executions) {
+    return c.json({ ...base, status:"RECONCILIATION_INCOMPLETE", newEntryRecommendation:"BLOCK", error:"UNEXPECTED_BROKER_RESPONSE_SHAPE" }, 503);
+  }
+  const stopOrders = orders.filter((o:any) => String(o?.executionType ?? "").toUpperCase() === "STOP");
+  const unprotectedPositionPossible = positions.length > 0 && stopOrders.length === 0;
+  const needsManualReconciliation = base.pendingIntentDetected || positions.length > 0 || orders.length > 0;
+  return c.json({ ...base, status: unprotectedPositionPossible ? "POSSIBLE_UNPROTECTED_POSITION" : needsManualReconciliation ? "MANUAL_RECONCILIATION_REQUIRED" : "NO_OPEN_EXPOSURE_DETECTED",
+    newEntryRecommendation: "BLOCK_UNTIL_SEPARATELY_AUTHORIZED",
+    counts: { openPositions:positions.length, activeOrders:orders.length, activeStops:stopOrders.length, recentExecutions:executions.length },
+    checks: { allThreeBrokerReadsSucceeded:true, possibleMissingStop:unprotectedPositionPossible,
+      exactStopToPositionMatchingVerified:false, allPagesFetched:false, historicalOrderOutcomeVerified:false },
+    note:"Snapshot is NOT proof that a STOP protects a specific position. No pagination or order-specific historical reconciliation; never clear a pending intent based on this endpoint." });
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
