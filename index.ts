@@ -6943,6 +6943,65 @@ app.get('/fx-active-orders-cursor-audit', async c => {
   }
 });
 
+
+// Read-only ID-specific order/execution reconciliation. Never authorizes trading.
+// IDs are deliberately not included in the public response.
+app.get('/fx-order-id-reconciliation-audit', async c => {
+  const base = {system:'Chagatto-2 FX Order ID Reconciliation Audit',readOnly:true,
+    orderSent:false,stopOrderSent:false,safetyStateChanged:false,
+    approvedForLive:false,liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',
+    entryRecommendation:'BLOCK_UNTIL_SEPARATELY_AUTHORIZED'};
+  if (!safetyStorageHealthy) return c.json({...base,status:'BLOCKED',reason:'STORAGE_UNAVAILABLE'},503);
+  try {
+    const recent:any = await gmoPrivateGet('/v1/latestExecutions','?symbol=USD_JPY&count=100');
+    const list:any[]|null = Array.isArray(recent?.data?.list)?recent.data.list:
+      Array.isArray(recent?.data)?recent.data:null;
+    if(!list) return c.json({...base,status:'UNVERIFIABLE',reason:'MALFORMED_RECENT_EXECUTIONS'},409);
+    // Only inspect bounded, unique order IDs found in real FX execution records.
+    const ids:string[]=[];
+    for (const x of list) {
+      const id=String(x?.orderId??'');
+      if(!/^\d+$/.test(id)||BigInt(id)<=0n) continue;
+      if(!ids.includes(id)) ids.push(id);
+      if(ids.length===3) break;
+    }
+    if(ids.length===0) return c.json({...base,status:'NO_ORDER_IDS_TO_VERIFY',sampledOrders:0,
+      orderSpecificReconciliation:false,stopProtectionVerified:false});
+    const results:any[]=[];
+    for(const id of ids) {
+      let orders:any,execs:any;
+      try {
+        // FX endpoint supports orderId; never pass clientOrderId here.
+        [orders,execs]=await Promise.all([
+          gmoPrivateGet('/v1/orders','?orderId='+encodeURIComponent(id)),
+          gmoPrivateGet('/v1/executions','?orderId='+encodeURIComponent(id))]);
+      }catch(error){ results.push({readable:false,reason:'ORDER_SPECIFIC_BROKER_READ_FAILED'});continue; }
+      const orderRows:any[]=Array.isArray(orders?.data?.list)?orders.data.list:
+        Array.isArray(orders?.data)?orders.data:[];
+      const execRows:any[]=Array.isArray(execs?.data?.list)?execs.data.list:
+        Array.isArray(execs?.data)?execs.data:[];
+      const orderMatches=orderRows.length>0&&orderRows.every(r=>String(r?.orderId??'')===id);
+      const execMatches=execRows.length>0&&execRows.every(r=>String(r?.orderId??'')===id);
+      const executionIds=execRows.map(r=>String(r?.executionId??''));
+      const uniqueExecutions=executionIds.every(x=>/^\d+$/.test(x))&&new Set(executionIds).size===executionIds.length;
+      const numericSizes=execRows.every(r=>Number.isFinite(Number(r?.size))&&Number(r.size)>0);
+      const positiveTotal=execRows.reduce((sum,r)=>sum+Number(r?.size||0),0)>0;
+      const recordMatches=orderMatches&&execMatches&&uniqueExecutions&&numericSizes&&positiveTotal;
+      results.push({readable:true,orderRows:orderRows.length,executionRows:execRows.length,
+        orderIdConsistent:orderMatches&&execMatches,executionIdsUnique:uniqueExecutions,
+        executionQuantitiesValid:numericSizes&&positiveTotal,recordMatches,
+        stopCoverageVerified:false});
+    }
+    const everyRecordMatched=results.length===ids.length&&results.every(r=>r.recordMatches===true);
+    return c.json({...base,status:everyRecordMatched?'SAMPLED_ORDER_IDS_MATCH':'ORDER_ID_RECONCILIATION_INCOMPLETE',
+      sampledOrders:ids.length,sampledRecentExecutionCount:list.length,
+      results,orderSpecificReconciliationSampled:everyRecordMatched,
+      fullOrderHistoryReconciled:false,positionIdToStopCoverageVerified:false,
+      stopTriggerOrFillVerified:false,
+      note:'Bounded sample only. Order IDs, position IDs, client IDs and personal details withheld. Not evidence of complete history or live trading safety.'},everyRecordMatched?200:409);
+  }catch(error){return c.json({...base,status:'UNVERIFIABLE',reason:'BROKER_READ_FAILED'},503);}
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
