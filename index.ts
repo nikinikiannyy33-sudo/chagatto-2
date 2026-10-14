@@ -6973,12 +6973,36 @@ app.get('/fx-order-id-reconciliation-audit', async c => {
       orderSpecificReconciliation:false,stopProtectionVerified:false});
     const results:any[]=[];
     for(const id of ids) {
+      // The latest execution feed supplies its own execution IDs. When an order-ID
+      // lookup is rejected, independently check those executions by executionId.
+      // This is a read-only diagnostic fallback, never a reason to submit orders.
+      const knownExecutionIds=[...new Set(list.filter(x=>String(x?.orderId??'')===id)
+        .map(x=>String(x?.executionId??''))
+        .filter(x=>/^\d+$/.test(x)&&BigInt(x)>0n))].slice(0,10);
       // Read each endpoint independently so one failed broker read does not hide the cause.
       // Never return raw error messages: they can include broker response details.
       const [orderFetch, executionFetch] = await Promise.allSettled([
         gmoPrivateGet('/v1/orders','?orderId='+encodeURIComponent(id)),
         gmoPrivateGet('/v1/executions','?orderId='+encodeURIComponent(id))]);
       if (orderFetch.status !== 'fulfilled' || executionFetch.status !== 'fulfilled') {
+        let executionIdFallback:any={attempted:false};
+        if(executionFetch.status==='rejected' && knownExecutionIds.length>0) {
+          try {
+            const fetched:any=await gmoPrivateGet('/v1/executions',
+              '?executionId='+encodeURIComponent(knownExecutionIds.join(',')));
+            const rows:any[]=Array.isArray(fetched?.data?.list)?fetched.data.list:
+              Array.isArray(fetched?.data)?fetched.data:[];
+            const expected=new Set(knownExecutionIds);
+            const returned=new Set(rows.map((r:any)=>String(r?.executionId??'')));
+            const matched=rows.length>0 && rows.every((r:any)=>String(r?.orderId??'')===id &&
+              expected.has(String(r?.executionId??''))) &&
+              [...expected].every(x=>returned.has(x));
+            executionIdFallback={attempted:true,readable:true,recordMatches:matched,
+              requestedCount:knownExecutionIds.length,returnedCount:rows.length};
+          } catch {
+            executionIdFallback={attempted:true,readable:false,recordMatches:false};
+          }
+        }
         // Public classification only: no raw exception, IDs, credentials or payloads.
         const classifyReadFailure = (result:PromiseSettledResult<any>) => {
           if(result.status==='fulfilled') return {status:'OK'};
@@ -7025,6 +7049,7 @@ app.get('/fx-order-id-reconciliation-audit', async c => {
           executionRead:executionFetch.status==='fulfilled'?'OK':'FAILED',
           orderReadDiagnostic:classifyReadFailure(orderFetch),
           executionReadDiagnostic:classifyReadFailure(executionFetch),
+          executionIdFallback,
           reconciliationRequired:true});
         continue;
       }
@@ -7061,7 +7086,7 @@ app.get('/fx-order-id-reconciliation-audit', async c => {
       results,orderSpecificReconciliationSampled:everyRecordMatched,
       fullOrderHistoryReconciled:false,positionIdToStopCoverageVerified:false,
       stopTriggerOrFillVerified:false,
-      note:'Bounded sample only. Sanitized failure categories and GMO ERR codes are shown without exposing IDs, credentials or raw responses. Historical read failures may reflect retention, permissions, API rejection or transport; they are not proof that an order is absent. Not evidence of STOP coverage or live trading safety.'},everyRecordMatched?200:409);
+      note:'Bounded sample only; a successful executionId fallback does not override an unreconciled order-specific read. Sanitized failure categories and GMO ERR codes are shown without exposing IDs, credentials or raw responses. Historical read failures may reflect retention, permissions, API rejection or transport; they are not proof that an order is absent. Not evidence of STOP coverage or live trading safety.'},everyRecordMatched?200:409);
   }catch(error){return c.json({...base,status:'UNVERIFIABLE',reason:'BROKER_READ_FAILED'},503);}
 });
 
