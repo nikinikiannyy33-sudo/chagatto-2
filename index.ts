@@ -6975,10 +6975,24 @@ app.get('/fx-order-id-reconciliation-audit', async c => {
         gmoPrivateGet('/v1/orders','?orderId='+encodeURIComponent(id)),
         gmoPrivateGet('/v1/executions','?orderId='+encodeURIComponent(id))]);
       if (orderFetch.status !== 'fulfilled' || executionFetch.status !== 'fulfilled') {
+        // Public classification only: no raw exception, IDs, credentials or payloads.
+        const classifyReadFailure = (result:PromiseSettledResult<any>) => {
+          if(result.status==='fulfilled') return {status:'OK'};
+          const message=String(result.reason instanceof Error?result.reason.message:'');
+          if(message.includes('GMO API keys are not set')) return {status:'FAILED',category:'CREDENTIALS_NOT_CONFIGURED'};
+          if(message.startsWith('GMO /v1/')) {
+            const codeMatch=message.match(/\"code\"\s*:\s*\"(ERR-[0-9]{3,6})\"/);
+            return {status:'FAILED',category:'GMO_API_REJECTION',
+              ...(codeMatch?{brokerErrorCode:codeMatch[1]}:{})};
+          }
+          if(/fetch failed|network|timeout|abort/i.test(message)) return {status:'FAILED',category:'TRANSPORT_FAILURE'};
+          return {status:'FAILED',category:'UNCLASSIFIED_READ_FAILURE'};
+        };
         results.push({readable:false,reason:'ORDER_SPECIFIC_BROKER_READ_FAILED',
           orderRead:orderFetch.status==='fulfilled'?'OK':'FAILED',
           executionRead:executionFetch.status==='fulfilled'?'OK':'FAILED',
-          // No retry or trade; a historical unavailability is not evidence of a missing order.
+          orderReadDiagnostic:classifyReadFailure(orderFetch),
+          executionReadDiagnostic:classifyReadFailure(executionFetch),
           reconciliationRequired:true});
         continue;
       }
@@ -7006,7 +7020,7 @@ app.get('/fx-order-id-reconciliation-audit', async c => {
       results,orderSpecificReconciliationSampled:everyRecordMatched,
       fullOrderHistoryReconciled:false,positionIdToStopCoverageVerified:false,
       stopTriggerOrFillVerified:false,
-      note:'Bounded sample only. Failed endpoint is identified without disclosing broker errors or IDs. Historical read failures may reflect retention, permissions, API rejection or transport; they are not proof that an order is absent. Not evidence of STOP coverage or live trading safety.'},everyRecordMatched?200:409);
+      note:'Bounded sample only. Sanitized failure categories and GMO ERR codes are shown without exposing IDs, credentials or raw responses. Historical read failures may reflect retention, permissions, API rejection or transport; they are not proof that an order is absent. Not evidence of STOP coverage or live trading safety.'},everyRecordMatched?200:409);
   }catch(error){return c.json({...base,status:'UNVERIFIABLE',reason:'BROKER_READ_FAILED'},503);}
 });
 
