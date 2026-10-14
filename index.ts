@@ -6981,9 +6981,18 @@ app.get('/fx-order-id-reconciliation-audit', async c => {
           const message=String(result.reason instanceof Error?result.reason.message:'');
           if(message.includes('GMO API keys are not set')) return {status:'FAILED',category:'CREDENTIALS_NOT_CONFIGURED'};
           if(message.startsWith('GMO /v1/')) {
-            const codeMatch=message.match(/\"code\"\s*:\s*\"(ERR-[0-9]{3,6})\"/);
+            // GMO rejection responses can contain messages:[{code,message}].
+            // Extract an allowlisted error *code* only; never expose broker messages.
+            const payloadText=message.slice(message.indexOf(' failed: ')+9);
+            let brokerErrorCode:string|undefined;
+            try {
+              const payload=JSON.parse(payloadText);
+              const messages=Array.isArray(payload?.messages)?payload.messages:[];
+              const candidate=messages.find((item:any)=>typeof item?.code==='string' && /^ERR-[0-9]{3,6}$/.test(item.code));
+              if(candidate) brokerErrorCode=candidate.code;
+            } catch { /* Keep the diagnostic fail-closed if payload is malformed. */ }
             return {status:'FAILED',category:'GMO_API_REJECTION',
-              ...(codeMatch?{brokerErrorCode:codeMatch[1]}:{})};
+              ...(brokerErrorCode?{brokerErrorCode}:{brokerErrorCodeUnavailable:true})};
           }
           if(/fetch failed|network|timeout|abort/i.test(message)) return {status:'FAILED',category:'TRANSPORT_FAILURE'};
           return {status:'FAILED',category:'UNCLASSIFIED_READ_FAILURE'};
