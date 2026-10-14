@@ -3827,6 +3827,41 @@ app.get("/market-hours-status", (c) => {
 });
 
 
+// Read-only decision helper shared by real route and deterministic tests.
+// Malformed or truncated position replies must never be treated as no exposure.
+function decidePreEntryPositionSafety(reply: any) {
+  if (!reply || reply.status !== 0) return {allowed:false,reason:'POSITION_RESPONSE_UNVERIFIABLE',positionCount:null};
+  const rows = Array.isArray(reply?.data?.list) ? reply.data.list
+    : Array.isArray(reply?.data) ? reply.data : null;
+  if (!rows) return {allowed:false,reason:'POSITION_RESPONSE_UNVERIFIABLE',positionCount:null};
+  const reportedTotal = reply?.data?.totalCount;
+  const reportedCount = reply?.data?.count;
+  if (rows.length >= 100 ||
+      (reportedTotal !== undefined && (!Number.isFinite(Number(reportedTotal)) || Number(reportedTotal) > rows.length)) ||
+      (reportedCount !== undefined && (!Number.isFinite(Number(reportedCount)) || Number(reportedCount) > rows.length))) {
+    return {allowed:false,reason:'POSITION_PAGINATION_NOT_VERIFIED',positionCount:rows.length};
+  }
+  if (rows.length) return {allowed:false,reason:'POSITION_ALREADY_EXISTS',positionCount:rows.length};
+  return {allowed:true,reason:'NO_OPEN_POSITIONS_VERIFIED',positionCount:0};
+}
+
+app.get('/pre-entry-position-guard-test', c => {
+  const cases: {name:string;reply:any;allowed:boolean}[] = [
+    {name:'VALID_EMPTY_LIST',reply:{status:0,data:{list:[]}},allowed:true},
+    {name:'VALID_EMPTY_ARRAY',reply:{status:0,data:[]},allowed:true},
+    {name:'OPEN_POSITION',reply:{status:0,data:{list:[{positionId:'example'}]}},allowed:false},
+    {name:'MALFORMED_DATA',reply:{status:0,data:{}},allowed:false},
+    {name:'MISSING_DATA',reply:{status:0},allowed:false},
+    {name:'BROKER_ERROR',reply:{status:1,data:{list:[]}},allowed:false},
+    {name:'INCOMPLETE_PAGE',reply:{status:0,data:{list:[],totalCount:1}},allowed:false},
+    {name:'PAGE_LIMIT',reply:{status:0,data:{list:Array.from({length:100},()=>({}))}},allowed:false},
+  ];
+  const tests=cases.map(x=>{const result=decidePreEntryPositionSafety(x.reply);return {name:x.name,reason:result.reason,allowed:result.allowed,passed:result.allowed===x.allowed}});
+  return c.json({system:'Chagatto-2 Pre-entry Position Guard',simulationOnly:true,orderSent:false,gmoPrivateApiCalled:false,
+    liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',testCount:tests.length,allPassed:tests.every(x=>x.passed),tests,
+    limitations:['NO_BROKER_CALL','NO_POST_AUTH_ORDER_INJECTION','NO_FULL_PAGINATION_TEST']});
+});
+
 // Pure classifier used by the real /gmo-order safety gate and its read-only test.
 // A complete, empty order list is the ONLY acceptable state for a new entry.
 function decidePreEntryActiveOrderSafety(rows: any[] | null, pageIncomplete = false) {
@@ -4026,18 +4061,12 @@ try {
     }, 500);
   }
 
-  const openPositions =
-    Array.isArray(positionData?.data)
-      ? positionData.data
-      : Array.isArray(positionData?.data?.list)
-        ? positionData.data.list
-        : [];
-
-  if (openPositions.length > 0) {
+  const positionSafety = decidePreEntryPositionSafety(positionData);
+  if (!positionSafety.allowed) {
     return c.json({
       orderSent: false,
-      reason: "POSITION_ALREADY_EXISTS",
-      positionCount: openPositions.length,
+      error: positionSafety.reason,
+      positionCount: positionSafety.positionCount,
     }, 409);
   }
 // 安全装置6：通信不明・処理途中の注文が残っている場合は新規発注しない。
