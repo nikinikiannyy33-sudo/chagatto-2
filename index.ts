@@ -3836,9 +3836,12 @@ function decidePreEntryPositionSafety(reply: any) {
   if (!rows) return {allowed:false,reason:'POSITION_RESPONSE_UNVERIFIABLE',positionCount:null};
   const reportedTotal = reply?.data?.totalCount;
   const reportedCount = reply?.data?.count;
-  if (rows.length >= 100 ||
-      (reportedTotal !== undefined && (!Number.isFinite(Number(reportedTotal)) || Number(reportedTotal) > rows.length)) ||
-      (reportedCount !== undefined && (!Number.isFinite(Number(reportedCount)) || Number(reportedCount) > rows.length))) {
+  // Zero, null, negative, fractional and truncated counts must never turn an
+  // unverifiable broker response into evidence that the account is empty.
+  const invalidCount = (value: any) => value !== undefined &&
+    (value === null || value === '' || typeof value === 'boolean' ||
+     !Number.isSafeInteger(Number(value)) || Number(value) < 0 || Number(value) > rows.length);
+  if (rows.length >= 100 || invalidCount(reportedTotal) || invalidCount(reportedCount)) {
     return {allowed:false,reason:'POSITION_PAGINATION_NOT_VERIFIED',positionCount:rows.length};
   }
   if (rows.length) return {allowed:false,reason:'POSITION_ALREADY_EXISTS',positionCount:rows.length};
@@ -3855,6 +3858,9 @@ app.get('/pre-entry-position-guard-test', c => {
     {name:'BROKER_ERROR',reply:{status:1,data:{list:[]}},allowed:false},
     {name:'INCOMPLETE_PAGE',reply:{status:0,data:{list:[],totalCount:1}},allowed:false},
     {name:'PAGE_LIMIT',reply:{status:0,data:{list:Array.from({length:100},()=>({}))}},allowed:false},
+    {name:'NULL_TOTAL_COUNT',reply:{status:0,data:{list:[],totalCount:null}},allowed:false},
+    {name:'FRACTIONAL_COUNT',reply:{status:0,data:{list:[],count:0.5}},allowed:false},
+    {name:'NEGATIVE_COUNT',reply:{status:0,data:{list:[],totalCount:-1}},allowed:false},
   ];
   const tests=cases.map(x=>{const result=decidePreEntryPositionSafety(x.reply);return {name:x.name,reason:result.reason,allowed:result.allowed,passed:result.allowed===x.allowed}});
   return c.json({system:'Chagatto-2 Pre-entry Position Guard',simulationOnly:true,orderSent:false,gmoPrivateApiCalled:false,
@@ -3889,6 +3895,25 @@ app.get('/pre-entry-active-order-guard-test', (c) => {
     liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',
     testCount:tests.length,allPassed:tests.every(x=>x.passed),tests,
     limitations:['PURE_CLASSIFIER_PLUS_REAL_ROUTE_INTEGRATION_NOT_POST_AUTH_PROBE','NO_LIVE_ORDER_TEST','NO_FULL_ORDER_HISTORY_PAGINATION']});
+});
+
+// Tests the malformed pagination metadata used by the actual pre-order guards.
+// This endpoint never calls a broker API or mutates persisted safety state.
+app.get('/pre-entry-pagination-metadata-test', c => {
+  const invalid = [null, '', -1, 0.5, 'NaN', true, 1, 100];
+  const tests = [
+    ...invalid.map(value => {
+      const reply = {status:0,data:{list:[],totalCount:value}};
+      const got = decidePreEntryPositionSafety(reply);
+      return {kind:'POSITION',input:value,blocked:!got.allowed,passed:!got.allowed};
+    }),
+    {kind:'POSITION_VALID_EMPTY',blocked:!decidePreEntryPositionSafety({status:0,data:{list:[],totalCount:0}}).allowed,
+      passed:decidePreEntryPositionSafety({status:0,data:{list:[],totalCount:0}}).allowed}
+  ];
+  return c.json({system:'Chagatto-2 Pre-entry Pagination Metadata',simulationOnly:true,
+    orderSent:false,privateApiCalled:false,liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',
+    testCount:tests.length,allPassed:tests.every(t=>t.passed),tests,
+    note:'Position metadata classifier test; active-order metadata enforced in the real gmo-order path. No live execution.'});
 });
 
 app.post("/gmo-order", async (c) => {
@@ -4092,11 +4117,13 @@ const brokerOrderList = Array.isArray(activeOrderData?.data?.list)
   : Array.isArray(activeOrderData?.data)
     ? activeOrderData.data
     : null;
+const brokerOrderCountUnverifiable = (value: any) => value !== undefined &&
+  (value === null || value === '' || typeof value === 'boolean' ||
+   !Number.isSafeInteger(Number(value)) || Number(value) < 0 ||
+   Number(value) > (brokerOrderList?.length ?? 0));
 const brokerOrderPageIncomplete =
-  (activeOrderData?.data?.totalCount !== undefined &&
-    Number(activeOrderData.data.totalCount) > (brokerOrderList?.length ?? 0)) ||
-  (activeOrderData?.data?.count !== undefined &&
-    Number(activeOrderData.data.count) > (brokerOrderList?.length ?? 0));
+  brokerOrderCountUnverifiable(activeOrderData?.data?.totalCount) ||
+  brokerOrderCountUnverifiable(activeOrderData?.data?.count);
 const activeOrderDecision = decidePreEntryActiveOrderSafety(
   brokerOrderList, brokerOrderPageIncomplete
 );
