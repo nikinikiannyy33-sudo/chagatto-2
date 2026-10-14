@@ -6998,9 +6998,23 @@ app.get('/fx-order-id-reconciliation-audit', async c => {
             const reason:any=result.reason;
             const httpStatus=Number.isInteger(reason?.brokerHttpStatus)?reason.brokerHttpStatus:undefined;
             const apiStatus=Number.isInteger(reason?.brokerApiStatus)?reason.brokerApiStatus:undefined;
+            // Strict structural diagnostics only. Never publish raw broker messages,
+            // ID values, request data, URLs, credentials or exception text.
+            let errorResponseShape:'UNPARSEABLE'|'NO_MESSAGES'|'MESSAGES_ARRAY'|'MESSAGES_OTHER'='UNPARSEABLE';
+            let errorCodeShape:'PRESENT_EXPECTED'|'PRESENT_UNEXPECTED'|'ABSENT'='ABSENT';
+            try {
+              const payload=JSON.parse(payloadText);
+              if (!Object.prototype.hasOwnProperty.call(payload??{},'messages')) errorResponseShape='NO_MESSAGES';
+              else if (Array.isArray(payload.messages)) {
+                errorResponseShape='MESSAGES_ARRAY';
+                const hasCode=payload.messages.some((item:any)=>item && Object.prototype.hasOwnProperty.call(item,'code'));
+                errorCodeShape=brokerErrorCode?'PRESENT_EXPECTED':hasCode?'PRESENT_UNEXPECTED':'ABSENT';
+              } else errorResponseShape='MESSAGES_OTHER';
+            } catch { /* Remain fail-closed on unexpected broker responses. */ }
             return {status:'FAILED',category:'GMO_API_REJECTION',
               ...(httpStatus!==undefined?{httpStatus}:{}),
               ...(apiStatus!==undefined?{apiStatus}:{}),
+              errorResponseShape,errorCodeShape,
               ...(brokerErrorCode?{brokerErrorCode}:{brokerErrorCodeUnavailable:true})};
           }
           if(/fetch failed|network|timeout|abort/i.test(message)) return {status:'FAILED',category:'TRANSPORT_FAILURE'};
