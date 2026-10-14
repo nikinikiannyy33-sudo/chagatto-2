@@ -4846,12 +4846,13 @@ if (
   }
 }
 
-const stopConfirmed =
-  (
-    stopResponse !== null &&
-    stopResponse.ok &&
-    stopData?.status === 0
-  ) || stopConfirmedByActiveOrders;
+// POST acknowledgement or a single unpaginated order-list match is NOT
+// proof of complete protection for all executed positions and quantities.
+const stopAcknowledged =
+  stopResponse !== null &&
+  stopResponse.ok &&
+  stopData?.status === 0;
+const stopConfirmed = false; // requires future order-specific, paginated coverage reconciliation
 
 // STOPがGMO側に存在しないことを確認できた場合だけ、
 // 建玉を成行決済して無防備なポジションを残さない。
@@ -4947,7 +4948,9 @@ persistSafetyHalt("PENDING_MARKET_ORDER_REQUIRES_ORDER_SPECIFIC_RECONCILIATION")
 
 return c.json({
   orderSent: true,
-  stopOrderSent: stopConfirmed,
+  stopOrderSent: stopAcknowledged,
+  stopOrderAcknowledged: stopAcknowledged,
+  brokerProtectionVerified: false,
   symbol: "USD_JPY",
   side,
   orderId,
@@ -4979,6 +4982,7 @@ stopConfirmedByActiveOrders,
 matchedStopOrder,
 activeOrdersCheckSucceeded,
 protectionState,
+protectionVerificationNote: "POST_ACK_AND_SINGLE_ACTIVE_ORDER_MATCH_ARE_NOT_POSITION_COVERAGE_PROOF",
 emergencyCloseAttempted,
 emergencyCloseSucceeded,
 emergencyCloseData,
@@ -6864,3 +6868,20 @@ serve({
 });
 
 
+
+// Read-only audit: confirms this release deliberately separates STOP receipt
+// from actual broker-side position protection. No orders or private API calls.
+app.get('/stop-ack-state-separation-audit', c => c.json({
+  system: 'Chagatto-2 STOP Acknowledgement State Separation',
+  readOnly: true,
+  orderSent: false,
+  privateBrokerApiCalled: false,
+  liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === 'true',
+  stopPostAcknowledgementCountsAsProtection: false,
+  singleUnpaginatedOrderMatchCountsAsProtection: false,
+  pendingIntentAutoClearedOnAck: false,
+  unknownProtectionRequiresSafetyHalt: true,
+  completeProtectionVerificationImplemented: false,
+  approvedForLive: false,
+  note: 'Static policy audit only; not an actual order, broker fill, or STOP trigger verification.'
+}));
