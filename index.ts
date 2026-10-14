@@ -6475,7 +6475,12 @@ function assessPreliveReadiness(input: {storageHealthy:boolean; pending:boolean;
   if(input.positions>0) blockers.push('OPEN_POSITIONS_REQUIRE_MANUAL_PROTECTION_AUDIT');
   if(input.orders>0) blockers.push('ACTIVE_ORDERS_REQUIRE_MANUAL_AUDIT');
   if(input.stopUnresolved>0) blockers.push('STOP_COVERAGE_UNRESOLVED');
-  // An empty snapshot is not authorization: missing history, latency, spread, execution tests remain.
+  // A clean snapshot must NEVER be confused with authorization to trade.
+  // These requirements cannot be proven by a read-only snapshot.
+  blockers.push('LIVE_AUTHORIZATION_NOT_GRANTED');
+  blockers.push('ORDER_SPECIFIC_HISTORY_NOT_RECONCILED');
+  blockers.push('REAL_STOP_EXECUTION_NOT_TESTED');
+  blockers.push('TRANSACTION_COST_AND_STRATEGY_NOT_VALIDATED');
   return {decision:'BLOCK_NEW_ENTRY', blockers, brokerSafetyVerified:false, liveApproved:false};
 }
 app.get('/prelive-reconciliation-gate', async c=>{
@@ -6513,7 +6518,8 @@ app.get('/prelive-reconciliation-gate-test',c=>{
     {name:'OPEN_POSITION',v:{storageHealthy:true,pending:false,halted:false,brokerReadsOk:true,shapeOk:true,positions:1,orders:0,stopUnresolved:1},expected:['OPEN_POSITIONS_REQUIRE_MANUAL_PROTECTION_AUDIT','STOP_COVERAGE_UNRESOLVED']},
     {name:'ACTIVE_ORDER',v:{storageHealthy:true,pending:false,halted:false,brokerReadsOk:true,shapeOk:true,positions:0,orders:1,stopUnresolved:0},expected:['ACTIVE_ORDERS_REQUIRE_MANUAL_AUDIT']},
   ];
-  const tests=scenarios.map(s=>{const result=assessPreliveReadiness(s.v);return {scenario:s.name,passed:result.decision==='BLOCK_NEW_ENTRY' && !result.liveApproved && JSON.stringify(result.blockers)===JSON.stringify(s.expected)};});
+  const mandatory=['LIVE_AUTHORIZATION_NOT_GRANTED','ORDER_SPECIFIC_HISTORY_NOT_RECONCILED','REAL_STOP_EXECUTION_NOT_TESTED','TRANSACTION_COST_AND_STRATEGY_NOT_VALIDATED'];
+  const tests=scenarios.map(s=>{const result=assessPreliveReadiness(s.v);return {scenario:s.name,passed:result.decision==='BLOCK_NEW_ENTRY' && !result.liveApproved && JSON.stringify(result.blockers)===JSON.stringify([...s.expected,...mandatory])};});
   return c.json({system:'Chagatto-2 Prelive Gate Simulation',simulationOnly:true,orderSent:false,privateGmoApiCalled:false,safetyStateChanged:false,
     testCount:tests.length,allPassed:tests.every(t=>t.passed),tests,liveApproved:false});
 });
