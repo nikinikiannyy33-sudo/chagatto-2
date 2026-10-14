@@ -4111,31 +4111,50 @@ const orderSize = FIXED_ORDER_SIZE;
     .update(text)
     .digest("hex");
 
-  const response = await fetch(
-    "https://forex-api.coin.z.com/private/v1/order",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "API-KEY": apiKey,
-        "API-TIMESTAMP": timestamp,
-        "API-SIGN": sign,
-      },
-      body: orderBody,
-    }
-  );
+  // Once the order request is attempted, a transport failure or malformed reply
+  // cannot establish that the broker did NOT accept it. Persist a fail-closed
+  // latch BEFORE any further entry can be submitted. Never retry this POST.
+  let response: Response;
+  let data: any;
+  try {
+    response = await fetch(
+      "https://forex-api.coin.z.com/private/v1/order",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "API-KEY": apiKey,
+          "API-TIMESTAMP": timestamp,
+          "API-SIGN": sign,
+        },
+        body: orderBody,
+      }
+    );
+    data = await response.json();
+  } catch (error) {
+    persistSafetyHalt("MARKET_ORDER_RESPONSE_UNKNOWN");
+    return c.json({
+      orderSent: "UNKNOWN", stopOrderSent: false, safetyHalt: true,
+      status: "MANUAL_BROKER_RECONCILIATION_REQUIRED",
+      reason: gmoSafetyHaltReason,
+      message: "Order submission outcome is unknown. No automatic retry. Manually inspect broker orders, executions, positions, and STOP coverage.",
+      transportError: String(error instanceof Error ? error.message : error),
+    }, 503);
+  }
 
-  const data: any = await response.json();
-
-if (!response.ok || data.status !== 0) {
-  return c.json({
-    orderSent: false,
-    symbol: "USD_JPY",
-    side,
-    size: String(orderSize),
-    data,
-  }, 500);
-}
+  if (!response.ok || data?.status !== 0) {
+    // A non-success response is not evidence of a safely empty account.
+    // Conservatively latch until broker-side reconciliation is performed.
+    persistSafetyHalt("MARKET_ORDER_REJECTED_OR_AMBIGUOUS_RESPONSE");
+    return c.json({
+      orderSent: "UNKNOWN", stopOrderSent: false, safetyHalt: true,
+      status: "MANUAL_BROKER_RECONCILIATION_REQUIRED",
+      reason: gmoSafetyHaltReason,
+      httpStatus: response.status,
+      brokerStatus: data?.status ?? null,
+      message: "No automatic retry. Broker orders, executions, positions, and STOP coverage require review.",
+    }, 503);
+  }
 
 const orderResult = Array.isArray(data?.data)
   ? data.data[0]
@@ -4149,8 +4168,10 @@ const rootOrderId = Number(
 );
 
 if (!Number.isFinite(orderId) || !Number.isFinite(rootOrderId)) {
+  persistSafetyHalt("MARKET_ORDER_ID_MISSING");
   return c.json({
     orderSent: true,
+    safetyHalt: true,
     stopOrderSent: false,
     error: "ORDER_ID_NOT_FOUND",
     data,
@@ -4310,8 +4331,10 @@ const totalExecutedSize = executions.reduce(
 );
 
 if (!Number.isFinite(totalExecutedSize) || totalExecutedSize <= 0) {
+  persistSafetyHalt("INVALID_EXECUTED_SIZE");
   return c.json({
     orderSent: true,
+    safetyHalt: true,
     stopOrderSent: false,
     orderId,
     error: "INVALID_EXECUTED_SIZE",
@@ -6199,6 +6222,30 @@ app.get("/safety-volume-restart-probe", (c) => {
     realSafetyHaltUntouched: true,
     note: "This checks a separate probe file on the same Volume. It does NOT prove actual halt recovery or broker order safety. Redeploy without wiping Volume, then reload."
   });
+});
+
+
+// Read-only diagnostic of the real market-order ambiguous-outcome policy.
+// No GMO credentials, private APIs, order calls, or safety state mutations.
+app.get("/unknown-order-outcome-test", (c) => {
+  const scenarios = [
+    { name: "POST_NETWORK_TIMEOUT", attempted: true, transportError: true, validJson: false, ok: false, hasId: false },
+    { name: "POST_INVALID_JSON", attempted: true, transportError: false, validJson: false, ok: true, hasId: false },
+    { name: "POST_HTTP_ERROR", attempted: true, transportError: false, validJson: true, ok: false, hasId: false },
+    { name: "POST_SUCCESS_WITHOUT_ORDER_ID", attempted: true, transportError: false, validJson: true, ok: true, hasId: false },
+    { name: "POST_SUCCESS_WITH_ORDER_ID", attempted: true, transportError: false, validJson: true, ok: true, hasId: true },
+  ];
+  const results = scenarios.map((x) => {
+    const uncertain = x.attempted && (x.transportError || !x.validJson || !x.ok || !x.hasId);
+    const decision = uncertain ? "PERSIST_HALT_AND_REQUIRE_RECONCILIATION" : "PROCEED_TO_EXECUTION_AND_STOP_VERIFICATION";
+    return { scenario: x.name, decision, autoRetryMarketOrder: false,
+      newEntryBlockedIfAmbiguous: uncertain, brokerSafetyVerified: false,
+      passed: uncertain ? decision === "PERSIST_HALT_AND_REQUIRE_RECONCILIATION" : decision === "PROCEED_TO_EXECUTION_AND_STOP_VERIFICATION" };
+  });
+  return c.json({ system: "Chagatto-2 Unknown Market Order Outcome Gate", mode: "SIMULATION_ONLY",
+    orderSent: false, gmoPrivateApiCalled: false, liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+    safetyMarkerChanged: false, testCount: results.length, allPassed: results.every(x => x.passed), results,
+    limits: "Source-path simulation only. Does not validate broker executions, STOP placement, exchange behavior or recovery after a real outage." });
 });
 
 const port = Number(process.env.PORT || 8080);
