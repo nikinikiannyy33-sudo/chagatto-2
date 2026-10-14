@@ -6898,6 +6898,51 @@ app.get('/stop-protection-evidence-audit', async c => {
     note:'GMO FX does not promise totalCount on these responses. A page with fewer than 100 items does not prove full execution history. Read-only; never approve live.'},allReadable?200:409);
 });
 
+// FX active-orders cursor walk (read-only). Do not infer STOP coverage or authorize orders.
+app.get('/fx-active-orders-cursor-audit', async c => {
+  const base = { system:'Chagatto-2 FX Active Orders Cursor Audit',readOnly:true,
+    orderSent:false,stopOrderSent:false,safetyStateChanged:false,
+    liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',approvedForLive:false,
+    entryRecommendation:'BLOCK_UNTIL_SEPARATELY_AUTHORIZED' };
+  if (!safetyStorageHealthy) return c.json({...base,status:'UNVERIFIABLE',reason:'STORAGE_UNAVAILABLE'},503);
+  const seen = new Set<string>();
+  let prevId: string | null = null;
+  let pageCount=0, orderCount=0;
+  const maxPages=10;
+  try {
+    for (let i=0;i<maxPages;i++) {
+      const query='?symbol=USD_JPY&count=100'+(prevId?'&prevId='+encodeURIComponent(prevId):'');
+      const result:any=await gmoPrivateGet('/v1/activeOrders',query);
+      if (result?.status!==0 || !Array.isArray(result?.data?.list))
+        return c.json({...base,status:'UNVERIFIABLE',reason:'MALFORMED_BROKER_RESPONSE',pageCount,orderCount},409);
+      const items:any[]=result.data.list;
+      pageCount++;
+      let minId:bigint|null=null;
+      for(const item of items) {
+        const raw=String(item?.orderId??'');
+        if(!/^\d+$/.test(raw) || BigInt(raw)<=0n || seen.has(raw))
+          return c.json({...base,status:'UNVERIFIABLE',reason:'INVALID_OR_DUPLICATE_ORDER_ID',pageCount,orderCount},409);
+        const id=BigInt(raw);
+        if(prevId!==null && id>=BigInt(prevId))
+          return c.json({...base,status:'UNVERIFIABLE',reason:'NON_DECREASING_CURSOR',pageCount,orderCount},409);
+        seen.add(raw);
+        if(minId===null || id<minId) minId=id;
+      }
+      orderCount+=items.length;
+      if(items.length<100) return c.json({...base,status:'CURSOR_SCAN_FINISHED',
+        pageCount,orderCount,method:'FX_PREVID',
+        activeOrderSnapshotEnumerated:true,orderSpecificReconciliation:false,
+        stopToPositionProtectionVerified:false,stopTriggerOrFillVerified:false,
+        note:'A finite active-order cursor scan is not full order history, a position-to-STOP match, or authorization to trade.'});
+      if(minId===null) return c.json({...base,status:'UNVERIFIABLE',reason:'MISSING_NEXT_CURSOR',pageCount,orderCount},409);
+      prevId=minId.toString();
+    }
+    return c.json({...base,status:'UNVERIFIABLE',reason:'PAGE_LIMIT_REACHED',pageCount,orderCount},409);
+  }catch(error){
+    return c.json({...base,status:'UNVERIFIABLE',reason:'BROKER_READ_FAILED',pageCount,orderCount},503);
+  }
+});
+
 const port = Number(process.env.PORT || 8080);
 console.log(`Chagatto-2 started PORT=${port}`);
 
