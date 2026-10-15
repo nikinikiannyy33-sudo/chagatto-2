@@ -9,17 +9,19 @@ export function readState(file){if(!fs.existsSync(file))return initialState();co
 export function writeState(file,s){if(!validState(s))throw Error('PAPER_STATE_INVALID');fs.mkdirSync(path.dirname(file),{recursive:true});const tmp=file+'.'+process.pid+'.tmp';try{fs.writeFileSync(tmp,JSON.stringify(s),{mode:0o600,flag:'wx'});fs.renameSync(tmp,file)}finally{try{fs.rmSync(tmp,{force:true})}catch{}}}
 // BUY entries mark to BID, SELL entries mark to ASK. Since the feed is BID-only,
 // simulate a 2 pip exit cost on either direction; NOT a real executable quote.
-export function pnlYen(pos,mark){const direction=pos.side==='BUY'?1:-1;return Math.round((mark-pos.entryPrice)*direction*pos.size-CONFIG.roundTripCostYen)}
+export function grossPnlYen(pos,mark){const direction=pos.side==='BUY'?1:-1;return Math.round((mark-pos.entryPrice)*direction*pos.size)}
+export function pnlYen(pos,mark){return grossPnlYen(pos,mark)-CONFIG.roundTripCostYen}
 export function step(state,{now,barTime,mark,signal,pattern}){
  if(!validState(state))throw Error('PAPER_STATE_INVALID');
- if(!Number.isSafeInteger(now)||!Number.isSafeInteger(barTime)||!Number.isFinite(mark)||mark<=0)throw Error('INVALID_MARKET_OBSERVATION');
+ if(!Number.isSafeInteger(now)||!Number.isSafeInteger(barTime)||!Number.isFinite(mark)||mark<=0||now<barTime+300000)throw Error('INVALID_MARKET_OBSERVATION');
  if(!['BUY','SELL','WAIT'].includes(signal))throw Error('INVALID_SIGNAL');
  const events=[];
  if(state.lastDecisionBar!==null&&barTime<=state.lastDecisionBar)return {state,events:[{action:'DUPLICATE_OR_OLD_BAR_SKIPPED'}]};
  if(state.position){
-  const pos=state.position;const net=pnlYen(pos,mark);const age=now-pos.openedAt;
-  const reason=net>=CONFIG.tpYen?'TP':net<=-CONFIG.slYen?'SL':age>=CONFIG.maxHoldMs?'TIME':null;
-  if(reason){state.trades.push({...pos,closedAt:now,exitPrice:mark,pnlYen:net,closeReason:reason,hypothetical:true});state.position=null;events.push({action:'PAPER_CLOSE',reason,pnlYen:net});}
+  const pos=state.position;const gross=grossPnlYen(pos,mark);const net=pnlYen(pos,mark);const age=now-pos.openedAt;
+  // Match frozen backtest: TP and SL levels are BEFORE assumed roundtrip cost.
+  const reason=gross>=CONFIG.tpYen?'TP':gross<=-CONFIG.slYen?'SL':age>=CONFIG.maxHoldMs?'TIME':null;
+  if(reason){state.trades.push({...pos,closedAt:now,exitPrice:mark,grossPnlYen:gross,pnlYen:net,closeReason:reason,hypothetical:true});state.position=null;events.push({action:'PAPER_CLOSE',reason,pnlYen:net});}
   else events.push({action:'PAPER_HOLD',pnlYen:net,holdMinutes:Math.round(age/60000)});
   // No close-and-reopen on same cycle.
   state.lastDecisionBar=barTime;return {state,events};
@@ -27,7 +29,7 @@ export function step(state,{now,barTime,mark,signal,pattern}){
  const today=dayJst(now);
  const closedToday=state.trades.filter(t=>dayJst(t.closedAt)===today);
  const realized=closedToday.reduce((n,t)=>n+t.pnlYen,0);
- const entriesToday=state.trades.filter(t=>dayJst(t.openedAt)===today).length;
+ const entriesToday=state.trades.filter(t=>dayJst(t.openedAt)===today).length+(state.position&&dayJst(state.position.openedAt)===today?1:0);
  const last=state.trades.filter(t=>dayJst(t.closedAt)===today).slice(-CONFIG.maxLossStreak);
  const threeLoss=last.length===CONFIG.maxLossStreak&&last.every(t=>t.pnlYen<0);
  if(realized<=CONFIG.dailyStopYen||entriesToday>=CONFIG.maxDailyEntries||threeLoss){events.push({action:'PAPER_ENTRY_BLOCKED',reason:realized<=CONFIG.dailyStopYen?'DAILY_STOP':entriesToday>=CONFIG.maxDailyEntries?'DAILY_MAX':'THREE_LOSSES'});}
