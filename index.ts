@@ -7312,3 +7312,29 @@ app.get('/candidate-a-v53-exit-readiness',c=>c.json({system:'Chagatto-2 Candidat
   'RECONCILE_ORDER_AND_EXECUTION','DURABLE_EXIT_INTENT','SINGLE_CLOSE','VERIFY_FLAT_AND_NO_PENDING_ORDERS'],
   actualBrokerCancelIntegrated:false,actualBrokerCloseIntegrated:false,
   nextAction:'DO_NOT_DEPLOY_LIVE; broker API lifecycle and persistent resume must be implemented and approved'}));
+
+// V57: explicit, non-authorizing live release checklist.
+// This endpoint does not touch the account, send an order, or change any flag.
+app.get('/candidate-a-live-readiness', c => {
+  const hardGate=CANDIDATE_A_PAPER_ONLY;
+  const blockers=[
+    'BROKER_OCO_STOP_POSITION_COVERAGE_RECONCILIATION_NOT_IMPLEMENTED',
+    'FOUR_HOUR_BROKER_OCO_CANCEL_AND_CLOSE_NOT_CONNECTED',
+    'UNKNOWN_ORDER_AND_EXIT_RECOVERY_NOT_END_TO_END_VERIFIED',
+    'CANDIDATE_A_LIVE_ENTRY_SIGNAL_NOT_INDEPENDENTLY_VERIFIED',
+    'LIVE_BROKER_PERMISSION_AND_MINIMUM_ORDER_SIZE_NOT_VERIFIED',
+    'LIVE_ORDER_EXECUTION_NOT_APPROVED'
+  ];
+  if(hardGate)blockers.unshift('CANDIDATE_A_PAPER_ONLY_HARD_BLOCK');
+  if(process.env.LIVE_TRADING_ENABLED!=='true')blockers.unshift('LIVE_TRADING_ENABLED_NOT_TRUE');
+  return c.json({system:'Chagatto-2 Candidate A Live Readiness',version:57,
+    mode:'READ_ONLY_STATIC_CODE_AUDIT',readyForRealOrders:false,approvedForLive:false,
+    paperOnly:hardGate,brokerReadCalled:false,brokerWriteCalled:false,orderSent:false,
+    brokerStopsVerified:false,brokerFourHourExitVerified:false,
+    tradeSettings:{symbol:'USD_JPY',size:1000,takeProfitGrossYen:550,stopLossGrossYen:150,
+      maxHoldHours:4,patterns:['UUB','BUU','LLN'],dailyEntryLossStopYen:-1200},
+    blockers,
+    readOnlyChecks:['/candidate-a-paper-status','/scheduler-status','/prelive-reconciliation-gate',
+      '/stop-position-coverage-diagnostic','/broker-reconciliation-readonly'],
+    instruction:'Keep LIVE_TRADING_ENABLED=false. Do not replace a safety halt with a manual live toggle.'});
+});
