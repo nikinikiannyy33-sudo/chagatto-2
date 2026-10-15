@@ -5,6 +5,8 @@ import * as researchFs from "node:fs/promises";
 import * as durableFs from "node:fs";
 import * as researchPath from "node:path";
 const app = new Hono();
+// Candidate A integration: BROKER WRITE ACTIONS ARE HARD-DISABLED pending independent approval.
+const CANDIDATE_A_PAPER_ONLY = true;
 
 function sma(values: number[], period: number) {
   if (values.length < period) return null;
@@ -2234,7 +2236,7 @@ async function buildWinRateFocusedSignal() {
     },
     fixedTrade: {
       orderSize: FIXED_ORDER_SIZE,
-      takeProfitPips: 20,
+      takeProfitPips: 55,
       stopLossPips: 15,
     },
     time: new Date().toISOString(),
@@ -2389,15 +2391,76 @@ function newEntriesSafelyBlocked(): boolean {
 }
 initializeDurableSafetyState();
 
+// Candidate A configuration. These values are price-distance equivalents at 1,000 USD units.
+const CANDIDATE_A = Object.freeze({symbol:"USD_JPY", size:1000, tpYen:550, slYen:150,
+  tpDistance:0.550, slDistance:0.150, maxHoldMs:4*60*60*1000,
+  dailyStopYen:-1200, maxDailyEntries:20, maxLossStreak:3,
+  researchRoundTripCostPips:2});
+type CandidateBar = {time:number;open:number;high:number;low:number;close:number};
+function candidateACandleClass(b:CandidateBar):string {
+  const span=Math.max(b.high-b.low,1e-6);
+  const body=b.close-b.open;
+  const up=b.high-Math.max(b.open,b.close);
+  const dn=Math.min(b.open,b.close)-b.low;
+  if(Math.abs(body)/span<0.22)return "N";
+  if(dn/span>0.48 && dn>up*1.3)return "L";
+  if(up/span>0.48 && up>dn*1.3)return "U";
+  return body>0?"B":"S";
+}
+function candidateASignalAtNextOpen(closed:CandidateBar[], nextOpenTime:number) {
+  if(closed.length<11)return {signal:"WAIT",pattern:null,reason:"INSUFFICIENT_CLOSED_BARS"};
+  const last=closed.slice(-11);
+  if(last.some((b,i)=>!Number.isFinite(b.time)||![b.open,b.high,b.low,b.close].every(Number.isFinite)||
+      b.high<Math.max(b.open,b.close)||b.low>Math.min(b.open,b.close)||b.low>b.high ||
+      (i>0&&b.time-last[i-1].time!==300000)))
+    return {signal:"WAIT",pattern:null,reason:"BAD_OR_GAPPED_CANDLES"};
+  if(last.at(-1)!.time+300000!==nextOpenTime)
+    return {signal:"WAIT",pattern:null,reason:"LATEST_BAR_NOT_JUST_CLOSED"};
+  const hour=Number(new Intl.DateTimeFormat("en-US",{timeZone:"Asia/Tokyo",hour:"numeric",hourCycle:"h23"}).format(new Date(nextOpenTime)));
+  if(hour<8||hour>=24)return {signal:"WAIT",pattern:null,reason:"OUTSIDE_08_TO_24_JST"};
+  const pattern=last.slice(-3).map(candidateACandleClass).join("");
+  if(!["UUB","BUU","LLN"].includes(pattern))return {signal:"WAIT",pattern,reason:"NO_APPROVED_PATTERN"};
+  if(pattern!=="LLN") {
+    const five=last.slice(-5);
+    const meanBodyRatio=five.reduce((sum,b)=>sum+Math.abs(b.close-b.open)/Math.max(b.high-b.low,1e-6),0)/5;
+    if(meanBodyRatio<0.48)return {signal:"WAIT",pattern,reason:"FIVE_BODY_FILTER"};
+  }
+  return {signal:pattern==="LLN"?"SELL":"BUY",pattern,reason:"CANDIDATE_A_MATCH"};
+}
+// PUBLIC BID candles are for hypothetical signal review only, never evidence of actual fills.
+app.get("/candidate-a-signal-preview",async c=>{
+  try{
+    const closed=await fetchCompletedGmoCandles("5min",3) as CandidateBar[];
+    const last=closed.at(-1);
+    if(!last)return c.json({paperOnly:true,orderSent:false,error:"NO_CANDLES"},503);
+    const now=Date.now();
+    // Reject stale or future candles. Never allow weekends/gaps to masquerade as current.
+    const nextOpen=last.time+300000;
+    const decision= now-nextOpen>=0&&now-nextOpen<=300000
+      ?candidateASignalAtNextOpen(closed,nextOpen)
+      :{signal:"WAIT",pattern:null,reason:"NOT_CURRENT_COMPLETED_CANDLE"};
+    return c.json({system:"Chagatto-2 Candidate A",mode:"PAPER_ONLY",orderSent:false,
+      brokerWriteActionsDisabled:CANDIDATE_A_PAPER_ONLY,
+      triggerCandleTime:last.time,triggerCandleIso:new Date(last.time).toISOString(),
+      intendedNextOpenIso:new Date(nextOpen).toISOString(),decision,
+      settings:CANDIDATE_A,
+      limitations:["PUBLIC_BID_ONLY_NOT_EXECUTABLE_SPREAD","NO_LIVE_FOUR_HOUR_CLOSE", "NO_BROKER_OCO_COVERAGE_PROVEN",
+        "NO_RECONCILED_PROTECTIVE_ORDERS", "DO_NOT_ENABLE_LIVE_TRADING"]});
+  }catch(e:any){return c.json({paperOnly:true,orderSent:false,error:String(e?.message??e)},503);}
+});
+app.get("/candidate-a-config",c=>c.json({mode:"PAPER_ONLY",orderSent:false,
+  brokerWriteActionsDisabled:CANDIDATE_A_PAPER_ONLY,settings:CANDIDATE_A,
+  deploymentApproved:false,liveTradingApproved:false}));
+
 // ===== Chagatto-1 safety scheduler patch =====
 // 検証中は Railway の LIVE_TRADING_ENABLED=false のままにする。
 const DAILY_LOSS_LIMIT_YEN = -1200;
 const MAX_DAILY_TRADES = 20;
 const FIXED_ORDER_SIZE = 1000;
 const FIXED_STOP_DISTANCE = 0.150; // 15 pips on USD/JPY
-const FIXED_TAKE_PROFIT_DISTANCE = 0.200; // 20 pips on USD/JPY
+const FIXED_TAKE_PROFIT_DISTANCE = 0.550; // 55 pips on USD/JPY; dormant V50 paper-only
 const TARGET_LOSS_PER_TRADE_YEN = 150;
-const TARGET_PROFIT_PER_TRADE_YEN = 200;
+const TARGET_PROFIT_PER_TRADE_YEN = 550;
 let schedulerInProgress = false;
 let lastSchedulerFiveMinKey: string | null = null;
 let lastSchedulerResult: any = null;
@@ -2594,6 +2657,29 @@ async function runWinRateSafetyCycle() {
       return;
     }
 
+    // V50: candidate-A paper cycle must not read private account/order APIs.
+    // Evaluate ONLY completed public 5-minute candles; this branch is hardcoded
+    // before any private API call and cannot submit a live order.
+    if (CANDIDATE_A_PAPER_ONLY) {
+      try {
+        const closed = await fetchCompletedGmoCandles("5min", 3) as CandidateBar[];
+        const last = closed.at(-1);
+        const now = Date.now();
+        const nextOpen = last ? last.time + 300000 : NaN;
+        const decision = last && now >= nextOpen && now - nextOpen <= 300000
+          ? candidateASignalAtNextOpen(closed, nextOpen)
+          : { signal: "WAIT", pattern: null, reason: last ? "STALE_CANDLE" : "NO_CANDLES" };
+        lastSchedulerResult = { startedAt, action: "CANDIDATE_A_PAPER_SIGNAL", decision,
+          triggerCandleTime: last?.time ?? null, privateApiCalled: false,
+          orderSent: false, positionOpened: false, positionClosed: false,
+          note: "Signal preview only. Does not simulate persistent fills or 4h auto-close." };
+      } catch (error: any) {
+        lastSchedulerResult = {startedAt, action: "CANDIDATE_A_PAPER_ERROR",
+          error: String(error?.message ?? error), privateApiCalled: false, orderSent: false};
+      }
+      return;
+    }
+
     const daily = await getTodayRealizedPnlJst();
     if (daily.pnl <= DAILY_LOSS_LIMIT_YEN) {
       lastSchedulerResult = { startedAt, action: "STOP_DAILY_LOSS", daily };
@@ -2635,7 +2721,7 @@ if (daily.entryCount >= MAX_DAILY_TRADES) {
     }
 
     // LIVE=false の検証中は注文APIを呼ばず、ここまでの判定だけ記録する。
-    if (process.env.LIVE_TRADING_ENABLED !== "true") {
+    if (CANDIDATE_A_PAPER_ONLY || process.env.LIVE_TRADING_ENABLED !== "true") {
       lastSchedulerResult = { startedAt, action: "DRY_RUN", daily, signal, signalData };
       console.log("[scheduler] DRY_RUN", lastSchedulerResult);
       return;
@@ -2756,7 +2842,7 @@ app.get("/system-audit", (c) => c.json({
   signalChainConsistent: true,
   adxMinimum: 15,
   fixedOrderSize: FIXED_ORDER_SIZE,
-  takeProfitPips: 20,
+  takeProfitPips: 55,
   stopLossPips: 15,
   dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
   dailyProfitCap: null,
@@ -2829,7 +2915,7 @@ app.get("/order-safety-audit", async (c) => {
       maxDailyTrades: MAX_DAILY_TRADES,
       dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
       fixedOrderSize: FIXED_ORDER_SIZE,
-      takeProfitPips: 20,
+      takeProfitPips: 55,
       stopLossPips: 15,
       weekendMarketHoursGuard: true,
       note: "No order is sent by this endpoint."
@@ -3264,7 +3350,7 @@ async function gmoPrivatePost(path: string, bodyObject: Record<string, unknown>)
     triggerCandleTime: requestedTriggerCandleTime,
     triggerCandleIso: new Date(requestedTriggerCandleTime).toISOString(),
     orderSize,
-    takeProfitPips: 20,
+    takeProfitPips: 55,
     stopLossPips: 15,
     dailyEntryCount: orderDailyPnl.entryCount,
     dailyPnl: orderDailyPnl.pnl,
@@ -3735,6 +3821,7 @@ app.get("/change-order-request-preview", async (c) => {
 // Fail-closed: this route never sends unless LIVE_TRADING_ENABLED=true AND explicit execute=true
 // AND all supplied safety facts pass. Default/browser access is always dry-run.
 app.post("/change-order-live-gate", async (c) => {
+  if (CANDIDATE_A_PAPER_ONLY) return c.json({orderSent:false, decision:"BLOCKED_CANDIDATE_A_PAPER_ONLY", route:"/change-order-live-gate"},403);
   try {
     const live=String(process.env.LIVE_TRADING_ENABLED||"false").toLowerCase()==="true";
     const body:any=await c.req.json().catch(()=>({}));
@@ -3953,6 +4040,7 @@ app.get('/pre-entry-combined-guard-regression', (c) => {
 });
 
 app.post("/gmo-order", async (c) => {
+  if (CANDIDATE_A_PAPER_ONLY) return c.json({orderSent:false, decision:"BLOCKED_CANDIDATE_A_PAPER_ONLY", route:"/gmo-order"},403);
   // 安全装置1：本番取引が有効になっているか
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
     return c.json({
@@ -4976,7 +5064,7 @@ targetLossPerTradeYen: TARGET_LOSS_PER_TRADE_YEN,
 targetProfitPerTradeYen: TARGET_PROFIT_PER_TRADE_YEN,
 fixedOrderSize: FIXED_ORDER_SIZE,
 stopLossPips: 15,
-takeProfitPips: 20,
+takeProfitPips: 55,
 dailyLossLimitYen: DAILY_LOSS_LIMIT_YEN,
 maxDailyTrades: MAX_DAILY_TRADES,
 stopClientOrderId,
@@ -5016,6 +5104,7 @@ app.get("/stop-ack-safety-audit", c => c.json({
 // 外部スケジューラから 08:00 / 15:00 / 21:00 (JST) に呼び出す。
 // LIVE_TRADING_ENABLED=false の間は実注文されない。
 app.post("/gmo-auto-run", async (c) => {
+  if (CANDIDATE_A_PAPER_ONLY) return c.json({orderSent:false, decision:"BLOCKED_CANDIDATE_A_PAPER_ONLY", route:"/gmo-auto-run"},403);
   if (newEntriesSafelyBlocked()) {
     return c.json({
       autoRun: false,
@@ -5175,6 +5264,7 @@ app.get("/gmo-positions", async (c) => {
   });
 });
 app.post("/gmo-close", async (c) => {
+  if (CANDIDATE_A_PAPER_ONLY) return c.json({orderSent:false, decision:"BLOCKED_CANDIDATE_A_PAPER_ONLY", route:"/gmo-close"},403);
   // 安全装置1：本番取引OFFなら決済しない
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
     return c.json({
@@ -7117,3 +7207,83 @@ app.get('/stop-ack-state-separation-audit', c => c.json({
   approvedForLive: false,
   note: 'Static policy audit only; not an actual order, broker fill, or STOP trigger verification.'
 }));
+
+
+// V52: Independent paper-only four-hour exit policy inspection.
+// No broker reads or writes, and no credentials. Synthetic inputs ONLY.
+// This is not wired to actual /gmo-close and never authorizes a broker call.
+type V52ExitSnapshot = {
+  now:number; entryAt:number; positionReadOk:boolean; orderReadOk:boolean;
+  executionReadOk:boolean; allPagesRead:boolean; pendingEntryIntent:boolean;
+  pendingExitIntent:boolean; unknownOrderOutcome:boolean; positionCount:number;
+  positionSize:number; positionId:number; side:string; activeOrderCount:number;
+  protectiveOrderLinked:boolean; protectiveOrderFullSize:boolean;
+  protectiveOrderOppositeSide:boolean; ocoStructureVerified:boolean;
+  ocoCancelConfirmed:boolean; postCancelFreshSnapshot:boolean;
+  postCancelPositionVerified:boolean; postCancelOrdersEmpty:boolean;
+  postCancelExecutionChecked:boolean;
+};
+function v52AssessFourHourExit(s:V52ExitSnapshot) {
+  const halt=(reason:string)=>({decision:'HALT_MANUAL_RECONCILIATION',reason,maySendClose:false});
+  if(!s || !Number.isFinite(s.now)||!Number.isFinite(s.entryAt)||s.entryAt>s.now)
+    return halt('TIMESTAMP_INVALID');
+  if(!s.positionReadOk || !s.orderReadOk || !s.executionReadOk || !s.allPagesRead)
+    return halt('BROKER_SNAPSHOT_UNVERIFIED');
+  if(s.pendingEntryIntent || s.pendingExitIntent || s.unknownOrderOutcome)
+    return halt('ORDER_INTENT_UNRESOLVED');
+  if(s.positionCount!==1 || !Number.isSafeInteger(s.positionId)||s.positionId<=0 ||
+    s.positionSize!==1000 || !['BUY','SELL'].includes(s.side))return halt('POSITION_MISMATCH');
+  if(s.activeOrderCount!==1 || !s.protectiveOrderLinked || !s.protectiveOrderFullSize ||
+     !s.protectiveOrderOppositeSide || !s.ocoStructureVerified)
+    return halt('OCO_PROTECTION_UNVERIFIED');
+  const due=s.now-s.entryAt>=4*3600000;
+  if(!s.ocoCancelConfirmed) return {decision:due?'CANCEL_OCO_FIRST':'KEEP_PROTECTION_AND_WAIT',
+    reason:due?'TIME_LIMIT_REACHED':'NOT_YET_DUE',maySendClose:false};
+  if(!s.postCancelFreshSnapshot || !s.postCancelPositionVerified ||
+     !s.postCancelOrdersEmpty || !s.postCancelExecutionChecked)
+    return halt('POST_CANCEL_RECONCILIATION_REQUIRED');
+  if(!due)return halt('UNEXPECTED_EARLY_OCO_CANCEL');
+  return {decision:'PREPARE_DURABLE_EXIT_INTENT',reason:'SYNTHETIC_ONLY',maySendClose:false};
+}
+app.get('/candidate-a-four-hour-exit-safety-test', c => {
+  const base:V52ExitSnapshot={now:4*3600000,entryAt:0,positionReadOk:true,
+    orderReadOk:true,executionReadOk:true,allPagesRead:true,pendingEntryIntent:false,
+    pendingExitIntent:false,unknownOrderOutcome:false,positionCount:1,
+    positionSize:1000,positionId:123,side:'BUY',activeOrderCount:1,
+    protectiveOrderLinked:true,protectiveOrderFullSize:true,
+    protectiveOrderOppositeSide:true,ocoStructureVerified:true,ocoCancelConfirmed:false,
+    postCancelFreshSnapshot:false,postCancelPositionVerified:false,
+    postCancelOrdersEmpty:false,postCancelExecutionChecked:false};
+  const cases:[string,Partial<V52ExitSnapshot>,string][]=[
+    ['BEFORE_DEADLINE',{now:4*3600000-1},'KEEP_PROTECTION_AND_WAIT'],
+    ['AT_DEADLINE',{},'CANCEL_OCO_FIRST'],
+    ['NO_ORDER_PAGE',{allPagesRead:false},'HALT_MANUAL_RECONCILIATION'],
+    ['ENTRY_UNRESOLVED',{pendingEntryIntent:true},'HALT_MANUAL_RECONCILIATION'],
+    ['EXIT_UNRESOLVED',{pendingExitIntent:true},'HALT_MANUAL_RECONCILIATION'],
+    ['PARTIAL_COVERAGE',{protectiveOrderFullSize:false},'HALT_MANUAL_RECONCILIATION'],
+    ['WRONG_QUANTITY',{positionSize:500},'HALT_MANUAL_RECONCILIATION'],
+    ['NO_POST_CANCEL_SNAPSHOT',{ocoCancelConfirmed:true},'HALT_MANUAL_RECONCILIATION'],
+    ['POST_CANCEL_RECONCILED',{ocoCancelConfirmed:true,postCancelFreshSnapshot:true,
+       postCancelPositionVerified:true,postCancelOrdersEmpty:true,
+       postCancelExecutionChecked:true},'PREPARE_DURABLE_EXIT_INTENT'],
+  ];
+  const tests=cases.map(([name,override,expected])=>{
+    const result=v52AssessFourHourExit({...base,...override});
+    return {name,expected,decision:result.decision,maySendClose:result.maySendClose,
+      passed:result.decision===expected && !result.maySendClose};
+  });
+  return c.json({system:'Chagatto-2 V52 Candidate A Exit Guard',mode:'SYNTHETIC_ONLY',
+     orderSent:false,brokerCalled:false,liveApproved:false,privateApiCalled:false,
+     allPassed:tests.every(x=>x.passed),testCount:tests.length,tests,
+     note:'Pure decision exercise, NOT broker-side four-hour close functionality.'});
+});
+
+// V53: Always-blocked time exit lifecycle status. Broker-free diagnostic only.
+// The executable test suite lives in exit_lifecycle.test.mjs. No dynamic broker IO.
+app.get('/candidate-a-v53-exit-readiness',c=>c.json({system:'Chagatto-2 Candidate A V53',mode:'REVIEW_ONLY',orderSent:false,
+  closeOrderSent:false,brokerApiCalled:false,liveApproved:false,orderAllowed:false,
+  targetProfitGrossYen:550,stopLossGrossYen:150,maxHoldingHours:4,
+  workflow:['VERIFY_COMPLETE_POSITION_AND_OCO','DURABLE_CANCEL_INTENT','CANCEL_BROKER_ORDER',
+  'RECONCILE_ORDER_AND_EXECUTION','DURABLE_EXIT_INTENT','SINGLE_CLOSE','VERIFY_FLAT_AND_NO_PENDING_ORDERS'],
+  actualBrokerCancelIntegrated:false,actualBrokerCloseIntegrated:false,
+  nextAction:'DO_NOT_DEPLOY_LIVE; broker API lifecycle and persistent resume must be implemented and approved'}));
