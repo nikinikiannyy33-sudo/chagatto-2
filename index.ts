@@ -2196,7 +2196,7 @@ async function buildWinRateFocusedSignal() {
   return {
     system: "Chagatto-2 WinRate Focus",
     source: "GMO Coin FX",
-    strategy: "1H SMA/RSI/ADX primary + relaxed 5M direction confirmation; 4H display only",
+    strategy: "Candidate A 5M UUB/BUU/LLN; paper position accounting; 4H hypothetical close",
     signal,
     triggerCandleTime: last5.time,
     triggerCandleIso: new Date(last5.time).toISOString(),
@@ -2669,10 +2669,20 @@ async function runWinRateSafetyCycle() {
         const decision = last && now >= nextOpen && now - nextOpen <= 300000
           ? candidateASignalAtNextOpen(closed, nextOpen)
           : { signal: "WAIT", pattern: null, reason: last ? "STALE_CANDLE" : "NO_CANDLES" };
-        lastSchedulerResult = { startedAt, action: "CANDIDATE_A_PAPER_SIGNAL", decision,
-          triggerCandleTime: last?.time ?? null, privateApiCalled: false,
-          orderSent: false, positionOpened: false, positionClosed: false,
-          note: "Signal preview only. Does not simulate persistent fills or 4h auto-close." };
+        // Persistent hypothetical portfolio: never makes a private broker call.
+        const paper = await import("./paper_portfolio.mjs");
+        const paperFile = researchPath.join(safetyStateDir, "candidate-a-paper-v55.json");
+        if (!safetyStorageHealthy) throw new Error("PAPER_DURABLE_STORAGE_UNAVAILABLE");
+        if (!last || !Number.isFinite(last.close) || last.close <= 0) throw new Error("PAPER_MARK_INVALID");
+        const state = paper.readState(paperFile);
+        const result = paper.step(state,{now,barTime:last.time,mark:last.close,
+          signal:decision.signal,pattern:decision.pattern});
+        paper.writeState(paperFile,result.state);
+        lastSchedulerResult = {startedAt,action:"CANDIDATE_A_PAPER_PORTFOLIO",decision,
+          triggerCandleTime:last.time,events:result.events,
+          paperPosition:result.state.position,paperClosedTrades:result.state.trades.length,
+          privateApiCalled:false,orderSent:false,
+          note:"Hypothetical BID-only close-mark portfolio. Entry/exit are modeled at last completed candle close; 2pip roundtrip cost, no ASK/fills/slippage. Not a live broker execution."};
       } catch (error: any) {
         lastSchedulerResult = {startedAt, action: "CANDIDATE_A_PAPER_ERROR",
           error: String(error?.message ?? error), privateApiCalled: false, orderSent: false};
@@ -2929,9 +2939,24 @@ app.get("/order-safety-audit", async (c) => {
   }
 });
 
+app.get("/candidate-a-paper-status", async c => {
+  try {
+    const paper = await import("./paper_portfolio.mjs");
+    const file = researchPath.join(safetyStateDir,"candidate-a-paper-v55.json");
+    if(!safetyStorageHealthy) return c.json({paperOnly:true,error:"PAPER_DURABLE_STORAGE_UNAVAILABLE",orderSent:false},503);
+    const state=paper.readState(file);
+    return c.json({system:"Chagatto-2 Candidate A",mode:"PAPER_ONLY",liveTradingApproved:false,
+      privateApiCalled:false,orderSent:false,settings:paper.CONFIG,
+      position:state.position,closedTrades:state.trades.length,
+      netPnlYen:state.trades.reduce((n:number,t:any)=>n+t.pnlYen,0),
+      lastFiveTrades:state.trades.slice(-5),lastDecisionBar:state.lastDecisionBar,
+      caveat:"BID-only approximate virtual fills, not execution-grade returns. 4h exits are evaluated at the next observed scheduler candle, not exact intrabar prices."});
+  }catch(e:any){return c.json({paperOnly:true,orderSent:false,error:String(e?.message??e)},503)}
+});
+
 app.get("/scheduler-status", (c) => c.json({
   schedule: "continuous monitor; evaluate once after each completed 5-minute candle",
-  strategy: "1H SMA/RSI/ADX primary + relaxed 5M direction confirmation; 4H display only",
+  strategy: "Candidate A 5M UUB/BUU/LLN; paper position accounting; 4H hypothetical close",
   liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
   inProgress: schedulerInProgress,
   lastFiveMinKey: lastSchedulerFiveMinKey,
