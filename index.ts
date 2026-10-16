@@ -85,6 +85,38 @@ app.get("/", (c) => {
   });
 });
 
+// V107: authenticated, strictly read-only operational arming checklist.
+// Never reports API credentials or permits trading. HTTP GET has no broker write calls.
+app.get('/operator-live-preflight-v107', (c) => {
+  const expected = process.env.ADMIN_TOKEN;
+  if (!expected || c.req.header('X-ADMIN-TOKEN') !== expected)
+    return c.json({ok:false,reason:'ADMIN_AUTH_REQUIRED'},401);
+  const flags = {
+    liveTradingEnabled:process.env.LIVE_TRADING_ENABLED === 'true',
+    operatorTestMode:V106_OPERATOR_TEST_MODE,
+    entryApproved:process.env.V97_LIVE_ENTRY_APPROVED === 'true',
+    manualExitApproved:process.env.V98_LIVE_EXIT_APPROVED === 'true',
+    automaticExitApproved:process.env.V99_AUTOMATIC_EXIT_APPROVED === 'true',
+    credentialsPresent:Boolean(process.env.GMO_API_KEY && process.env.GMO_API_SECRET),
+    adminTokenConfigured:Boolean(expected),
+    safetyVolumeHealthy:safetyStorageHealthy,
+    durableHaltActive:newEntriesSafelyBlocked(),
+    requestInProgress:v97DispatchInProgress
+  };
+  const blockers:string[] = [];
+  if (!flags.liveTradingEnabled) blockers.push('LIVE_TRADING_DISABLED');
+  if (!flags.operatorTestMode) blockers.push('OPERATOR_TEST_DISABLED');
+  if (!flags.entryApproved) blockers.push('ENTRY_NOT_APPROVED');
+  if (!flags.manualExitApproved || !flags.automaticExitApproved) blockers.push('EXIT_NOT_ARMED');
+  if (!flags.credentialsPresent) blockers.push('GMO_CREDENTIALS_MISSING');
+  if (!flags.safetyVolumeHealthy || flags.durableHaltActive) blockers.push('DURABLE_SAFETY_HALT');
+  if (flags.requestInProgress) blockers.push('ENTRY_ALREADY_RUNNING');
+  return c.json({system:'Chagatto-2 V107 Operator Preflight',readOnly:true,orderSent:false,
+    flags,blockers,operatorFlagsReady:blockers.length===0,
+    brokerProtectionVerified:false,realOrderTestCompleted:false,
+    note:'Flags readiness is NOT permission to submit a real order. Actual broker protective OCO and close remain unverified.'});
+});
+
 // V97: Connected HTTP entry point to the real broker trade pipeline.
 // This route is intentionally operator-triggered, never called by the paper scheduler.
 // Activating it can place actual FX orders and expose capital to market risk.
