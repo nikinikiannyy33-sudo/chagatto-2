@@ -2,6 +2,13 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import crypto from "node:crypto";
 import * as researchFs from "node:fs/promises";
+import { createGmoFxReader } from "./gmo_fx_read_adapter.mjs";
+import { createLiveMarketEntry } from "./gmo_live_market_order_v94.mjs";
+import { protectiveOcoBody } from "./gmo_protective_oco_v95.mjs";
+import { executeOneLiveTrade } from "./gmo_live_trade_v96.mjs";
+import { runExitTick } from "./gmo_live_exit_v98.mjs";
+import { writeProtectedEntry, autoExitMonitor } from "./gmo_auto_exit_scheduler_v99.mjs";
+import { auditExactBrokerOco } from "./broker_exact_oco_audit_v68.mjs";
 import * as durableFs from "node:fs";
 import * as researchPath from "node:path";
 const app = new Hono();
@@ -74,6 +81,106 @@ app.get("/", (c) => {
     status: "running",
     mode: "FX verification system",
   });
+});
+
+// V97: Connected HTTP entry point to the real broker trade pipeline.
+// This route is intentionally operator-triggered, never called by the paper scheduler.
+// Activating it can place actual FX orders and expose capital to market risk.
+let v97DispatchInProgress = false;
+app.post("/gmo-live-entry-v97", async (c) => {
+  const token = process.env.ADMIN_TOKEN;
+  if (!token || c.req.header("X-ADMIN-TOKEN") !== token)
+    return c.json({ok:false,reason:"ADMIN_AUTH_REQUIRED",orderSent:false},401);
+  if (CANDIDATE_A_PAPER_ONLY || process.env.LIVE_TRADING_ENABLED !== "true" ||
+      process.env.V97_LIVE_ENTRY_APPROVED !== "true")
+    return c.json({ok:false,reason:"LIVE_GATE_CLOSED",orderSent:false},403);
+  if (!safetyStorageHealthy || newEntriesSafelyBlocked())
+    return c.json({ok:false,reason:"DURABLE_SAFETY_HALT",orderSent:false},409);
+  if (v97DispatchInProgress)
+    return c.json({ok:false,reason:"ORDER_DISPATCH_ALREADY_RUNNING",orderSent:false},409);
+  v97DispatchInProgress = true;
+  try {
+    const request:any = await c.req.json();
+    if (request?.approved !== true || request?.size !== 1000)
+      return c.json({ok:false,reason:"EXPLICIT_1000_UNIT_APPROVAL_REQUIRED",orderSent:false},400);
+    const side = request.side;
+    const pattern = request.pattern;
+    if (!((pattern === "UUB" || pattern === "BUU") && side === "BUY") &&
+        !(pattern === "LLN" && side === "SELL"))
+      return c.json({ok:false,reason:"PATTERN_SIDE_MISMATCH",orderSent:false},400);
+    if (!isGmoFxTradingHoursJst())
+      return c.json({ok:false,reason:"MARKET_CLOSED",orderSent:false},409);
+    // Never accept arbitrary / stale candle timestamps supplied by the caller.
+    const bars:any[] = await fetchCompletedGmoCandles("5min",3) as any[];
+    const last = bars.at(-1);
+    const now = Date.now();
+    const nextOpen = last?.time + 300000;
+    const decision = last && now >= nextOpen && now-nextOpen < 300000
+      ? candidateASignalAtNextOpen(bars,nextOpen) : null;
+    if (!decision || decision.signal !== side || decision.pattern !== pattern ||
+        Number(request.triggerCandleTime) !== last.time)
+      return c.json({ok:false,reason:"FRESH_STRATEGY_SIGNAL_NOT_CONFIRMED",orderSent:false},409);
+    // Reject any account exposure, including orders that have not yet filled.
+    const reader = createGmoFxReader({apiKey:process.env.GMO_API_KEY,
+      secret:process.env.GMO_API_SECRET});
+    const snapshot = await reader.positionAndOrders();
+    if (!snapshot.complete || !snapshot.brokerConfirmed || snapshot.positions.length || snapshot.orders.length)
+      return c.json({ok:false,reason:"BROKER_EXPOSURE_OR_INCOMPLETE_SNAPSHOT",orderSent:false},409);
+    const daily = await getTodayRealizedPnlJst();
+    if (daily.pnl <= DAILY_LOSS_LIMIT_YEN || daily.entryCount >= MAX_DAILY_TRADES)
+      return c.json({ok:false,reason:"DAILY_ENTRY_LIMIT",orderSent:false},409);
+    // Durable broker call: the module journals before POST and will not retry on uncertainty.
+    const result = await executeOneLiveTrade({apiKey:process.env.GMO_API_KEY,
+      secret:process.env.GMO_API_SECRET,pattern,side,
+      triggerCandleTime:last.time,approved:true,persistentDirectory:safetyStateDir});
+    if(result.stage==='PROTECTED' && result.coverageVerified===true){
+      try {writeProtectedEntry(result.entry,safetyStateDir)}
+      catch{persistSafetyHalt('PROTECTED_ENTRY_LEDGER_PERSIST_FAILED');return c.json({ok:false,reason:'PROTECTED_ENTRY_LEDGER_PERSIST_FAILED',orderSent:true},503)}
+      return c.json({ok:true,reason:'PROTECTED_POSITION_TRACKED',result},202);
+    }
+    // No unsupported OCO readback is treated as protection: halt further entries.
+    persistSafetyHalt(`V97_ORDER_PIPELINE_${String(result.stage || 'UNKNOWN')}`);
+    return c.json({ok:false,orderSent:"MAY_HAVE_BEEN_SENT",requiresManualBrokerReview:true,
+      result,reason:"LIVE_ENTRY_REQUIRES_BROKER_OCO_RECONCILIATION"},202);
+  } catch(e:any) {
+    persistSafetyHalt("V97_DISPATCH_FAILED_OR_UNKNOWN");
+    return c.json({ok:false,reason:"BROKER_EXECUTION_STATUS_UNKNOWN",
+      error:String(e?.message??e),requiresManualBrokerReview:true},503);
+  } finally {v97DispatchInProgress=false;}
+});
+
+// V98: operational four-hour exit tick. Explicit operator trigger only.
+// Does not treat ACK as cancel completion / settlement completion.
+let v98ExitInProgress=false;
+app.post('/gmo-live-exit-tick-v98',async c=>{
+ const token=process.env.ADMIN_TOKEN;
+ if(!token||c.req.header('X-ADMIN-TOKEN')!==token)
+   return c.json({ok:false,reason:'ADMIN_AUTH_REQUIRED'},401);
+ if(CANDIDATE_A_PAPER_ONLY || process.env.LIVE_TRADING_ENABLED!=='true'||
+    process.env.V98_LIVE_EXIT_APPROVED!=='true')
+   return c.json({ok:false,reason:'LIVE_EXIT_NOT_ARMED',orderSent:false},403);
+ if(v98ExitInProgress)return c.json({ok:false,reason:'EXIT_TICK_RUNNING'},409);
+ v98ExitInProgress=true;
+ try{
+  const body:any=await c.req.json();
+  if(body?.approved!==true)return c.json({ok:false,reason:'APPROVAL_REQUIRED'},400);
+  // Never trust caller-supplied entry identity or timestamps for broker writes.
+  const ledgerPath=researchPath.join(safetyStateDir,'protected-position-v99.json');
+  let entry:any;
+  try{entry=JSON.parse(durableFs.readFileSync(ledgerPath,'utf8'))}
+  catch{return c.json({ok:false,reason:'PROTECTED_ENTRY_LEDGER_REQUIRED',orderSent:false},409)}
+  if(!entry.coverageVerified || !['INDEPENDENT','OPERATIONAL_NOT_INDEPENDENT'].includes(entry.coverageEvidenceLevel))
+    return c.json({ok:false,reason:'PROTECTION_PROVENANCE_REQUIRED',orderSent:false},409);
+  const result=await runExitTick({entry,apiKey:process.env.GMO_API_KEY,
+   secret:process.env.GMO_API_SECRET,persistentDirectory:safetyStateDir,
+   approved:true,liveEnabled:true,now:Date.now()});
+  // This controller is one-way: never clear the safety halt on exit ACK.
+  if(result.orderSent||result.requiresManualBrokerReview)
+    persistSafetyHalt('V98_EXIT_BROKER_RECONCILIATION_REQUIRED');
+  return c.json(result,result.orderSent?202:409);
+ }catch(e:any){persistSafetyHalt('V98_EXIT_UNKNOWN');
+   return c.json({ok:false,reason:'EXIT_OUTCOME_UNKNOWN',error:String(e?.message??e)},503)
+ }finally{v98ExitInProgress=false}
 });
 
 app.get("/health", (c) => {
@@ -2243,17 +2350,27 @@ async function buildWinRateFocusedSignal() {
   };
 }
 
+// Canonical Candidate A strategy: exact same confirmed 5M pattern used in paper tests.
+// Signal only. Broker writes remain physically blocked throughout the runtime.
 app.get("/smart-signal", async (c) => {
   try {
-    const result = await buildWinRateFocusedSignal();
-    return c.json(result);
+    const closed = await fetchCompletedGmoCandles("5min", 3) as CandidateBar[];
+    const last = closed.at(-1);
+    if (!last) return c.json({system:"Chagatto-2 Candidate A",signal:"WAIT",
+      reason:"NO_COMPLETED_CANDLES",orderSent:false},503);
+    const now = Date.now();
+    const nextOpenTime = last.time + 300000;
+    const decision = now >= nextOpenTime && now-nextOpenTime < 300000
+      ? candidateASignalAtNextOpen(closed,nextOpenTime)
+      : {signal:"WAIT",pattern:null,reason:"STALE_OR_NOT_YET_CLOSED"};
+    return c.json({system:"Chagatto-2 Candidate A",strategy:"5M UUB/BUU/LLN",
+      mode:"PAPER_ONLY",signal:decision.signal,pattern:decision.pattern,
+      reason:decision.reason,triggerCandleTime:last.time,
+      triggerCandleIso:new Date(last.time).toISOString(),
+      brokerWriteActionsDisabled:CANDIDATE_A_PAPER_ONLY,orderSent:false});
   } catch (error: any) {
-    return c.json({
-      system: "Chagatto-2 WinRate Focus",
-      signal: "WAIT",
-      error: String(error?.message ?? error),
-      orderSent: false,
-    }, 500);
+    return c.json({system:"Chagatto-2 Candidate A",signal:"WAIT",
+      error:String(error?.message??error),orderSent:false},503);
   }
 });
 
@@ -2452,6 +2569,18 @@ app.get("/candidate-a-config",c=>c.json({mode:"PAPER_ONLY",orderSent:false,
   brokerWriteActionsDisabled:CANDIDATE_A_PAPER_ONLY,settings:CANDIDATE_A,
   deploymentApproved:false,liveTradingApproved:false}));
 
+// Read-only 4-hour exit orchestration status. No broker POST, no state mutation.
+// This is a separate injection-tested coordinator. Live close remains blocked.
+app.get('/candidate-a-four-hour-exit-readiness',c=>c.json({
+  system:'Chagatto-2',readOnly:true,realOrderSent:false,realCloseSent:false,
+  brokerWritesEnabled:false,candidate:'A',size:1000,tpGrossYen:550,slGrossYen:150,maxHoldHours:4,
+  gate:'BLOCKED_BROKER_PROTECTION_AND_CLOSE_UNVERIFIED',
+  proofRequired:['EXACT_POSITION_TO_OCO_LINK','DURABLE_CANCEL_INTENT_AND_POST_RESULT',
+    'BROKER_CONFIRMED_CANCELLED_OCO_CHILDREN','FRESH_POSITION_AND_EXECUTION_RECONCILIATION',
+    'DURABLE_CLOSE_INTENT_AND_POST_RESULT','POST_CLOSE_ZERO_POSITION_AND_ORDER_PROOF'],
+  note:'The separate four_hour_exit_engine.mjs rejects unknown states and never writes to GMO. Not live-ready.'
+}));
+
 // ===== Chagatto-1 safety scheduler patch =====
 // 検証中は Railway の LIVE_TRADING_ENABLED=false のままにする。
 const DAILY_LOSS_LIMIT_YEN = -1200;
@@ -2645,7 +2774,7 @@ async function runWinRateSafetyCycle() {
   const startedAt = new Date().toISOString();
 
   try {
-    if (!isGmoFxTradingHoursJst()) {
+    if (CANDIDATE_A_PAPER_ONLY && !isGmoFxTradingHoursJst()) {
       lastSchedulerResult = {
         startedAt,
         action: "STOP_MARKET_CLOSED",
@@ -2690,6 +2819,67 @@ async function runWinRateSafetyCycle() {
       return;
     }
 
+    // An open position is NOT proof of a correctly installed protective OCO.
+    // Never silently mark one protected or skip an expired four-hour exit.
+    // This read-only monitor errs closed until the broker-linked exit path is approved.
+    const brokerReader = createGmoFxReader({
+      apiKey: process.env.GMO_API_KEY,
+      secret: process.env.GMO_API_SECRET,
+    });
+    const brokerSnapshot = await brokerReader.positionAndOrders();
+    if (!brokerSnapshot.complete || !brokerSnapshot.brokerConfirmed || brokerSnapshot.atomic !== false) {
+      persistSafetyHalt("SCHEDULER_BROKER_SNAPSHOT_UNVERIFIED");
+      throw new Error("SCHEDULER_BROKER_SNAPSHOT_UNVERIFIED");
+    }
+    const baseUrl = schedulerBaseUrl();
+    if (brokerSnapshot.positions.length > 0 || brokerSnapshot.orders.length > 0) {
+      // Evaluate expiry independently from new-entry limits or market hours.
+      // Unknown entry time is an operator alert, NEVER permission to close blindly.
+      const {reviewLiveExitExposure} = await import("./broker_exit_review_v93.mjs");
+      const exitReview = reviewLiveExitExposure(brokerSnapshot, Date.now());
+      if (!exitReview.ok) {
+        persistSafetyHalt(exitReview.reason);
+        throw new Error(exitReview.reason);
+      }
+      const holdAudit = exitReview.age;
+      persistSafetyHalt(holdAudit.expiredCount > 0
+        ? "FOUR_HOUR_LIVE_POSITION_REQUIRES_VERIFIED_EXIT"
+        : holdAudit.unknownCount > 0
+          ? "LIVE_POSITION_AGE_UNKNOWN_REQUIRES_RECONCILIATION"
+          : "LIVE_POSITION_OR_ORDER_REQUIRES_PROTECTIVE_EXIT_RECONCILIATION");
+      lastSchedulerResult = {
+        startedAt,
+        action: "SAFETY_HALT_UNVERIFIED_BROKER_EXPOSURE",
+        // Daily PnL is deliberately not read before examining broker exposure.
+        // Referencing `daily` here caused a runtime ReferenceError (TDZ),
+        // hiding the actual protective-order safety halt.
+        daily: null,
+        positionCount: brokerSnapshot.positions.length,
+        activeOrderCount: brokerSnapshot.orders.length,
+        holdAudit,
+        exitReviewReason: exitReview.reason,
+        requiresOperatorExitReview: holdAudit.expiredCount > 0 || holdAudit.unknownCount > 0,
+        newEntryBlocked: true,
+        orderSent: false,
+        reason: "Broker exposure requires exact protective OCO and four-hour exit reconciliation. No automatic close or cancellation is authorized.",
+      };
+      console.error("[scheduler] broker exposure not proven protected", lastSchedulerResult);
+      return;
+    }
+
+    // V91: A closed market prevents NEW entries, not the broker exposure audit.
+    // Keep the broker snapshot and protective-order halt reachable 24/7.
+    if (!isGmoFxTradingHoursJst()) {
+      lastSchedulerResult = {startedAt, action:"STOP_MARKET_CLOSED",
+        brokerExposureChecked:true, positionCount:0, activeOrderCount:0,
+        orderSent:false, newEntryBlocked:true,
+        reason:"MARKET_CLOSED_AFTER_BROKER_EXPOSURE_AUDIT"};
+      return;
+    }
+
+    // V89: Daily entry limits govern NEW orders only. Never return before
+    // inspecting open broker exposure: stops must remain visible even when
+    // the account has reached its daily loss or entry-count cap.
     const daily = await getTodayRealizedPnlJst();
     if (daily.pnl <= DAILY_LOSS_LIMIT_YEN) {
       lastSchedulerResult = { startedAt, action: "STOP_DAILY_LOSS", daily };
@@ -2702,27 +2892,20 @@ if (daily.entryCount >= MAX_DAILY_TRADES) {
       return;
     }
 
-    const positionCount = await getUsdJpyOpenPositionCount();
-    const baseUrl = schedulerBaseUrl();
-    if (positionCount > 0) {
-      // Existing position is already protected by its OCO TP/SL.
-      // No new entry is allowed until the position is closed.
-      lastSchedulerResult = {
-        startedAt,
-        action: "HOLD_OPEN_POSITION_OCO",
-        daily,
-        positionCount,
-        newEntryBlocked: true,
-      };
-      console.log("[scheduler] hold open position", lastSchedulerResult);
-      return;
-    }
-
-    const signalResponse = await fetch(`${baseUrl}/smart-signal`);
-    const signalData: any = await signalResponse.json();
-    if (!signalResponse.ok) throw new Error(`smart-signal failed: ${JSON.stringify(signalData)}`);
-
-    const signal = String(signalData?.signal ?? "WAIT");
+    // Candidate A is the only reviewed 5-minute strategy. Do NOT route an
+    // unrelated /smart-signal response to the live scheduler.
+    const candidateBars = await fetchCompletedGmoCandles("5min", 3) as CandidateBar[];
+    const candidateLast = candidateBars.at(-1);
+    const schedulerNow = Date.now();
+    const candidateNextOpen = candidateLast ? candidateLast.time + 300000 : NaN;
+    const candidateDecision = candidateLast && schedulerNow >= candidateNextOpen &&
+      schedulerNow - candidateNextOpen < 300000
+        ? candidateASignalAtNextOpen(candidateBars, candidateNextOpen)
+        : {signal:"WAIT",pattern:null,reason:"NO_FRESH_CLOSED_CANDLE"};
+    const signalData: any = {...candidateDecision,
+      triggerCandleTime: candidateLast?.time ?? null,
+      strategy: "Candidate A 5M UUB/BUU/LLN"};
+    const signal = String(signalData.signal);
     await recordResearchSignal(signalData, "SCHEDULER_SIGNAL");
     if (signal !== "BUY" && signal !== "SELL") {
       lastSchedulerResult = { startedAt, action: "WAIT", daily, signalData };
@@ -2761,7 +2944,13 @@ if (daily.entryCount >= MAX_DAILY_TRADES) {
     };
     console.log("[scheduler] order result", lastSchedulerResult);
   } catch (error: any) {
-    lastSchedulerResult = { startedAt, action: "ERROR", error: String(error?.message ?? error) };
+    // V89: A failed live broker read must not leave new-entry permission
+    // open. Persistent halt also survives a process restart.
+    if (!CANDIDATE_A_PAPER_ONLY) {
+      persistSafetyHalt("SCHEDULER_READ_OR_EXECUTION_ERROR");
+    }
+    lastSchedulerResult = { startedAt, action: "ERROR", error: String(error?.message ?? error),
+      newEntryBlocked: !CANDIDATE_A_PAPER_ONLY, orderSent: false };
     console.error("[scheduler] error", lastSchedulerResult);
   } finally {
     schedulerInProgress = false;
@@ -2939,6 +3128,62 @@ app.get("/order-safety-audit", async (c) => {
   }
 });
 
+// v70: authenticated read-only preflight. No cancel, close, or entry code paths.
+// v71 operator-facing explicit live blockers (no write path, no secrets).
+app.get('/candidate-a-live-deployment-gate', c => c.json({
+ system:'Chagatto-2',mode:'READ_ONLY',orderSent:false,
+ liveTradingEnabled:false,readyForRealOrders:false,
+ blockers:[
+  'CANDIDATE_A_PAPER_ONLY_HARD_GATE',
+  'EXACT_BROKER_POSITION_TO_OCO_LINKAGE_NOT_CONFIRMED',
+  'EXIT_CANCEL_CLOSE_FILL_SEQUENCE_NOT_BROKER_TESTED',
+  'RESTART_RECOVERY_REQUIRES_BROKER_EXECUTION_EVIDENCE',
+  'BROKER_MARGIN_FEES_AND_STRATEGY_RISK_NOT_LIVE_VALIDATED'
+ ],
+ warning:'Changing LIVE_TRADING_ENABLED alone must never remove the hard gate.'
+}));
+
+app.get('/candidate-a-live-exit-readonly-preflight', async c => {
+ const base={system:'Chagatto-2',mode:'V70_READ_ONLY',orderSent:false,liveApproved:false};
+ const token=process.env.ADMIN_TOKEN;
+ if(!token||c.req.header('X-ADMIN-TOKEN')!==token)return c.json({...base,error:'UNAUTHORIZED'},401);
+ const params=c.req.query();
+ if(Object.keys(params).some(k=>!['positionId','rootOrderId','size','side','openedAt'].includes(k)))return c.json({...base,error:'UNKNOWN_QUERY_PARAM'},400);
+ try{
+  const {createGmoFxReader}=await import('./gmo_fx_read_adapter.mjs');
+  const {readOnlyExitPreflight}=await import('./integrated_exit_preflight_v70.mjs');
+  const reader=createGmoFxReader({apiKey:process.env.GMO_API_KEY,secret:process.env.GMO_API_SECRET});
+  const entry={positionId:params.positionId,rootOrderId:params.rootOrderId,size:params.size,side:params.side,openedAt:Number(params.openedAt)};
+  const check=await readOnlyExitPreflight({reader,entry});
+  return c.json({...base,...check});
+ }catch{return c.json({...base,status:'BLOCK',error:'BROKER_PREFLIGHT_UNAVAILABLE'},503)}
+});
+
+// v80: production HTTP integration of authenticated, read-only close evidence.
+// Authorization never permits a broker write, irrespective of evidence result.
+app.get('/candidate-a-close-settlement-readonly', async c => {
+ const base={system:'Chagatto-2',mode:'READ_ONLY_SETTLEMENT_V81',orderSent:false,closeOrderSent:false,liveWriteAuthorized:false};
+ const admin=process.env.ADMIN_TOKEN;
+ if(!admin || c.req.header('X-ADMIN-TOKEN')!==admin) return c.json({...base,reason:'UNAUTHORIZED'},401);
+ const q=c.req.query();
+ if(Object.keys(q).some(k=>!['positionId','closeOrderId','size','side'].includes(k))) return c.json({...base,reason:'UNKNOWN_QUERY_PARAMETER'},400);
+ const id=(x:unknown)=>typeof x==='string'&&/^[1-9][0-9]*$/.test(x)&&Number.isSafeInteger(Number(x));
+ if(!id(q.positionId)||!id(q.closeOrderId)||!id(q.size)||!['BUY','SELL'].includes(q.side))return c.json({...base,reason:'INVALID_ENTRY_IDENTITY'},400);
+ try {
+  const reader=createGmoFxReader({apiKey:process.env.GMO_API_KEY,secret:process.env.GMO_API_SECRET});
+  const {verifyExactSettlement}=await import('./settlement_evidence_v79.mjs');
+  const first=await reader.positionAndOrders();
+  const executionProof=await reader.completeExecutions(q.closeOrderId);
+  const second=await reader.positionAndOrders();
+  const evidence=verifyExactSettlement({entry:{positionId:q.positionId,size:q.size,side:q.side},closeOrderId:q.closeOrderId,
+    first,second,executions:executionProof.rows,executionHistoryComplete:executionProof.complete});
+  // Fail closed if the broker omits totalCount or returns a truncated order-scoped history.
+  // Proof of a completed close still never authorizes a fresh trade.
+  return c.json({...base,...evidence,executionRecords:executionProof.rows.length,
+    evidenceSource:'ORDER_ID_SCOPED_TOTAL_COUNT_EXACT_MATCH'});
+ }catch{return c.json({...base,settled:false,allowNewEntry:false,reason:'BROKER_READ_OR_RECONCILIATION_FAILED'},503)}
+});
+
 app.get("/candidate-a-paper-status", async c => {
   try {
     const paper = await import("./paper_portfolio.mjs");
@@ -2952,6 +3197,37 @@ app.get("/candidate-a-paper-status", async c => {
       lastFiveTrades:state.trades.slice(-5),lastDecisionBar:state.lastDecisionBar,
       caveat:"BID-only approximate virtual fills, not execution-grade returns. 4h exits are evaluated at the next observed scheduler candle, not exact intrabar prices."});
   }catch(e:any){return c.json({paperOnly:true,orderSent:false,error:String(e?.message??e)},503)}
+});
+
+// v58: fully read-only, deterministic broker-exit readiness self-test.
+// NOTE: This is not a live broker adapter and NEVER sends cancellations/closes.
+
+// v59: broker-readonly diagnostic. Explicitly NOT a trading gate or approval.
+app.get('/candidate-a-broker-readonly-audit', async c => {
+  const base={system:'Chagatto-2 v59',readOnly:true,orderSent:false,liveApproved:false};
+  const token=process.env.ADMIN_TOKEN;
+  if(!token || c.req.header('X-ADMIN-TOKEN')!==token) return c.json({...base,error:'UNAUTHORIZED'},401);
+  try {
+    const mod=await import('./broker_audit.mjs');
+    const results=await Promise.allSettled([
+      gmoPrivateGet('/v1/openPositions','?symbol=USD_JPY&count=100'),
+      gmoPrivateGet('/v1/activeOrders','?symbol=USD_JPY&count=100'),
+      gmoPrivateGet('/v1/latestExecutions','?symbol=USD_JPY&count=100')
+    ]);
+    if(results.some(r=>r.status!=='fulfilled'))return c.json({...base,status:'BLOCK',reason:'BROKER_READ_FAILED'},503);
+    const audit=mod.auditSnapshot(...results.map(r=>(r as PromiseFulfilledResult<any>).value));
+    return c.json({...base,audit,note:'Read-only, no broker order/cancel calls; broker-reported order linkage cannot be proven from activeOrders alone.'});
+  } catch(e:any) { return c.json({...base,status:'BLOCK',reason:'AUDIT_ERROR'},503); }
+});
+
+app.get("/candidate-a-four-hour-exit-planner-test", async (c) => {
+  const {planFourHourExit,HOLD_MS}=await import("./exit_reconciliation.mjs");
+  const position={status:0,data:{list:[{positionId:"123",side:"BUY",size:"1000"}],totalCount:1}};
+  const orders={status:0,data:{list:[{executionType:"OCO",settleType:"CLOSE",side:"SELL",settlePosition:[{positionId:"123",size:"1000"}]}],totalCount:1}};
+  const decision=planFourHourExit({now:HOLD_MS+1,openedAt:0,positionId:"123",side:"BUY",size:1000,
+    positionsReply:position,ordersReply:orders,executionsVerified:true});
+  return c.json({paperOnly:true,brokerCalled:false,orderSent:false,executionMode:"SYNTHETIC_DATA_ONLY",
+    decision, liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==="true",liveApproved:false});
 });
 
 app.get("/scheduler-status", (c) => c.json({
@@ -2980,6 +3256,25 @@ setInterval(() => {
   lastSchedulerFiveMinKey = bucketKey;
   void runWinRateSafetyCycle();
 }, 20_000);
+// V99: automatic four-hour monitor, independent from the 5-minute entry cadence.
+// A stop-loss order must remain with the broker between monitor ticks.
+let v99ExitBusy=false;
+let v99LastExit={reason:'NOT_YET_RUN',orderSent:false};
+export async function runV99AutomaticExitOnce(now=Date.now()){
+ if(v99ExitBusy)return {reason:'EXIT_ALREADY_RUNNING',orderSent:false};
+ if(CANDIDATE_A_PAPER_ONLY || process.env.LIVE_TRADING_ENABLED!=='true' || process.env.V99_AUTOMATIC_EXIT_APPROVED!=='true')
+   return {reason:'AUTO_EXIT_GATE_CLOSED',orderSent:false};
+ v99ExitBusy=true;
+ try{
+  const result=await autoExitMonitor({dir:safetyStateDir,now,enabled:true,apiKey:process.env.GMO_API_KEY,secret:process.env.GMO_API_SECRET});
+  v99LastExit=result;
+  if(result.orderSent||result.requiresManualBrokerReview)persistSafetyHalt('V99_AUTO_EXIT_RECONCILIATION_REQUIRED');
+  return result;
+ }catch(e:any){persistSafetyHalt('V99_EXIT_MONITOR_ERROR');return {reason:'AUTO_EXIT_ERROR',error:String(e?.message??e),orderSent:false};}
+ finally{v99ExitBusy=false}
+}
+setInterval(()=>{void runV99AutomaticExitOnce()},20_000);
+app.get('/gmo-auto-exit-status-v99',c=>c.json({last:v99LastExit,active:v99ExitBusy,enabled:!CANDIDATE_A_PAPER_ONLY&&process.env.LIVE_TRADING_ENABLED==='true'&&process.env.V99_AUTOMATIC_EXIT_APPROVED==='true'}));
 // ===== end safety scheduler patch =====
 
 app.get("/gmo-safety-status", (c) => c.json({
@@ -4064,6 +4359,36 @@ app.get('/pre-entry-combined-guard-regression', (c) => {
     limitations:['SHARED_CLASSIFIERS_NOT_FULL_POST_AUTH_ORDER_FLOW','NO_BROKER_IO','NO_STOP_FILL_TEST','NO_LIVE_APPROVAL']});
 });
 
+// v95 independent protection preview; no broker write and no approval implied.
+app.post('/gmo-protection-preview-v95',async c=>{
+ const token=process.env.ADMIN_TOKEN;
+ if(!token||c.req.header('X-ADMIN-TOKEN')!==token)return c.json({error:'UNAUTHORIZED'},401);
+ try{const req=await c.req.json();return c.json({orderSent:false,liveEnabled:false,protectionVerified:false,proposed:protectiveOcoBody(req)});}
+ catch(e){return c.json({error:e instanceof Error?e.message:String(e),orderSent:false},400);}
+});
+
+// v94 real signed broker entry transport, intentionally behind independent hard gates.
+// PRECONDITION for enabling: end-to-end protective OCO, 4-hour settlement and recovery verified.
+app.post('/gmo-market-order-v94', async c=>{
+ if(CANDIDATE_A_PAPER_ONLY||process.env.LIVE_TRADING_ENABLED!=='true'||process.env.V94_LIVE_ENTRY_APPROVED!=='true')
+  return c.json({orderSent:false,reason:'V94_HARD_LIVE_GATE_BLOCKED'},403);
+ const token=process.env.ADMIN_TOKEN;
+ if(!token||c.req.header('X-ADMIN-TOKEN')!==token)return c.json({orderSent:false,reason:'UNAUTHORIZED'},401);
+ if(newEntriesSafelyBlocked()||!isGmoFxTradingHoursJst())return c.json({orderSent:false,reason:'SAFETY_OR_MARKET_HALT'},409);
+ try{
+  const req=await c.req.json();
+  const entry=createLiveMarketEntry({apiKey:process.env.GMO_API_KEY,secret:process.env.GMO_API_SECRET,
+    armed:true,journalDirectory:'/data/safety'});
+  const result=await entry.submit({...req,approved:true});
+  // A market order is never considered safely protected on acceptance alone.
+  persistSafetyHalt('V94_MARKET_ENTRY_REQUIRES_OCO_AND_FILL_RECONCILIATION');
+  return c.json({...result,liveTradingApproved:false},202);
+ }catch(error){
+  persistSafetyHalt('V94_MARKET_ENTRY_UNVERIFIED_OR_BLOCKED');
+  return c.json({orderSent:'UNKNOWN_OR_BLOCKED',reason:error instanceof Error?error.message:String(error)},503);
+ }
+});
+
 app.post("/gmo-order", async (c) => {
   if (CANDIDATE_A_PAPER_ONLY) return c.json({orderSent:false, decision:"BLOCKED_CANDIDATE_A_PAPER_ONLY", route:"/gmo-order"},403);
   // 安全装置1：本番取引が有効になっているか
@@ -4332,48 +4657,32 @@ if (
 // 1000通貨固定。SL15pipsなら約150円の価格差損失（滑り・手数料等は別）。
 const maxRiskYen = TARGET_LOSS_PER_TRADE_YEN;
 
-// スケジューラと同じ勝率優先シグナルを再確認する。
-// 旧 /gmo-signal を参照すると、新戦略がBUY/SELLでも注文が拒否されるため使わない。
-const signalResponse = await fetch(
-  new URL("/smart-signal", c.req.url).toString()
-);
-
-const signalData: any = await signalResponse.json();
-
-  // シグナル取得が正常か確認
-if (!signalResponse.ok) {
-  return c.json({
-    orderSent: false,
-    error: "SMART_SIGNAL_API_ERROR",
-  }, 500);
+// Re-evaluate the exact Candidate A strategy at the broker write boundary.
+// Never trust a caller-provided signal or the legacy /smart-signal endpoint.
+let verifiedCandidate: any;
+try {
+  const confirmedBars = await fetchCompletedGmoCandles("5min", 3) as CandidateBar[];
+  const mostRecent = confirmedBars.at(-1);
+  const nowForOrder = Date.now();
+  const expectedNextOpen = mostRecent ? mostRecent.time + 300000 : NaN;
+  if (!mostRecent || !Number.isSafeInteger(mostRecent.time) ||
+      mostRecent.time !== requestedTriggerCandleTime ||
+      mostRecent.time % 300000 !== 0 ||
+      expectedNextOpen > nowForOrder ||
+      nowForOrder - expectedNextOpen >= 300000) {
+    return c.json({orderSent:false,error:"CANDIDATE_A_CANDLE_NOT_CURRENT"},409);
+  }
+  verifiedCandidate = candidateASignalAtNextOpen(confirmedBars, expectedNextOpen);
+} catch (error) {
+  return c.json({orderSent:false,error:"CANDIDATE_A_RECHECK_FAILED",
+    message:error instanceof Error ? error.message : String(error)},503);
 }
-
-// BUY / SELL シグナル以外では注文しない
-const currentSignal = String(signalData.signal);
-
-if (
-  currentSignal !== "BUY" &&
-  currentSignal !== "SELL"
-) {
-  return c.json({
-    orderSent: false,
-    error: "NO_SMART_TRADE_SIGNAL",
-    signal: currentSignal,
-  }, 409);
-}
-
-const currentTriggerCandleTime = Number(signalData?.triggerCandleTime);
-
-if (
-  !Number.isFinite(currentTriggerCandleTime) ||
-  currentTriggerCandleTime !== requestedTriggerCandleTime
-) {
-  return c.json({
-    orderSent: false,
-    error: "SIGNAL_CANDLE_CHANGED",
-    requestedTriggerCandleTime,
-    currentTriggerCandleTime,
-  }, 409);
+const currentSignal = String(verifiedCandidate?.signal ?? "WAIT");
+const approvedPattern = String(verifiedCandidate?.pattern ?? "");
+const approvedSide = approvedPattern === "LLN" ? "SELL" :
+  (approvedPattern === "UUB" || approvedPattern === "BUU") ? "BUY" : "WAIT";
+if (currentSignal === "WAIT" || approvedSide !== currentSignal) {
+  return c.json({orderSent:false,error:"CANDIDATE_A_PATTERN_NOT_VERIFIED"},409);
 }
 
 // 外部から指定された注文方向とシグナルが違えば拒否
@@ -5148,33 +5457,38 @@ app.post("/gmo-auto-run", async (c) => {
     }, 401);
   }
 
-  // シグナルをサーバー内部で取得
-  let signalResponse: Response;
+  // The manual auto-run entry must use exactly the same closed 5-minute
+  // Candidate A decision as the scheduler; /smart-signal is a legacy strategy.
   let signalData: any;
-
   try {
-    signalResponse = await fetch(
-      new URL("/gmo-signal", c.req.url).toString()
-    );
-    signalData = await signalResponse.json();
+    const candidateBars = await fetchCompletedGmoCandles("5min", 3) as CandidateBar[];
+    const candidateLast = candidateBars.at(-1);
+    const now = Date.now();
+    const nextOpen = candidateLast ? candidateLast.time + 300000 : NaN;
+    const decision = candidateLast && now >= nextOpen && now - nextOpen < 300000
+      ? candidateASignalAtNextOpen(candidateBars, nextOpen)
+      : {signal:"WAIT",pattern:null,reason:"NO_FRESH_CLOSED_CANDLE"};
+    signalData = {...decision,triggerCandleTime:candidateLast?.time ?? null,
+      strategy:"Candidate A 5M UUB/BUU/LLN"};
   } catch (error) {
-    return c.json({
-      autoRun: false,
-      error: "SIGNAL_FETCH_FAILED",
-      message:
-        error instanceof Error ? error.message : String(error),
-    }, 500);
-  }
-
-  if (!signalResponse.ok) {
-    return c.json({
-      autoRun: false,
-      error: "SIGNAL_API_ERROR",
-      signalData,
-    }, 500);
+    return c.json({autoRun:false,orderSent:false,error:"CANDIDATE_A_SIGNAL_FAILED",
+      message:error instanceof Error ? error.message : String(error)},503);
   }
 
   const signal = String(signalData?.signal ?? "WAIT");
+
+  // Only a current completed five-minute candle may trigger an entry.
+  // Invalid, stale, or future candle times are blocked before calling /gmo-order.
+  const triggerCandleTime = Number(signalData?.triggerCandleTime);
+  const nowMs = Date.now();
+  if ((signal === "BUY" || signal === "SELL") && (
+    !Number.isSafeInteger(triggerCandleTime) || triggerCandleTime <= 0 ||
+    triggerCandleTime % 300000 !== 0 ||
+    triggerCandleTime + 300000 > nowMs ||
+    nowMs - (triggerCandleTime + 300000) >= 300000
+  )) {
+    return c.json({autoRun:false,orderSent:false,error:"INVALID_OR_STALE_CLOSED_CANDLE"},409);
+  }
 
   // WAITなら注文処理を呼ばない
   if (signal !== "BUY" && signal !== "SELL") {
@@ -5200,7 +5514,7 @@ app.post("/gmo-auto-run", async (c) => {
           "Content-Type": "application/json",
           "X-ADMIN-TOKEN": adminToken,
         },
-        body: JSON.stringify({ side: signal }),
+        body: JSON.stringify({ side: signal, triggerCandleTime }),
       }
     );
 
@@ -5289,6 +5603,10 @@ app.get("/gmo-positions", async (c) => {
   });
 });
 app.post("/gmo-close", async (c) => {
+  // Legacy closeOrder route does not cancel/reconcile a linked protective OCO.
+  // Block unconditionally even if a future deploy removes the paper hard gate.
+  return c.json({closeSent:false,orderSent:false,
+    error:"LEGACY_CLOSE_UNSAFE_USE_RECONCILED_EXIT_WORKFLOW"},403);
   if (CANDIDATE_A_PAPER_ONLY) return c.json({orderSent:false, decision:"BLOCKED_CANDIDATE_A_PAPER_ONLY", route:"/gmo-close"},403);
   // 安全装置1：本番取引OFFなら決済しない
   if (process.env.LIVE_TRADING_ENABLED !== "true") {
@@ -6609,6 +6927,72 @@ app.get("/unknown-order-outcome-test", (c) => {
     orderSent: false, gmoPrivateApiCalled: false, liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
     safetyMarkerChanged: false, testCount: results.length, allPassed: results.every(x => x.passed), results,
     limits: "Source-path simulation only. Does not validate broker executions, STOP placement, exchange behavior or recovery after a real outage." });
+});
+
+// Authenticated, fully paginated broker-side inspection. Absolutely no broker write.
+// This endpoint is intentionally NOT a trading-permission gate: reading sequential
+// snapshots cannot prove transactional STOP coverage or authorize a close.
+app.get("/broker-complete-snapshot-v67", async (c) => {
+  const expected = process.env.ADMIN_TOKEN;
+  if (!expected || c.req.header("X-ADMIN-TOKEN") !== expected) {
+    return c.json({readOnly:true, authorized:false, error:"ADMIN_AUTH_REQUIRED"},401);
+  }
+  const common = {readOnly:true, orderSent:false, liveOrdersEnabled:false,
+    safeToTrade:false, safeToClose:false, snapshotAtomic:false};
+  if (!safetyStorageHealthy) {
+    return c.json({...common, status:"BLOCKED", reason:"SAFETY_VOLUME_UNAVAILABLE"},503);
+  }
+  if (!process.env.GMO_API_KEY || !process.env.GMO_API_SECRET) {
+    return c.json({...common,status:"BLOCKED",reason:"BROKER_CREDENTIALS_MISSING"},503);
+  }
+  try {
+    const reader = createGmoFxReader({apiKey:process.env.GMO_API_KEY,
+      secret:process.env.GMO_API_SECRET});
+    const first = await reader.positionAndOrders();
+    const second = await reader.positionAndOrders();
+    const stable = JSON.stringify(first.positions) === JSON.stringify(second.positions) &&
+      JSON.stringify(first.orders) === JSON.stringify(second.orders);
+    const positions = second.positions;
+    const orders = second.orders;
+    const unprotected = positions.length > 0 &&
+      !orders.some((o:any)=>String(o?.executionType).toUpperCase()==="STOP");
+    return c.json({...common, status:!stable?"CHANGING_BROKER_SNAPSHOT":
+      unprotected?"POSSIBLE_UNPROTECTED_POSITION":"READ_COMPLETED_NOT_LIVE_APPROVED",
+      snapshotStable:stable,
+      pendingMarketOrder:pendingMarketOrderExistsOrUnknown(),
+      safetyHalt:gmoSafetyHalt,
+      counts:{positions:positions.length,orders:orders.length,
+        stops:orders.filter((o:any)=>String(o?.executionType).toUpperCase()==="STOP").length},
+      paginationComplete:true, stopToPositionLinkVerified:false,
+      brokerHistoryConfirmed:false,
+      note:"Two non-atomic GET snapshots cannot authorize order placement, cancellation or settlement."});
+  } catch (err:any) {
+    return c.json({...common,status:"BLOCKED",reason:"BROKER_READ_UNVERIFIED",
+      errorCode:String(err?.message??"UNKNOWN").slice(0,100)},503);
+  }
+});
+
+// Per-position authenticated read-only OCO audit. No cancellation/close permission.
+app.get("/broker-exact-oco-audit-v68", async (c) => {
+  const expected = process.env.ADMIN_TOKEN;
+  if (!expected || c.req.header("X-ADMIN-TOKEN") !== expected) return c.json({readOnly:true,error:"ADMIN_AUTH_REQUIRED"},401);
+  const blocked = {readOnly:true,orderSent:false,allowNewEntry:false,allowCancel:false,allowMarketClose:false};
+  if (!safetyStorageHealthy || !process.env.GMO_API_KEY || !process.env.GMO_API_SECRET)
+    return c.json({...blocked,reason:"SAFETY_OR_CREDENTIALS_MISSING"},503);
+  const positionId = c.req.query("positionId"), rootOrderId = c.req.query("rootOrderId");
+  const size = c.req.query("size"), side = c.req.query("side");
+  if (![positionId,rootOrderId,size].every(x=>typeof x === "string" && /^[1-9][0-9]*$/.test(x) && Number.isSafeInteger(Number(x))) || !["BUY","SELL"].includes(String(side)))
+    return c.json({...blocked,reason:"INVALID_ENTRY_PARAMETERS"},400);
+  try {
+    const reader = createGmoFxReader({apiKey:process.env.GMO_API_KEY,secret:process.env.GMO_API_SECRET});
+    const first = await reader.positionAndOrders();
+    const details = await reader.exactOrder(rootOrderId);
+    const second = await reader.positionAndOrders();
+    const result = auditExactBrokerOco({entry:{positionId,rootOrderId,size,side},first,second,orderDetails:details});
+    return c.json({...blocked,...result,liveTradingApproved:false,snapshotAtomic:false});
+  } catch (err:any) {
+    return c.json({...blocked,reason:"BROKER_AUDIT_FAILED",errorCode:String(err?.message??"UNKNOWN").slice(0,80)},503);
+  }
 });
 
 // Read-only broker-side reconciliation snapshot. Does not modify any safety state.
