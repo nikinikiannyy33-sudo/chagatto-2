@@ -14,6 +14,8 @@ import * as researchPath from "node:path";
 const app = new Hono();
 // Candidate A integration: BROKER WRITE ACTIONS ARE HARD-DISABLED pending independent approval.
 const CANDIDATE_A_PAPER_ONLY = true;
+// V106 operator-only trial switch; DOES NOT unlock legacy order routes or the paper scheduler.
+const V106_OPERATOR_TEST_MODE = process.env.V106_OPERATOR_TEST_MODE === "true";
 
 function sma(values: number[], period: number) {
   if (values.length < period) return null;
@@ -91,9 +93,11 @@ app.post("/gmo-live-entry-v97", async (c) => {
   const token = process.env.ADMIN_TOKEN;
   if (!token || c.req.header("X-ADMIN-TOKEN") !== token)
     return c.json({ok:false,reason:"ADMIN_AUTH_REQUIRED",orderSent:false},401);
-  if (CANDIDATE_A_PAPER_ONLY || process.env.LIVE_TRADING_ENABLED !== "true" ||
+  if (!V106_OPERATOR_TEST_MODE || process.env.LIVE_TRADING_ENABLED !== "true" ||
       process.env.V97_LIVE_ENTRY_APPROVED !== "true")
     return c.json({ok:false,reason:"LIVE_GATE_CLOSED",orderSent:false},403);
+  if (process.env.V98_LIVE_EXIT_APPROVED !== 'true' || process.env.V99_AUTOMATIC_EXIT_APPROVED !== 'true')
+    return c.json({ok:false,reason:'EXIT_PATH_NOT_ARMED',orderSent:false},403);
   if (!safetyStorageHealthy || newEntriesSafelyBlocked())
     return c.json({ok:false,reason:"DURABLE_SAFETY_HALT",orderSent:false},409);
   if (v97DispatchInProgress)
@@ -156,7 +160,7 @@ app.post('/gmo-live-exit-tick-v98',async c=>{
  const token=process.env.ADMIN_TOKEN;
  if(!token||c.req.header('X-ADMIN-TOKEN')!==token)
    return c.json({ok:false,reason:'ADMIN_AUTH_REQUIRED'},401);
- if(CANDIDATE_A_PAPER_ONLY || process.env.LIVE_TRADING_ENABLED!=='true'||
+ if(!V106_OPERATOR_TEST_MODE || process.env.LIVE_TRADING_ENABLED!=='true'||
     process.env.V98_LIVE_EXIT_APPROVED!=='true')
    return c.json({ok:false,reason:'LIVE_EXIT_NOT_ARMED',orderSent:false},403);
  if(v98ExitInProgress)return c.json({ok:false,reason:'EXIT_TICK_RUNNING'},409);
@@ -3262,7 +3266,7 @@ let v99ExitBusy=false;
 let v99LastExit={reason:'NOT_YET_RUN',orderSent:false};
 export async function runV99AutomaticExitOnce(now=Date.now()){
  if(v99ExitBusy)return {reason:'EXIT_ALREADY_RUNNING',orderSent:false};
- if(CANDIDATE_A_PAPER_ONLY || process.env.LIVE_TRADING_ENABLED!=='true' || process.env.V99_AUTOMATIC_EXIT_APPROVED!=='true')
+ if(!V106_OPERATOR_TEST_MODE || process.env.LIVE_TRADING_ENABLED!=='true' || process.env.V99_AUTOMATIC_EXIT_APPROVED!=='true')
    return {reason:'AUTO_EXIT_GATE_CLOSED',orderSent:false};
  v99ExitBusy=true;
  try{
@@ -3274,7 +3278,7 @@ export async function runV99AutomaticExitOnce(now=Date.now()){
  finally{v99ExitBusy=false}
 }
 setInterval(()=>{void runV99AutomaticExitOnce()},20_000);
-app.get('/gmo-auto-exit-status-v99',c=>c.json({last:v99LastExit,active:v99ExitBusy,enabled:!CANDIDATE_A_PAPER_ONLY&&process.env.LIVE_TRADING_ENABLED==='true'&&process.env.V99_AUTOMATIC_EXIT_APPROVED==='true'}));
+app.get('/gmo-auto-exit-status-v99',c=>c.json({last:v99LastExit,active:v99ExitBusy,enabled:V106_OPERATOR_TEST_MODE&&process.env.LIVE_TRADING_ENABLED==='true'&&process.env.V99_AUTOMATIC_EXIT_APPROVED==='true'}));
 // ===== end safety scheduler patch =====
 
 app.get("/gmo-safety-status", (c) => c.json({
