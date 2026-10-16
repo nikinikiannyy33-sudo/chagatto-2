@@ -16,6 +16,10 @@ const app = new Hono();
 const CANDIDATE_A_PAPER_ONLY = true;
 // V106 operator-only trial switch; DOES NOT unlock legacy order routes or the paper scheduler.
 const V106_OPERATOR_TEST_MODE = process.env.V106_OPERATOR_TEST_MODE === "true";
+// v108: emergency exit-only permission is separate from permission to OPEN positions.
+// Both exit approvals remain mandatory; this flag NEVER enables a new order.
+const v108ExitOnlyAllowed = () => process.env.V108_EXIT_ONLY_ENABLED === 'true';
+const v108ExitWritePermitted = () => process.env.LIVE_TRADING_ENABLED === 'true' || v108ExitOnlyAllowed();
 
 function sma(values: number[], period: number) {
   if (values.length < period) return null;
@@ -94,6 +98,7 @@ app.get('/operator-live-preflight-v107', (c) => {
   const flags = {
     liveTradingEnabled:process.env.LIVE_TRADING_ENABLED === 'true',
     operatorTestMode:V106_OPERATOR_TEST_MODE,
+    exitOnlyEnabled:v108ExitOnlyAllowed(),
     entryApproved:process.env.V97_LIVE_ENTRY_APPROVED === 'true',
     manualExitApproved:process.env.V98_LIVE_EXIT_APPROVED === 'true',
     automaticExitApproved:process.env.V99_AUTOMATIC_EXIT_APPROVED === 'true',
@@ -113,6 +118,7 @@ app.get('/operator-live-preflight-v107', (c) => {
   if (flags.requestInProgress) blockers.push('ENTRY_ALREADY_RUNNING');
   return c.json({system:'Chagatto-2 V107 Operator Preflight',readOnly:true,orderSent:false,
     flags,blockers,operatorFlagsReady:blockers.length===0,
+    exitWriteGateReady:flags.operatorTestMode && (flags.liveTradingEnabled || flags.exitOnlyEnabled) && flags.manualExitApproved && flags.automaticExitApproved,
     brokerProtectionVerified:false,realOrderTestCompleted:false,
     note:'Flags readiness is NOT permission to submit a real order. Actual broker protective OCO and close remain unverified.'});
 });
@@ -192,7 +198,7 @@ app.post('/gmo-live-exit-tick-v98',async c=>{
  const token=process.env.ADMIN_TOKEN;
  if(!token||c.req.header('X-ADMIN-TOKEN')!==token)
    return c.json({ok:false,reason:'ADMIN_AUTH_REQUIRED'},401);
- if(!V106_OPERATOR_TEST_MODE || process.env.LIVE_TRADING_ENABLED!=='true'||
+ if(!V106_OPERATOR_TEST_MODE || !v108ExitWritePermitted() ||
     process.env.V98_LIVE_EXIT_APPROVED!=='true')
    return c.json({ok:false,reason:'LIVE_EXIT_NOT_ARMED',orderSent:false},403);
  if(v98ExitInProgress)return c.json({ok:false,reason:'EXIT_TICK_RUNNING'},409);
@@ -3298,19 +3304,24 @@ let v99ExitBusy=false;
 let v99LastExit={reason:'NOT_YET_RUN',orderSent:false};
 export async function runV99AutomaticExitOnce(now=Date.now()){
  if(v99ExitBusy)return {reason:'EXIT_ALREADY_RUNNING',orderSent:false};
- if(!V106_OPERATOR_TEST_MODE || process.env.LIVE_TRADING_ENABLED!=='true' || process.env.V99_AUTOMATIC_EXIT_APPROVED!=='true')
+ if(!V106_OPERATOR_TEST_MODE || !v108ExitWritePermitted() || process.env.V98_LIVE_EXIT_APPROVED!=='true' || process.env.V99_AUTOMATIC_EXIT_APPROVED!=='true')
    return {reason:'AUTO_EXIT_GATE_CLOSED',orderSent:false};
  v99ExitBusy=true;
  try{
   const result=await autoExitMonitor({dir:safetyStateDir,now,enabled:true,apiKey:process.env.GMO_API_KEY,secret:process.env.GMO_API_SECRET});
   v99LastExit=result;
-  if(result.orderSent||result.requiresManualBrokerReview)persistSafetyHalt('V99_AUTO_EXIT_RECONCILIATION_REQUIRED');
+  // Never leave a corrupted or unverified durable position record silently cycling.
+  // Do not clear the ledger or blindly retry a possibly transmitted broker request.
+  if(['INVALID_DURABLE_ENTRY'].includes(String(result?.reason)))
+    persistSafetyHalt('V99_AUTO_EXIT_INVALID_PROTECTED_LEDGER');
+  if(result.orderSent||result.requiresManualBrokerReview)
+    persistSafetyHalt('V99_AUTO_EXIT_RECONCILIATION_REQUIRED');
   return result;
  }catch(e:any){persistSafetyHalt('V99_EXIT_MONITOR_ERROR');return {reason:'AUTO_EXIT_ERROR',error:String(e?.message??e),orderSent:false};}
  finally{v99ExitBusy=false}
 }
 setInterval(()=>{void runV99AutomaticExitOnce()},20_000);
-app.get('/gmo-auto-exit-status-v99',c=>c.json({last:v99LastExit,active:v99ExitBusy,enabled:V106_OPERATOR_TEST_MODE&&process.env.LIVE_TRADING_ENABLED==='true'&&process.env.V99_AUTOMATIC_EXIT_APPROVED==='true'}));
+app.get('/gmo-auto-exit-status-v99',c=>c.json({last:v99LastExit,active:v99ExitBusy,enabled:V106_OPERATOR_TEST_MODE&&v108ExitWritePermitted()&&process.env.V98_LIVE_EXIT_APPROVED==='true'&&process.env.V99_AUTOMATIC_EXIT_APPROVED==='true',exitOnlyMode:v108ExitOnlyAllowed()&&process.env.LIVE_TRADING_ENABLED!=='true'}));
 // ===== end safety scheduler patch =====
 
 app.get("/gmo-safety-status", (c) => c.json({
