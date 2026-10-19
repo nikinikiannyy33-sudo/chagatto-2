@@ -2528,8 +2528,32 @@ function clearPendingMarketOrderAfterConfirmedStop(): boolean {
   }
 }
 
+// V118: A persisted unresolved position incident blocks every new entry, even
+// after Railway restarts. Never infer that a restart resolves broker exposure.
+function unresolvedLiveIncidentExistsOrUnknown(): boolean {
+  try {
+    if (!safetyStorageHealthy) return true;
+    const names = durableFs.readdirSync(safetyStateDir);
+    for (const name of names) {
+      if (!/^unprotected-position-[1-9][0-9]*\.json$/.test(name)) continue;
+      const full = researchPath.join(safetyStateDir, name);
+      const st = durableFs.lstatSync(full);
+      if (!st.isFile() || st.isSymbolicLink()) return true;
+      const incident = JSON.parse(durableFs.readFileSync(full, "utf8"));
+      // Existing incident is an irreversible latch until a separately audited
+      // manual recovery. Even a malformed incident never permits new orders.
+      if (incident?.status !== 'UNVERIFIED_REQUIRES_BROKER_RECONCILIATION') return true;
+      return true;
+    }
+    return false;
+  } catch (error) {
+    safetyStorageHealthy = false;
+    safetyStorageError = String(error);
+    return true;
+  }
+}
 function newEntriesSafelyBlocked(): boolean {
-  if (!safetyStorageHealthy || gmoSafetyHalt || pendingMarketOrderExistsOrUnknown()) return true;
+  if (!safetyStorageHealthy || gmoSafetyHalt || pendingMarketOrderExistsOrUnknown() || unresolvedLiveIncidentExistsOrUnknown()) return true;
   try {
     // Recheck the marker on every entry; absent/unreadable volume is fail-closed.
     const marker = durableFs.existsSync(safetyStateFile);
