@@ -13,7 +13,9 @@ import * as durableFs from "node:fs";
 import * as researchPath from "node:path";
 const app = new Hono();
 // Candidate A integration: BROKER WRITE ACTIONS ARE HARD-DISABLED pending independent approval.
-const CANDIDATE_A_PAPER_ONLY = true;
+// v110: live order dispatch is opt-in; defaults to simulation when unset.
+// Never enable without required root .mjs dependencies and broker reconciliation tests.
+const CANDIDATE_A_PAPER_ONLY = process.env.CANDIDATE_A_LIVE_AUTOMATION_APPROVED !== 'true';
 // V106 operator-only trial switch; DOES NOT unlock legacy order routes or the paper scheduler.
 const V106_OPERATOR_TEST_MODE = process.env.V106_OPERATOR_TEST_MODE === "true";
 // v108: emergency exit-only permission is separate from permission to OPEN positions.
@@ -138,8 +140,8 @@ app.post("/gmo-live-entry-v97", async (c) => {
     return c.json({ok:false,reason:'EXIT_PATH_NOT_ARMED',orderSent:false},403);
   if (!safetyStorageHealthy || newEntriesSafelyBlocked())
     return c.json({ok:false,reason:"DURABLE_SAFETY_HALT",orderSent:false},409);
-  if (v97DispatchInProgress)
-    return c.json({ok:false,reason:"ORDER_DISPATCH_ALREADY_RUNNING",orderSent:false},409);
+  if (v97DispatchInProgress || v99ExitBusy || v98ExitInProgress)
+    return c.json({ok:false,reason:"ENTRY_OR_EXIT_ALREADY_RUNNING",orderSent:false},409);
   v97DispatchInProgress = true;
   try {
     const request:any = await c.req.json();
@@ -2962,27 +2964,58 @@ if (daily.entryCount >= MAX_DAILY_TRADES) {
       return;
     }
 
-    if (newEntriesSafelyBlocked()) {
-      lastSchedulerResult = { startedAt, action: "SAFETY_HALT", reason: gmoSafetyHaltReason, newEntryBlocked: true };
+    if (newEntriesSafelyBlocked() || v99ExitBusy || v98ExitInProgress || v97DispatchInProgress) {
+      lastSchedulerResult = { startedAt, action: "SAFETY_HALT_OR_EXIT_RUNNING",
+        reason: gmoSafetyHaltReason, newEntryBlocked: true, orderSent:false };
       return;
     }
     const adminToken = process.env.ADMIN_TOKEN;
     if (!adminToken) throw new Error("ADMIN_TOKEN is not set");
-    const orderResponse = await fetch(`${baseUrl}/gmo-order`, {
+    // v110: ONLY the protected v97 execution route may receive live Candidate A
+    // decisions. It re-fetches candles, checks current account exposure, verifies
+    // the explicit pattern/side, journals the submission, and tracks protection.
+    // Do not call the legacy /gmo-order endpoint from the scheduler.
+    if (!V106_OPERATOR_TEST_MODE ||
+        process.env.V97_LIVE_ENTRY_APPROVED !== 'true' ||
+        process.env.V98_LIVE_EXIT_APPROVED !== 'true' ||
+        process.env.V99_AUTOMATIC_EXIT_APPROVED !== 'true' ||
+        !safetyStorageHealthy || newEntriesSafelyBlocked()) {
+      lastSchedulerResult = {startedAt, action:'LIVE_APPROVAL_OR_SAFETY_GATE_CLOSED',
+        orderSent:false, signalData};
+      return;
+    }
+    const orderResponse = await fetch(`${baseUrl}/gmo-live-entry-v97`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-ADMIN-TOKEN": adminToken },
       body: JSON.stringify({
+        approved: true,
+        size: 1000,
         side: signal,
-        triggerCandleTime: Number(signalData?.triggerCandleTime),
+        pattern: signalData.pattern,
+        triggerCandleTime: Number(signalData.triggerCandleTime),
       }),
     });
-    const orderData: any = await orderResponse.json();
+    // A non-JSON/timeout response may follow an accepted broker order.
+    // Never repeat the entry automatically; leave a persistent review halt.
+    let orderData: any;
+    try { orderData = await orderResponse.json(); }
+    catch {
+      persistSafetyHalt("V111_LIVE_ORDER_RESPONSE_UNREADABLE");
+      lastSchedulerResult = {startedAt,action:"LIVE_ORDER_STATUS_UNKNOWN",
+        httpStatus:orderResponse.status,requiresManualBrokerReview:true,newEntryBlocked:true};
+      return;
+    }
+    if (!orderResponse.ok && orderResponse.status !== 202) {
+      persistSafetyHalt("V111_LIVE_ORDER_RESPONSE_NOT_ACCEPTED");
+    }
     lastSchedulerResult = {
       startedAt,
-      action: orderResponse.ok ? "ORDER_REQUESTED" : "ORDER_REJECTED",
+      action: orderData?.ok === true && orderData?.reason === "PROTECTED_POSITION_TRACKED" ? "PROTECTED_LIVE_ENTRY" : "LIVE_ORDER_REVIEW_REQUIRED",
       daily,
       signal,
       orderData,
+      // HTTP 202 can mean an uncertain broker state: never infer filled/protected from HTTP success.
+      requiresManualBrokerReview: orderData?.requiresManualBrokerReview === true || orderData?.ok !== true,
     };
     console.log("[scheduler] order result", lastSchedulerResult);
   } catch (error: any) {
