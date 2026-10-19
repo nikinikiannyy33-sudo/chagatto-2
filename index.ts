@@ -3305,6 +3305,39 @@ app.get("/candidate-a-four-hour-exit-planner-test", async (c) => {
     decision, liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==="true",liveApproved:false});
 });
 
+// V114: public, credential-free diagnostic snapshot. No broker writes or approvals.
+// This is not a readiness certificate or permission to trade.
+app.get("/scheduler-diagnostics-v114", (c) => {
+  const flags = {
+    strategyLiveApproved: !CANDIDATE_A_PAPER_ONLY,
+    liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === "true",
+    operatorTestMode: V106_OPERATOR_TEST_MODE,
+    entryApproved: process.env.V97_LIVE_ENTRY_APPROVED === "true",
+    exitApproved: process.env.V98_LIVE_EXIT_APPROVED === "true",
+    automaticExitApproved: process.env.V99_AUTOMATIC_EXIT_APPROVED === "true",
+    safetyStorageHealthy,
+    newEntriesSafelyBlocked: newEntriesSafelyBlocked(),
+    entryDispatchBusy: v97DispatchInProgress,
+    exitBusy: v99ExitBusy || v98ExitInProgress,
+  };
+  const blockers = [
+    !flags.strategyLiveApproved && "STRATEGY_PAPER_MODE",
+    !flags.liveTradingEnabled && "LIVE_DISABLED",
+    !flags.operatorTestMode && "OPERATOR_TEST_MODE_DISABLED",
+    !flags.entryApproved && "ENTRY_NOT_APPROVED",
+    !flags.exitApproved && "EXIT_NOT_APPROVED",
+    !flags.automaticExitApproved && "AUTO_EXIT_NOT_APPROVED",
+    !flags.safetyStorageHealthy && "SAFETY_STORAGE_UNHEALTHY",
+    flags.newEntriesSafelyBlocked && "ENTRY_SAFETY_HALT",
+    flags.entryDispatchBusy && "ENTRY_DISPATCH_BUSY",
+    flags.exitBusy && "EXIT_BUSY",
+  ].filter(Boolean);
+  return c.json({system:"Chagatto-2 scheduler diagnostics v114",readOnly:true,
+    orderSent:false,flags,blockers,lastSchedulerResult,
+    brokerProtectionVerified:false,
+    note:"A zero-blocker snapshot is NOT proof of broker execution or protective order safety."});
+});
+
 app.get("/scheduler-status", (c) => c.json({
   schedule: "continuous monitor; evaluate once after each completed 5-minute candle",
   strategy: "Candidate A 5M UUB/BUU/LLN; paper position accounting; 4H hypothetical close",
