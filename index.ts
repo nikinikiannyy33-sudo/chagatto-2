@@ -3402,7 +3402,7 @@ export async function runV99AutomaticExitOnce(now=Date.now()){
   v99LastExit=result;
   // Never leave a corrupted or unverified durable position record silently cycling.
   // Do not clear the ledger or blindly retry a possibly transmitted broker request.
-  if(['INVALID_DURABLE_ENTRY'].includes(String(result?.reason)))
+  if(['INVALID_DURABLE_ENTRY', 'UNTRACKED_BROKER_EXPOSURE_NO_LEDGER', 'BROKER_SNAPSHOT_UNVERIFIED_NO_LEDGER', 'BROKER_READ_FAILED_NO_LEDGER'].includes(String(result?.reason)))
     persistSafetyHalt('V99_AUTO_EXIT_INVALID_PROTECTED_LEDGER');
   if(result.orderSent||result.requiresManualBrokerReview)
     persistSafetyHalt('V99_AUTO_EXIT_RECONCILIATION_REQUIRED');
