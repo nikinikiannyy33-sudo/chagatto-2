@@ -3394,8 +3394,10 @@ let v99ExitBusy=false;
 let v99LastExit={reason:'NOT_YET_RUN',orderSent:false};
 export async function runV99AutomaticExitOnce(now=Date.now()){
  if(v99ExitBusy)return {reason:'EXIT_ALREADY_RUNNING',orderSent:false};
- if(!V106_OPERATOR_TEST_MODE || !v108ExitWritePermitted() || process.env.V98_LIVE_EXIT_APPROVED!=='true' || process.env.V99_AUTOMATIC_EXIT_APPROVED!=='true')
-   return {reason:'AUTO_EXIT_GATE_CLOSED',orderSent:false};
+ if(!V106_OPERATOR_TEST_MODE || !v108ExitWritePermitted() || process.env.V98_LIVE_EXIT_APPROVED!=='true' || process.env.V99_AUTOMATIC_EXIT_APPROVED!=='true') {
+   v99LastExit={reason:'AUTO_EXIT_GATE_CLOSED',orderSent:false};
+   return v99LastExit;
+ }
  v99ExitBusy=true;
  try{
   const result=await autoExitMonitor({dir:safetyStateDir,now,enabled:true,apiKey:process.env.GMO_API_KEY,secret:process.env.GMO_API_SECRET});
@@ -3411,7 +3413,16 @@ export async function runV99AutomaticExitOnce(now=Date.now()){
  finally{v99ExitBusy=false}
 }
 setInterval(()=>{void runV99AutomaticExitOnce()},20_000);
-app.get('/gmo-auto-exit-status-v99',c=>c.json({last:v99LastExit,active:v99ExitBusy,enabled:V106_OPERATOR_TEST_MODE&&v108ExitWritePermitted()&&process.env.V98_LIVE_EXIT_APPROVED==='true'&&process.env.V99_AUTOMATIC_EXIT_APPROVED==='true',exitOnlyMode:v108ExitOnlyAllowed()&&process.env.LIVE_TRADING_ENABLED!=='true'}));
+app.get('/gmo-auto-exit-status-v99',c=>{
+ const flags={operatorTestMode:V106_OPERATOR_TEST_MODE,liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',exitOnlyApproved:v108ExitOnlyAllowed(),exitApproved:process.env.V98_LIVE_EXIT_APPROVED==='true',automaticExitApproved:process.env.V99_AUTOMATIC_EXIT_APPROVED==='true'};
+ const blockers=[];
+ if(!flags.operatorTestMode)blockers.push('OPERATOR_TEST_MODE_DISABLED');
+ if(!flags.liveTradingEnabled&&!flags.exitOnlyApproved)blockers.push('EXIT_WRITE_PERMISSION_DISABLED');
+ if(!flags.exitApproved)blockers.push('LIVE_EXIT_NOT_APPROVED');
+ if(!flags.automaticExitApproved)blockers.push('AUTOMATIC_EXIT_NOT_APPROVED');
+ return c.json({last:v99LastExit,active:v99ExitBusy,enabled:blockers.length===0,exitOnlyMode:flags.exitOnlyApproved&&!flags.liveTradingEnabled,flags,blockers,readOnly:true,orderSent:false,
+ note:'Monitor readiness does not establish a protected ledger, broker OCO, or successful settlement.'});
+});
 // ===== end safety scheduler patch =====
 
 app.get("/gmo-safety-status", (c) => c.json({
