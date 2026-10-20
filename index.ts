@@ -2535,7 +2535,7 @@ function unresolvedLiveIncidentExistsOrUnknown(): boolean {
     if (!safetyStorageHealthy) return true;
     const names = durableFs.readdirSync(safetyStateDir);
     for (const name of names) {
-      if (!/^unprotected-position-[1-9][0-9]*\.json$/.test(name)) continue;
+      if (!/^unprotected-position-[1-9][0-9]*\.json$/.test(name) && name !== 'uncertain-entry-reconciliation-required.json') continue;
       const full = researchPath.join(safetyStateDir, name);
       const st = durableFs.lstatSync(full);
       if (!st.isFile() || st.isSymbolicLink()) return true;
