@@ -1,5 +1,3 @@
-import { localExitReadiness } from "./exit_readiness_v124.mjs";
-import { inspectExitGate } from "./exit_gate_guard_v125.mjs";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import crypto from "node:crypto";
@@ -13,6 +11,57 @@ import { writeProtectedEntry, autoExitMonitor } from "./gmo_auto_exit_scheduler_
 import { auditExactBrokerOco } from "./broker_exact_oco_audit_v68.mjs";
 import * as durableFs from "node:fs";
 import * as researchPath from "node:path";
+// v126: embed local-only safety checks to avoid missing deploy module files.
+// Read-only local preflight. Does NOT grant trading permission or prove broker protection.
+function localExitReadiness({env={},dir='/data/safety',safetyStorageHealthy=false,now=Date.now()}={}) {
+ const flags={operatorTestMode:env.V106_OPERATOR_TEST_MODE==='true',
+   exitWritesAllowed:env.LIVE_TRADING_ENABLED==='true'||env.V108_EXIT_ONLY_ENABLED==='true',
+   exitApproved:env.V98_LIVE_EXIT_APPROVED==='true',
+   automaticExitApproved:env.V99_AUTOMATIC_EXIT_APPROVED==='true',
+   safetyStorageHealthy:Boolean(safetyStorageHealthy)};
+ const blockers=[];
+ for(const [key,ok] of Object.entries(flags))if(!ok)blockers.push('DISABLED_'+key);
+ const file=researchPath.join(dir,'protected-position-v99.json');
+ let ledger={state:'ABSENT'};
+ try {
+  const stat=durableFs.lstatSync(dir);
+  if(!stat.isDirectory()||stat.isSymbolicLink())throw Error('UNSAFE_DIRECTORY');
+  if(durableFs.existsSync(file)){
+   const entry=JSON.parse(durableFs.readFileSync(file,'utf8'));
+   const valid=/^[1-9][0-9]*$/.test(String(entry.positionId)) &&
+     /^[1-9][0-9]*$/.test(String(entry.rootOrderId)) &&
+     ['BUY','SELL'].includes(entry.side)&&Number(entry.size)===1000&&
+     Number.isSafeInteger(entry.openedAt)&&entry.openedAt>0&&entry.openedAt<=now&&
+     entry.coverageVerified===true&&
+     ['INDEPENDENT','OPERATIONAL_NOT_INDEPENDENT'].includes(entry.coverageEvidenceLevel);
+   ledger=valid?{state:'PRESENT_LOCAL_ONLY',ageMinutes:Math.floor((now-entry.openedAt)/60000)}:{state:'INVALID'};
+  }
+ } catch(e){ledger={state:'UNREADABLE'};}
+ if(ledger.state!=='PRESENT_LOCAL_ONLY')blockers.push('PROTECTED_LEDGER_'+ledger.state);
+ return {readOnly:true,orderSent:false,brokerProtectionVerified:false,
+   eligibleForLiveTrading:false,flags,ledger,blockers,
+   note:'Local diagnostics only. Broker-side position, STOP/LIMIT OCO, and actual close execution require separate verification.'};
+}
+
+// Pure local guard: NEVER sends broker instructions. Open exposure with disabled
+// automatic settlement needs an explicit durable entry halt and operator review.
+function inspectExitGate({dir='/data/safety',now=Date.now(),enabled=false}={}){
+ const file=researchPath.join(dir,'protected-position-v99.json');
+ let exists;
+ try {exists=durableFs.existsSync(file);} catch {return {mustHalt:true,reason:'EXIT_LEDGER_ACCESS_ERROR'};}
+ if(!exists)return {mustHalt:false,reason:'NO_LOCAL_PROTECTED_POSITION',ledgerPresent:false};
+ let entry;
+ try {entry=JSON.parse(durableFs.readFileSync(file,'utf8'));}
+ catch {return {mustHalt:true,reason:'EXIT_LEDGER_UNREADABLE',ledgerPresent:true};}
+ if(!Number.isSafeInteger(entry.openedAt)||entry.openedAt<=0||now<entry.openedAt||
+    !/^[1-9][0-9]*$/.test(String(entry.positionId))||
+    !/^[1-9][0-9]*$/.test(String(entry.rootOrderId)))
+   return {mustHalt:true,reason:'EXIT_LEDGER_INVALID',ledgerPresent:true};
+ const ageMs=now-entry.openedAt;
+ if(!enabled)return {mustHalt:true,reason:ageMs>=14_400_000?'FOUR_HOUR_EXIT_GATE_CLOSED':'EXIT_GATE_CLOSED_WITH_POSITION',ledgerPresent:true,ageMs};
+ return {mustHalt:false,reason:ageMs>=14_400_000?'FOUR_HOUR_EXIT_DUE':'MONITOR_ARMED',ledgerPresent:true,ageMs};
+}
+
 const app = new Hono();
 // Candidate A integration: BROKER WRITE ACTIONS ARE HARD-DISABLED pending independent approval.
 // v110: live order dispatch is opt-in; defaults to simulation when unset.
