@@ -1,3 +1,5 @@
+import { localExitReadiness } from "./exit_readiness_v124.mjs";
+import { inspectExitGate } from "./exit_gate_guard_v125.mjs";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import crypto from "node:crypto";
@@ -3394,8 +3396,11 @@ let v99ExitBusy=false;
 let v99LastExit={reason:'NOT_YET_RUN',orderSent:false};
 export async function runV99AutomaticExitOnce(now=Date.now()){
  if(v99ExitBusy)return {reason:'EXIT_ALREADY_RUNNING',orderSent:false};
- if(!V106_OPERATOR_TEST_MODE || !v108ExitWritePermitted() || process.env.V98_LIVE_EXIT_APPROVED!=='true' || process.env.V99_AUTOMATIC_EXIT_APPROVED!=='true') {
-   v99LastExit={reason:'AUTO_EXIT_GATE_CLOSED',orderSent:false};
+ const exitArmed=V106_OPERATOR_TEST_MODE && v108ExitWritePermitted() && process.env.V98_LIVE_EXIT_APPROVED==='true' && process.env.V99_AUTOMATIC_EXIT_APPROVED==='true';
+ const gateCheck=inspectExitGate({dir:safetyStateDir,now,enabled:exitArmed});
+ if(gateCheck.mustHalt)persistSafetyHalt('V125_'+gateCheck.reason);
+ if(!exitArmed) {
+   v99LastExit={reason:gateCheck.mustHalt?gateCheck.reason:'AUTO_EXIT_GATE_CLOSED',orderSent:false,requiresManualBrokerReview:gateCheck.mustHalt};
    return v99LastExit;
  }
  v99ExitBusy=true;
@@ -3413,6 +3418,10 @@ export async function runV99AutomaticExitOnce(now=Date.now()){
  finally{v99ExitBusy=false}
 }
 setInterval(()=>{void runV99AutomaticExitOnce()},20_000);
+// V124: local-only exit preflight. Never transmits an order or grants permissions.
+app.get('/gmo-exit-preflight-v124', c => c.json(localExitReadiness({
+ env:process.env,dir:safetyStateDir,safetyStorageHealthy,now:Date.now()
+})));
 app.get('/gmo-auto-exit-status-v99',c=>{
  const flags={operatorTestMode:V106_OPERATOR_TEST_MODE,liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',exitOnlyApproved:v108ExitOnlyAllowed(),exitApproved:process.env.V98_LIVE_EXIT_APPROVED==='true',automaticExitApproved:process.env.V99_AUTOMATIC_EXIT_APPROVED==='true'};
  const blockers=[];
