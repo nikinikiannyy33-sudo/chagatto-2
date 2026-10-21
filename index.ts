@@ -3481,6 +3481,43 @@ app.get('/gmo-auto-exit-status-v99',c=>{
  return c.json({last:v99LastExit,active:v99ExitBusy,enabled:blockers.length===0,exitOnlyMode:flags.exitOnlyApproved&&!flags.liveTradingEnabled,flags,blockers,readOnly:true,orderSent:false,
  note:'Monitor readiness does not establish a protected ledger, broker OCO, or successful settlement.'});
 });
+// v127: authenticated diagnostics; reads existing gates without placing orders.
+// Keep this private because even redacted operational state helps attackers.
+app.get('/operator-trade-readiness-v127', (c) => {
+  const expected = process.env.ADMIN_TOKEN;
+  if (!expected || c.req.header('X-ADMIN-TOKEN') !== expected)
+    return c.json({ok:false,reason:'ADMIN_AUTH_REQUIRED'},401);
+  const flags = {
+    operatorTestMode: V106_OPERATOR_TEST_MODE,
+    liveTradingEnabled: process.env.LIVE_TRADING_ENABLED === 'true',
+    candidateLiveApproved: !CANDIDATE_A_PAPER_ONLY,
+    entryApproved: process.env.V97_LIVE_ENTRY_APPROVED === 'true',
+    exitWriteAllowed: v108ExitWritePermitted(),
+    exitApproved: process.env.V98_LIVE_EXIT_APPROVED === 'true',
+    automaticExitApproved: process.env.V99_AUTOMATIC_EXIT_APPROVED === 'true',
+    credentialsPresent: Boolean(process.env.GMO_API_KEY && process.env.GMO_API_SECRET),
+    safetyStorageHealthy,
+    newEntriesBlocked: newEntriesSafelyBlocked(),
+    orderInProgress: v97DispatchInProgress || v98ExitInProgress || v99ExitBusy,
+  };
+  const blockers:string[] = [];
+  if (!flags.operatorTestMode) blockers.push('OPERATOR_TEST_MODE_DISABLED');
+  if (!flags.liveTradingEnabled) blockers.push('LIVE_TRADING_DISABLED');
+  if (!flags.candidateLiveApproved) blockers.push('CANDIDATE_PAPER_ONLY');
+  if (!flags.entryApproved) blockers.push('ENTRY_NOT_APPROVED');
+  if (!flags.exitWriteAllowed) blockers.push('EXIT_WRITES_DISABLED');
+  if (!flags.exitApproved) blockers.push('EXIT_NOT_APPROVED');
+  if (!flags.automaticExitApproved) blockers.push('AUTO_EXIT_NOT_APPROVED');
+  if (!flags.credentialsPresent) blockers.push('CREDENTIALS_MISSING');
+  if (!flags.safetyStorageHealthy) blockers.push('SAFETY_VOLUME_UNHEALTHY');
+  if (flags.newEntriesBlocked) blockers.push('DURABLE_SAFETY_HALT');
+  if (flags.orderInProgress) blockers.push('ORDER_OR_EXIT_IN_PROGRESS');
+  return c.json({version:127,readOnly:true,orderSent:false,flags,blockers,
+    configReady:blockers.length===0,brokerProtectionVerified:false,
+    fourHourLiveSettlementVerified:false,
+    note:'Config readiness is not evidence of broker OCO, guaranteed loss limit, or settlement.'});
+});
+
 // ===== end safety scheduler patch =====
 
 app.get("/gmo-safety-status", (c) => c.json({
@@ -7891,6 +7928,41 @@ app.get('/candidate-a-four-hour-exit-safety-test', c => {
      orderSent:false,brokerCalled:false,liveApproved:false,privateApiCalled:false,
      allPassed:tests.every(x=>x.passed),testCount:tests.length,tests,
      note:'Pure decision exercise, NOT broker-side four-hour close functionality.'});
+});
+
+// V128: read-only operational launch checklist, no toggle override and no broker writes.
+// This is a configuration display, not proof that protective orders are effective.
+app.get('/v128/live-launch-check', c => {
+  const required = [
+    'GMO_API_KEY','GMO_API_SECRET','ADMIN_TOKEN',
+    'CANDIDATE_A_LIVE_AUTOMATION_APPROVED','LIVE_TRADING_ENABLED',
+    'V106_OPERATOR_TEST_MODE','V97_LIVE_ENTRY_APPROVED',
+    'V98_LIVE_EXIT_APPROVED','V99_AUTOMATIC_EXIT_APPROVED'
+  ];
+  const enabled = (name:string) => process.env[name] === 'true';
+  const statuses = Object.fromEntries(required.map(name => [name,
+    name === 'GMO_API_KEY' || name === 'GMO_API_SECRET' || name === 'ADMIN_TOKEN'
+      ? (Boolean(process.env[name]) ? 'configured' : 'missing')
+      : (enabled(name) ? 'enabled' : 'disabled')
+  ]));
+  const blockers = required.filter(name =>
+    name === 'GMO_API_KEY' || name === 'GMO_API_SECRET' || name === 'ADMIN_TOKEN'
+      ? !process.env[name] : !enabled(name));
+  if(!safetyStorageHealthy) blockers.push('SAFETY_STORAGE_NOT_HEALTHY');
+  if(newEntriesSafelyBlocked()) blockers.push('DURABLE_SAFETY_HALT_OR_UNRESOLVED_BROKER_STATE');
+  // Broker protection is not established by the presence of env flags.
+  return c.json({version:128,mode:'READ_ONLY',
+    strategy:'Candidate A 5-minute UUB/BUU/LLN',
+    targets:{takeProfitYen:550,stopLossYen:150,maxHoldingHours:4},
+    configuration:statuses,
+    storageHealthy:safetyStorageHealthy,
+    blockers:[...new Set(blockers)],
+    automaticEntryAllowedByLocalGates:blockers.length===0,
+    brokerProtectionVerified:false,
+    realExitVerified:false,
+    orderSent:false,
+    warning:'This report cannot certify stop-order registration or a four-hour broker close.'
+  });
 });
 
 // V53: Always-blocked time exit lifecycle status. Broker-free diagnostic only.
