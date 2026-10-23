@@ -185,7 +185,8 @@ app.post("/gmo-live-entry-v97", async (c) => {
   if (!token || c.req.header("X-ADMIN-TOKEN") !== token)
     return c.json({ok:false,reason:"ADMIN_AUTH_REQUIRED",orderSent:false},401);
   if (!V106_OPERATOR_TEST_MODE || process.env.LIVE_TRADING_ENABLED !== "true" ||
-      process.env.V97_LIVE_ENTRY_APPROVED !== "true")
+      process.env.V97_LIVE_ENTRY_APPROVED !== "true" ||
+      process.env.V131_SINGLE_LIVE_TRIAL_APPROVED !== "true")
     return c.json({ok:false,reason:"LIVE_GATE_CLOSED",orderSent:false},403);
   if (process.env.V98_LIVE_EXIT_APPROVED !== 'true' || process.env.V99_AUTOMATIC_EXIT_APPROVED !== 'true')
     return c.json({ok:false,reason:'EXIT_PATH_NOT_ARMED',orderSent:false},403);
@@ -228,7 +229,11 @@ app.post("/gmo-live-entry-v97", async (c) => {
     const result = await executeOneLiveTrade({apiKey:process.env.GMO_API_KEY,
       secret:process.env.GMO_API_SECRET,pattern,side,
       triggerCandleTime:last.time,approved:true,persistentDirectory:safetyStateDir});
-    if(result.stage==='PROTECTED' && result.coverageVerified===true){
+    if(result.stage==='PROTECTED' && result.coverageVerified===true &&
+       result.entry?.coverageEvidenceLevel==='INDEPENDENT' &&
+       Number(result.entry?.size)===1000 &&
+       /^[1-9][0-9]*$/.test(String(result.entry?.positionId)) &&
+       /^[1-9][0-9]*$/.test(String(result.entry?.rootOrderId))){
       try {writeProtectedEntry(result.entry,safetyStateDir)}
       catch{persistSafetyHalt('PROTECTED_ENTRY_LEDGER_PERSIST_FAILED');return c.json({ok:false,reason:'PROTECTED_ENTRY_LEDGER_PERSIST_FAILED',orderSent:true},503)}
       return c.json({ok:true,reason:'PROTECTED_POSITION_TRACKED',result},202);
@@ -264,7 +269,7 @@ app.post('/gmo-live-exit-tick-v98',async c=>{
   let entry:any;
   try{entry=JSON.parse(durableFs.readFileSync(ledgerPath,'utf8'))}
   catch{return c.json({ok:false,reason:'PROTECTED_ENTRY_LEDGER_REQUIRED',orderSent:false},409)}
-  if(!entry.coverageVerified || !['INDEPENDENT','OPERATIONAL_NOT_INDEPENDENT'].includes(entry.coverageEvidenceLevel))
+  if(!entry.coverageVerified || entry.coverageEvidenceLevel !== 'INDEPENDENT')
     return c.json({ok:false,reason:'PROTECTION_PROVENANCE_REQUIRED',orderSent:false},409);
   const result=await runExitTick({entry,apiKey:process.env.GMO_API_KEY,
    secret:process.env.GMO_API_SECRET,persistentDirectory:safetyStateDir,
@@ -8023,4 +8028,94 @@ app.get('/v129-safety-audit', c => {
     blockers:['STOP_COVERAGE_UNVERIFIED','RESTART_IDEMPOTENCY_UNVERIFIED',
       'FOUR_HOUR_BROKER_CLOSE_UNVERIFIED','EXECUTION_RECONCILIATION_UNVERIFIED'],
     nextStep:'Reconcile live broker orders/positions and test persistent intents before approving live orders.'});
+});
+
+
+// v131: Restricted 1000-unit broker-entry readiness. Read-only; never place orders.
+// Broker OCO read-back remains mandatory; do not infer it from environment flags.
+app.get('/v131-live-trial-readiness', async c => {
+ const expected=process.env.ADMIN_TOKEN;
+ if(!expected || c.req.header('X-ADMIN-TOKEN')!==expected)
+   return c.json({ok:false,reason:'ADMIN_AUTH_REQUIRED'},401);
+ const blockers:string[]=[];
+ const flags={
+   singleTrialApproved:process.env.V131_SINGLE_LIVE_TRIAL_APPROVED==='true',
+   liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',
+   operatorMode:V106_OPERATOR_TEST_MODE,
+   candidateApproved:!CANDIDATE_A_PAPER_ONLY,
+   entryApproved:process.env.V97_LIVE_ENTRY_APPROVED==='true',
+   manualExitApproved:process.env.V98_LIVE_EXIT_APPROVED==='true',
+   automaticExitApproved:process.env.V99_AUTOMATIC_EXIT_APPROVED==='true',
+   storageHealthy:safetyStorageHealthy,
+   safetyHalt:newEntriesSafelyBlocked(),
+   keysPresent:Boolean(process.env.GMO_API_KEY&&process.env.GMO_API_SECRET),
+   busy:v97DispatchInProgress||v98ExitInProgress||v99ExitBusy
+ };
+ for(const [key,value] of Object.entries(flags)){
+   if(['safetyHalt','busy'].includes(key)?value:!value) blockers.push(key.toUpperCase());
+ }
+ let brokerSnapshotComplete=false,brokerFlat=false;
+ try{
+  const reader=createGmoFxReader({apiKey:process.env.GMO_API_KEY,secret:process.env.GMO_API_SECRET});
+  const snapshot=await reader.positionAndOrders();
+  brokerSnapshotComplete=snapshot.complete===true&&snapshot.brokerConfirmed===true;
+  brokerFlat=brokerSnapshotComplete&&snapshot.positions.length===0&&snapshot.orders.length===0;
+ }catch(_e){}
+ if(!brokerSnapshotComplete)blockers.push('BROKER_SNAPSHOT_INCOMPLETE');
+ if(!brokerFlat)blockers.push('BROKER_NOT_CONFIRMED_FLAT');
+ return c.json({version:131,mode:'READ_ONLY',orderSent:false,flags,
+  brokerSnapshotComplete,brokerFlat,configAndBrokerFlat:blockers.length===0,
+  brokerStopLossGuaranteed:false,fourHourCloseGuaranteed:false,
+  blockers,note:'Only the authenticated POST /gmo-live-entry-v97 can initiate a live trial. Independent protective OCO evidence is required after submission; uncertainty permanently halts new entries pending reconciliation.'});
+});
+
+// V130: authenticated broker preflight (read only).
+// This does not authorize broker writes. Never return credentials or detailed broker records.
+app.get('/v130-broker-live-preflight', async c => {
+  const expected = process.env.ADMIN_TOKEN;
+  if (!expected || c.req.header('X-ADMIN-TOKEN') !== expected)
+    return c.json({ok:false,error:'ADMIN_AUTH_REQUIRED'},401);
+  const out: any = {
+    version:130,mode:'BROKER_READ_ONLY',orderSent:false,brokerWritePerformed:false,
+    volumeHealthy:safetyStorageHealthy,
+    safetyHalt:newEntriesSafelyBlocked(),
+    liveTradingEnabled:process.env.LIVE_TRADING_ENABLED === 'true',
+    protectiveOcoBrokerVerified:false,
+    fourHourSettlementBrokerVerified:false,
+    persistentDuplicateProtectionBrokerVerified:false,
+    readyForLive:false,
+    reasons:[] as string[]
+  };
+  if (!out.volumeHealthy) out.reasons.push('DURABLE_STORAGE_UNHEALTHY');
+  if (out.safetyHalt) out.reasons.push('SAFETY_HALT_ACTIVE');
+  try {
+    const positions = await gmoPrivateGet('/v1/openPositions','?symbol=USD_JPY&count=100');
+    const check = decidePreEntryPositionSafety(positions);
+    out.positionsVerifiedEmpty = check.allowed;
+    out.positionCount = check.positionCount;
+    if (!check.allowed) out.reasons.push(check.reason);
+  } catch (_error) {
+    out.positionsVerifiedEmpty=false;
+    out.reasons.push('POSITION_BROKER_READ_UNAVAILABLE');
+  }
+  try {
+    const active = await gmoPrivateGet('/v1/activeOrders','?symbol=USD_JPY&count=100');
+    const rows = Array.isArray(active?.data?.list) ? active.data.list :
+      Array.isArray(active?.data) ? active.data : null;
+    const bad = (v:any) => v !== undefined && (v === null || v === '' ||
+      typeof v === 'boolean' || !Number.isSafeInteger(Number(v)) ||
+      Number(v)<0 || Number(v)>(rows?.length??0));
+    const incomplete=bad(active?.data?.totalCount)||bad(active?.data?.count);
+    const check=decidePreEntryActiveOrderSafety(rows,incomplete);
+    out.activeOrdersVerifiedEmpty=check.allowed;
+    out.activeOrderCount=check.activeOrderCount;
+    if (!check.allowed) out.reasons.push(check.reason);
+  } catch (_error) {
+    out.activeOrdersVerifiedEmpty=false;
+    out.reasons.push('ACTIVE_ORDERS_BROKER_READ_UNAVAILABLE');
+  }
+  out.reasons.push('PROTECTIVE_OCO_NOT_PROVEN',
+    'FOUR_HOUR_LIVE_SETTLEMENT_NOT_PROVEN',
+    'RESTART_IDEMPOTENCY_NOT_PROVEN');
+  return c.json(out);
 });
