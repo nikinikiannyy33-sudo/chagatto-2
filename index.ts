@@ -8000,3 +8000,27 @@ app.get('/candidate-a-live-readiness', c => {
       '/stop-position-coverage-diagnostic','/broker-reconciliation-readonly'],
     instruction:'Keep LIVE_TRADING_ENABLED=false. Do not replace a safety halt with a manual live toggle.'});
 });
+
+// V129: fail-closed release audit. No broker write, no automatic enablement.
+// Operational readiness is separate from code deployment success.
+app.get('/v129-safety-audit', c => {
+  const authorized = Boolean(process.env.ADMIN_TOKEN) &&
+    c.req.header('X-ADMIN-TOKEN') === process.env.ADMIN_TOKEN;
+  if (!authorized) return c.json({error:'UNAUTHORIZED'},401);
+  const volumeConfigured = Boolean(process.env.RESEARCH_ARCHIVE_DIR?.startsWith('/data/'));
+  const live = process.env.LIVE_TRADING_ENABLED === 'true';
+  return c.json({version:129,release:'SAFETY_AUDIT_ONLY',readOnly:true,
+    brokerReadPerformed:false,brokerWritePerformed:false,orderSent:false,
+    intendedRules:{symbol:'USD_JPY',size:1000,decisionIntervalMinutes:5,
+      takeProfitYen:550,stopLossYen:150,maxHoldingHours:4,dailyLossStopYen:-1200},
+    checks:{persistentVolumeConfigured:volumeConfigured,
+      liveTradingEnabled:live,
+      brokerStopCoverageVerified:false,
+      duplicateEntryAfterRestartVerified:false,
+      fourHourCloseVerified:false,
+      brokerExecutionReconciled:false},
+    readyForLive:false,
+    blockers:['STOP_COVERAGE_UNVERIFIED','RESTART_IDEMPOTENCY_UNVERIFIED',
+      'FOUR_HOUR_BROKER_CLOSE_UNVERIFIED','EXECUTION_RECONCILIATION_UNVERIFIED'],
+    nextStep:'Reconcile live broker orders/positions and test persistent intents before approving live orders.'});
+});
