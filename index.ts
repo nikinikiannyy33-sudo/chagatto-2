@@ -8031,6 +8031,61 @@ app.get('/v129-safety-audit', c => {
 });
 
 
+
+// v132: read-only Candidate A signal-frequency and entry-path diagnostics.
+// No broker writes, no private API calls, and no exposure of credentials.
+app.get('/v132-signal-frequency', async (c) => {
+  const expected = process.env.ADMIN_TOKEN;
+  if (!expected || c.req.header('X-ADMIN-TOKEN') !== expected)
+    return c.json({ok:false,reason:'ADMIN_AUTH_REQUIRED'},401);
+  try {
+    const bars = await fetchCompletedGmoCandles('5min',3) as CandidateBar[];
+    const unique = Array.from(new Map(bars.map(b => [b.time,b])).values())
+      .sort((a,b)=>a.time-b.time);
+    const decisions:Record<string,number> = {};
+    const patterns:Record<string,number> = {};
+    const matches:Record<string,number> = {};
+    let considered = 0;
+    for (let i=10;i<unique.length;i++) {
+      const history = unique.slice(i-10,i+1);
+      const nextOpen = unique[i].time+300000;
+      const decision = candidateASignalAtNextOpen(history,nextOpen);
+      const reason = String(decision.reason);
+      decisions[reason] = (decisions[reason]||0)+1;
+      if (decision.pattern) patterns[decision.pattern] = (patterns[decision.pattern]||0)+1;
+      if (decision.signal==='BUY'||decision.signal==='SELL') {
+        const key=String(decision.pattern);
+        matches[key]=(matches[key]||0)+1;
+      }
+      considered++;
+    }
+    const paperGate = CANDIDATE_A_PAPER_ONLY;
+    const gates = {
+      candidateApproved:!paperGate,
+      liveTradingEnabled:process.env.LIVE_TRADING_ENABLED==='true',
+      operatorTestMode:V106_OPERATOR_TEST_MODE,
+      entryApproved:process.env.V97_LIVE_ENTRY_APPROVED==='true',
+      singleTrialApproved:process.env.V131_SINGLE_LIVE_TRIAL_APPROVED==='true',
+      exitApproved:process.env.V98_LIVE_EXIT_APPROVED==='true',
+      autoExitApproved:process.env.V99_AUTOMATIC_EXIT_APPROVED==='true',
+      adminTokenPresent:Boolean(expected),
+      safetyStorageHealthy,
+      safetyHalt:newEntriesSafelyBlocked(),
+    };
+    return c.json({system:'Chagatto-2',version:132,readOnly:true,
+      orderSent:false,brokerCalled:false,daysRequested:3,
+      candleCount:unique.length,windowsExamined:considered,
+      firstCandleUtc:unique[0]?.time?new Date(unique[0].time).toISOString():null,
+      lastCandleUtc:unique.at(-1)?.time?new Date(unique.at(-1)!.time).toISOString():null,
+      reasons:decisions,patterns,approvedMatches:matches,gates,
+      schedulerLastAction:lastSchedulerResult?.action??null,
+      note:'Historical signal frequency only. An approved pattern does not imply executable entry, correct protective OCO, or profitable trading. No orders are placed.'});
+  } catch (e:any) {
+    return c.json({version:132,readOnly:true,orderSent:false,
+      error:'SIGNAL_FREQUENCY_DIAGNOSTIC_FAILED',detail:String(e?.message??e)},503);
+  }
+});
+
 // v131: Restricted 1000-unit broker-entry readiness. Read-only; never place orders.
 // Broker OCO read-back remains mandatory; do not infer it from environment flags.
 app.get('/v131-live-trial-readiness', async c => {
